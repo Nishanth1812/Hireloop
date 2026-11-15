@@ -3,6 +3,7 @@ package applications
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"strings"
 )
 
@@ -48,6 +49,14 @@ func (i *PatchInput) Valid() bool {
 		}
 	}
 	return i.Status == nil || *i.Status == "saved" || *i.Status == "applied"
+}
+
+func ValidID(id string) bool {
+	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		return false
+	}
+	_, err := hex.DecodeString(strings.ReplaceAll(id, "-", ""))
+	return err == nil
 }
 
 type Store interface {

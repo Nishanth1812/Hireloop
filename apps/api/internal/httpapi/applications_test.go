@@ -21,7 +21,7 @@ func (s *testStore) Create(_ context.Context, userID string, input applications.
 	if s.err != nil {
 		return applications.Application{}, s.err
 	}
-	a := applications.Application{ID: "app-1", Company: input.Company, Role: input.Role, Status: input.Status}
+	a := applications.Application{ID: "00000000-0000-0000-0000-000000000001", Company: input.Company, Role: input.Role, Status: input.Status}
 	s.records[userID] = append(s.records[userID], a)
 	return a, nil
 }
@@ -151,6 +151,9 @@ func TestApplications(t *testing.T) {
 	if w := requestByID("GET", "user-b", "", id); w.Code != http.StatusNotFound {
 		t.Fatalf("get other user: %d", w.Code)
 	}
+	if w := requestByID("GET", "user-a", "", "not-a-uuid"); w.Code != http.StatusBadRequest {
+		t.Fatalf("get malformed ID: %d", w.Code)
+	}
 
 	for _, body := range []string{`{}`, `{"company":" "}`, `{"company":"Acme","role":"Engineer","status":"unknown"}`, `{"company":"Acme","role":"Engineer","status":"applied","user_id":"user-b"}`} {
 		if w := requestByID("PATCH", "user-a", body, id); w.Code != http.StatusBadRequest {
@@ -159,6 +162,9 @@ func TestApplications(t *testing.T) {
 	}
 	if w := requestByID("PATCH", "user-b", `{"company":"Other","role":"Role","status":"applied"}`, id); w.Code != http.StatusNotFound {
 		t.Fatalf("patch other user: %d", w.Code)
+	}
+	if w := requestByID("PATCH", "user-a", `{"status":"applied"}`, "not-a-uuid"); w.Code != http.StatusBadRequest {
+		t.Fatalf("patch malformed ID: %d", w.Code)
 	}
 	w = requestByID("PATCH", "user-a", `{"company":"Acme Ltd","role":"Senior Engineer","status":"applied"}`, id)
 	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &item) != nil || item.Company != "Acme Ltd" || item.Status != "applied" {
@@ -171,6 +177,9 @@ func TestApplications(t *testing.T) {
 
 	if w := requestByID("DELETE", "user-b", "", id); w.Code != http.StatusNotFound {
 		t.Fatalf("delete other user: %d", w.Code)
+	}
+	if w := requestByID("DELETE", "user-a", "", "not-a-uuid"); w.Code != http.StatusBadRequest {
+		t.Fatalf("delete malformed ID: %d", w.Code)
 	}
 	if w := requestByID("DELETE", "user-a", "", id); w.Code != http.StatusNoContent {
 		t.Fatalf("delete owner: %d %s", w.Code, w.Body.String())
