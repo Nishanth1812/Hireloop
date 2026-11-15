@@ -1,3 +1,5 @@
 .env
 .env.*
 !.env.example
+/docs/
+/candidateops_market_audit_and_build_plan.md
