@@ -118,5 +118,77 @@ func NewHandler(supabaseURL, publicKey string, client *http.Client, store applic
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(items)
 	})
+	mux.HandleFunc("GET /api/applications/{id}", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		if store == nil {
+			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		id := r.PathValue("id")
+		app, err := store.Get(r.Context(), u.ID, id)
+		if err != nil {
+			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if app.ID == "" {
+			http.Error(w, "application not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(app)
+	})
+	mux.HandleFunc("PATCH /api/applications/{id}", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		if store == nil {
+			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var input applications.PatchInput
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&input) != nil || decoder.Decode(&struct{}{}) != io.EOF || !input.Valid() {
+			http.Error(w, "invalid application", http.StatusBadRequest)
+			return
+		}
+		id := r.PathValue("id")
+		app, err := store.Patch(r.Context(), u.ID, id, input)
+		if err != nil {
+			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if app.ID == "" {
+			http.Error(w, "application not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(app)
+	})
+	mux.HandleFunc("DELETE /api/applications/{id}", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		if store == nil {
+			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		id := r.PathValue("id")
+		found, err := store.Delete(r.Context(), u.ID, id)
+		if err != nil {
+			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if !found {
+			http.Error(w, "application not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	return mux
 }

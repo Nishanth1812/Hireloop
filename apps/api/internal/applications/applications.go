@@ -19,15 +19,43 @@ type Application struct {
 	Status  string `json:"status"`
 }
 
+type PatchInput struct {
+	Company *string `json:"company"`
+	Role    *string `json:"role"`
+	Status  *string `json:"status"`
+}
+
 func (i *Input) Valid() bool {
 	i.Company = strings.TrimSpace(i.Company)
 	i.Role = strings.TrimSpace(i.Role)
 	return i.Company != "" && len(i.Company) <= 200 && i.Role != "" && len(i.Role) <= 200 && (i.Status == "saved" || i.Status == "applied")
 }
 
+func (i *PatchInput) Valid() bool {
+	if i.Company == nil && i.Role == nil && i.Status == nil {
+		return false
+	}
+	if i.Company != nil {
+		*i.Company = strings.TrimSpace(*i.Company)
+		if *i.Company == "" || len(*i.Company) > 200 {
+			return false
+		}
+	}
+	if i.Role != nil {
+		*i.Role = strings.TrimSpace(*i.Role)
+		if *i.Role == "" || len(*i.Role) > 200 {
+			return false
+		}
+	}
+	return i.Status == nil || *i.Status == "saved" || *i.Status == "applied"
+}
+
 type Store interface {
 	Create(context.Context, string, Input) (Application, error)
 	List(context.Context, string) ([]Application, error)
+	Get(context.Context, string, string) (Application, error)
+	Patch(context.Context, string, string, PatchInput) (Application, error)
+	Delete(context.Context, string, string) (bool, error)
 }
 
 type PostgresStore struct{ DB *sql.DB }
@@ -54,4 +82,44 @@ func (s PostgresStore) List(ctx context.Context, userID string) ([]Application, 
 		items = append(items, a)
 	}
 	return items, rows.Err()
+}
+
+func (s PostgresStore) Get(ctx context.Context, userID, id string) (Application, error) {
+	var a Application
+	err := s.DB.QueryRowContext(ctx, `SELECT id, company, role, status FROM applications WHERE user_id = $1 AND id = $2`, userID, id).Scan(&a.ID, &a.Company, &a.Role, &a.Status)
+	if err == sql.ErrNoRows {
+		err = nil
+	}
+	return a, err
+}
+
+func (s PostgresStore) Patch(ctx context.Context, userID, id string, input PatchInput) (Application, error) {
+	var a Application
+	var company, role, status any
+	if input.Company != nil {
+		company = *input.Company
+	}
+	if input.Role != nil {
+		role = *input.Role
+	}
+	if input.Status != nil {
+		status = *input.Status
+	}
+	err := s.DB.QueryRowContext(ctx, `UPDATE applications SET company=COALESCE($3, company), role=COALESCE($4, role), status=COALESCE($5, status) WHERE user_id=$1 AND id=$2 RETURNING id, company, role, status`, userID, id, company, role, status).Scan(&a.ID, &a.Company, &a.Role, &a.Status)
+	if err == sql.ErrNoRows {
+		err = nil
+	}
+	return a, err
+}
+
+func (s PostgresStore) Delete(ctx context.Context, userID, id string) (bool, error) {
+	result, err := s.DB.ExecContext(ctx, `DELETE FROM applications WHERE user_id=$1 AND id=$2`, userID, id)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected != 0, nil
 }
