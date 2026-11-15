@@ -151,8 +151,10 @@ func TestApplications(t *testing.T) {
 	if w := requestByID("GET", "user-b", "", id); w.Code != http.StatusNotFound {
 		t.Fatalf("get other user: %d", w.Code)
 	}
-	if w := requestByID("GET", "user-a", "", "not-a-uuid"); w.Code != http.StatusBadRequest {
-		t.Fatalf("get malformed ID: %d", w.Code)
+	for _, invalidID := range []string{"not-a-uuid", "gggggggg-gggg-gggg-gggg-gggggggggggg"} {
+		if w := requestByID("GET", "user-a", "", invalidID); w.Code != http.StatusBadRequest {
+			t.Fatalf("get malformed ID %q: %d", invalidID, w.Code)
+		}
 	}
 
 	for _, body := range []string{`{}`, `{"company":" "}`, `{"company":"Acme","role":"Engineer","status":"unknown"}`, `{"company":"Acme","role":"Engineer","status":"applied","user_id":"user-b"}`} {
