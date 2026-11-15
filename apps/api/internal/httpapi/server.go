@@ -123,11 +123,15 @@ func NewHandler(supabaseURL, publicKey string, client *http.Client, store applic
 		if !ok {
 			return
 		}
+		id := r.PathValue("id")
+		if !applications.ValidID(id) {
+			http.Error(w, "invalid application ID", http.StatusBadRequest)
+			return
+		}
 		if store == nil {
 			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		id := r.PathValue("id")
 		app, err := store.Get(r.Context(), u.ID, id)
 		if err != nil {
 			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
@@ -145,8 +149,9 @@ func NewHandler(supabaseURL, publicKey string, client *http.Client, store applic
 		if !ok {
 			return
 		}
-		if store == nil {
-			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+		id := r.PathValue("id")
+		if !applications.ValidID(id) {
+			http.Error(w, "invalid application ID", http.StatusBadRequest)
 			return
 		}
 		var input applications.PatchInput
@@ -156,7 +161,10 @@ func NewHandler(supabaseURL, publicKey string, client *http.Client, store applic
 			http.Error(w, "invalid application", http.StatusBadRequest)
 			return
 		}
-		id := r.PathValue("id")
+		if store == nil {
+			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		app, err := store.Patch(r.Context(), u.ID, id, input)
 		if err != nil {
 			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
@@ -174,11 +182,15 @@ func NewHandler(supabaseURL, publicKey string, client *http.Client, store applic
 		if !ok {
 			return
 		}
+		id := r.PathValue("id")
+		if !applications.ValidID(id) {
+			http.Error(w, "invalid application ID", http.StatusBadRequest)
+			return
+		}
 		if store == nil {
 			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		id := r.PathValue("id")
 		found, err := store.Delete(r.Context(), u.ID, id)
 		if err != nil {
 			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
