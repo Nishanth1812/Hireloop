@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"hireloop/api/internal/applications"
+	"hireloop/api/internal/clerk"
+	"hireloop/api/internal/identities"
 )
 
 type user struct {
@@ -16,7 +19,7 @@ type user struct {
 	Email string `json:"email"`
 }
 
-func NewHandler(supabaseURL, publicKey string, client *http.Client, store applications.Store) http.Handler {
+func NewHandler(supabaseURL, publicKey string, client *http.Client, clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -29,41 +32,86 @@ func NewHandler(supabaseURL, publicKey string, client *http.Client, store applic
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return user{}, false
 		}
-		base, err := url.Parse(supabaseURL)
-		if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || (base.Path != "" && base.Path != "/") || publicKey == "" {
-			http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-			return user{}, false
+		token := parts[1]
+
+		// Clerk authentication path: the migration target. Supabase remains
+		// the database; a verified Clerk subject is resolved to its bound
+		// Supabase owner through an explicit identity mapping. A Clerk user
+		// with no binding is a new signup whose stable owner is the Clerk
+		// subject itself — no artificial Supabase auth.users row is created
+		// and ownership is never inferred from email.
+		if clerkVerifier != nil {
+			if identityMapper == nil {
+				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+				return user{}, false
+			}
+			cu, err := clerkVerifier.Verify(r.Context(), token)
+			if err != nil {
+				// Fail closed: never reveal why a Clerk token was rejected. A
+				// transient verification failure (JWKS unreachable) is
+				// reported as unavailable rather than as a bad token.
+				if errors.Is(err, clerk.ErrUnavailable) {
+					http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+					return user{}, false
+				}
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return user{}, false
+			}
+			supabaseID, found, err := identityMapper.Resolve(r.Context(), cu.ID)
+			if err != nil {
+				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+				return user{}, false
+			}
+			owner := cu.ID // new Clerk signups own themselves by Clerk subject
+			if found {
+				// Existing user: preserve the explicitly bound Supabase owner.
+				owner = supabaseID
+			}
+			return user{ID: owner, Email: cu.Email}, true
 		}
-		base.Path = "/auth/v1/user"
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, base.String(), nil)
-		if err != nil {
-			http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-			return user{}, false
+
+		// Supabase authentication path: reversible fallback used while Clerk
+		// is not configured. Existing ownership and behavior are preserved.
+		if supabaseURL != "" && publicKey != "" {
+			base, err := url.Parse(supabaseURL)
+			if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || (base.Path != "" && base.Path != "/") {
+				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+				return user{}, false
+			}
+			base.Path = "/auth/v1/user"
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, base.String(), nil)
+			if err != nil {
+				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+				return user{}, false
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("apikey", publicKey)
+			authClient := &http.Client{Timeout: 5 * time.Second}
+			if client != nil {
+				*authClient = *client
+				authClient.Timeout = 5 * time.Second
+			}
+			authClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+			res, err := authClient.Do(req)
+			if err != nil {
+				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+				return user{}, false
+			}
+			defer res.Body.Close()
+			if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return user{}, false
+			}
+			var u user
+			if res.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&u) != nil || u.ID == "" {
+				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+				return user{}, false
+			}
+			return u, true
 		}
-		req.Header.Set("Authorization", "Bearer "+parts[1])
-		req.Header.Set("apikey", publicKey)
-		authClient := &http.Client{Timeout: 5 * time.Second}
-		if client != nil {
-			*authClient = *client
-			authClient.Timeout = 5 * time.Second
-		}
-		authClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-		res, err := authClient.Do(req)
-		if err != nil {
-			http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-			return user{}, false
-		}
-		defer res.Body.Close()
-		if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return user{}, false
-		}
-		var u user
-		if res.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&u) != nil || u.ID == "" {
-			http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-			return user{}, false
-		}
-		return u, true
+
+		http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+		return user{}, false
 	}
 	mux.HandleFunc("GET /api/me", func(w http.ResponseWriter, r *http.Request) {
 		u, ok := authenticate(w, r)

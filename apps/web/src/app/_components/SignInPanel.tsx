@@ -1,11 +1,13 @@
 "use client";
 
 import Link from "next/link";
+import { ThemeControl } from "./ThemeControl";
 
 export function SignInPanel({ error, onSignIn }: { error: string; onSignIn: () => void }) {
   return (
     <main className="page-shell auth-shell">
       <Link className="wordmark" href="/" aria-label="Hireloop home"><span className="brand-mark">H</span>hireloop</Link>
+      <ThemeControl />
       <section className="sign-in-panel" aria-labelledby="welcome-title">
         <p className="eyebrow">A clearer job search</p>
         <h1 id="welcome-title">Keep every application moving.</h1>

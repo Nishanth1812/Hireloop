@@ -92,7 +92,7 @@ func TestApplications(t *testing.T) {
 	}))
 	defer provider.Close()
 	store := &testStore{records: make(map[string][]applications.Application)}
-	h := NewHandler(provider.URL, "public-key", provider.Client(), store)
+	h := NewHandler(provider.URL, "public-key", provider.Client(), nil, nil, store)
 	request := func(method, token, body, path string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 		if token != "" {

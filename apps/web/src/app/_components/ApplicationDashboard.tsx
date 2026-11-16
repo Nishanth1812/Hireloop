@@ -2,13 +2,14 @@
 
 import type { FormEvent } from "react";
 import Link from "next/link";
-import type { Session } from "@supabase/supabase-js";
+import { SignOutButton } from "@clerk/nextjs";
 import type { Application } from "@/lib/api";
 import { ApplicationCaptureForm } from "./ApplicationCaptureForm";
 import { ApplicationList } from "./ApplicationList";
+import { ThemeControl } from "./ThemeControl";
 
 type Props = {
-  session: Session;
+  email: string;
   applications: Application[];
   loading: boolean;
   loadError: boolean;
@@ -16,15 +17,14 @@ type Props = {
   busyId: string;
   error: string;
   notice: string;
-  onSignOut: () => void;
   onCreate: (event: FormEvent<HTMLFormElement>) => void;
   onStatusChange: (application: Application, status: Application["status"]) => void;
   onRemove: (application: Application) => void;
 };
 
 export function ApplicationDashboard({
-  session, applications, loading, loadError, saving, busyId, error, notice,
-  onSignOut, onCreate, onStatusChange, onRemove,
+  email, applications, loading, loadError, saving, busyId, error, notice,
+  onCreate, onStatusChange, onRemove,
 }: Props) {
   const savedCount = applications.filter((item) => item.status === "saved").length;
   const appliedCount = applications.length - savedCount;
@@ -34,8 +34,9 @@ export function ApplicationDashboard({
       <header className="topbar">
         <Link className="wordmark" href="/" aria-label="Hireloop home"><span className="brand-mark">H</span>hireloop</Link>
         <div className="account-menu">
-          <span className="account-email">{session.user.email}</span>
-          <button className="button quiet" onClick={onSignOut}>Sign out</button>
+          <span className="account-email" title={email}>{email}</span>
+          <ThemeControl />
+          <SignOutButton><button className="button quiet" type="button">Sign out</button></SignOutButton>
         </div>
       </header>
 
