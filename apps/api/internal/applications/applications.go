@@ -29,7 +29,7 @@ type PatchInput struct {
 func (i *Input) Valid() bool {
 	i.Company = strings.TrimSpace(i.Company)
 	i.Role = strings.TrimSpace(i.Role)
-	return i.Company != "" && len(i.Company) <= 200 && i.Role != "" && len(i.Role) <= 200 && (i.Status == "saved" || i.Status == "applied")
+	return validText(i.Company) && validText(i.Role) && (i.Status == "saved" || i.Status == "applied")
 }
 
 func (i *PatchInput) Valid() bool {
@@ -38,25 +38,29 @@ func (i *PatchInput) Valid() bool {
 	}
 	if i.Company != nil {
 		*i.Company = strings.TrimSpace(*i.Company)
-		if *i.Company == "" || len(*i.Company) > 200 {
+		if !validText(*i.Company) {
 			return false
 		}
 	}
 	if i.Role != nil {
 		*i.Role = strings.TrimSpace(*i.Role)
-		if *i.Role == "" || len(*i.Role) > 200 {
+		if !validText(*i.Role) {
 			return false
 		}
 	}
 	return i.Status == nil || *i.Status == "saved" || *i.Status == "applied"
 }
 
+func validText(value string) bool {
+	return value != "" && len(value) <= 200 && !strings.ContainsRune(value, 0)
+}
+
 func ValidID(id string) bool {
 	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
 		return false
 	}
-	_, err := hex.DecodeString(strings.ReplaceAll(id, "-", ""))
-	return err == nil
+	decoded, err := hex.DecodeString(strings.ReplaceAll(id, "-", ""))
+	return err == nil && len(decoded) == 16
 }
 
 type Store interface {

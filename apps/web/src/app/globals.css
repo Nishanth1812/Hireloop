@@ -140,7 +140,7 @@ h3 { margin-bottom: 8px; font-size: 1rem; }
 .sign-in-panel { width: min(500px, 100%); margin: auto; padding: clamp(28px, 6vw, 48px); }
 .sign-in-panel h1 { max-width: 380px; margin-bottom: 16px; }
 .sign-in-panel .muted { margin-bottom: 24px; }
-.sign-in-button { width: 100%; min-height: 48px; }
+.sign-in-button { display: inline-flex; align-items: center; justify-content: center; width: 100%; min-height: 48px; }
 .fine-print { margin: 15px 0 0; color: var(--muted); font-size: 0.78rem; text-align: center; }
 .auth-shell > .footer-note { width: 100%; margin-bottom: 24px; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }

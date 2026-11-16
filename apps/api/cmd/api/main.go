@@ -64,8 +64,12 @@ func main() {
 		identityMapper = identities.PostgresMapper{DB: db}
 	}
 
+	address := os.Getenv("HIRELOOP_API_ADDR")
+	if address == "" {
+		address = "127.0.0.1:8080"
+	}
 	server := &http.Server{
-		Addr:              "127.0.0.1:8080",
+		Addr:              address,
 		Handler:           httpapi.NewHandler(clerkVerifier, identityMapper, store),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

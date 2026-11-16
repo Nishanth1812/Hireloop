@@ -60,9 +60,9 @@ type User struct {
 // RequireAuthorizedParty is set, matching Clerk's default behavior (the check
 // applies when the claim is present; an absent `azp` can be skipped).
 type Verifier struct {
-	issuer   string
-	jwksURL  string
-	client   *http.Client
+	issuer  string
+	jwksURL string
+	client  *http.Client
 
 	// AuthorizedParties are the origins permitted to mint tokens for this
 	// service, checked against the token's `azp` claim.
@@ -75,11 +75,11 @@ type Verifier struct {
 	// Used by tests; production uses fetchJWKS.
 	staticKeys map[string]*rsa.PublicKey
 
-	keys   map[string]*rsa.PublicKey
+	keys      map[string]*rsa.PublicKey
 	keyLoaded map[string]time.Time
-	keysMu sync.RWMutex
+	keysMu    sync.RWMutex
 
-	now      func() time.Time
+	now       func() time.Time
 	clockSkew time.Duration
 
 	// refreshInterval is the minimum time between JWKS fetches. It bounds the
@@ -252,9 +252,8 @@ func (v *Verifier) Verify(ctx context.Context, token string) (User, error) {
 		// JWKS once and retry before rejecting the token. Forced refreshes are
 		// gated by lastSigFailFetch so repeated bad tokens cannot trigger
 		// unbounded fetches.
-		if v.staticKeys == nil && now.Sub(v.lastSigFailFetch) >= v.refreshInterval {
+		if v.staticKeys == nil {
 			if refreshed, ferr := v.forceFetchJWKS(ctx); ferr == nil {
-				v.lastSigFailFetch = now
 				if key, ok := refreshed[header.Kid]; ok &&
 					rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], sigBytes) == nil {
 					return User{ID: payload.Sub, Email: payload.Email}, nil
@@ -359,16 +358,20 @@ func (v *Verifier) refreshJWKS(ctx context.Context) (map[string]*rsa.PublicKey, 
 
 // forceFetchJWKS refreshes the JWKS cache regardless of the refresh interval.
 // It is used once after a signature failure to pick up a rotated signing key.
-// Callers gate forced refreshes (via lastSigFailFetch) so repeated bad tokens
-// cannot trigger unbounded fetches.
+// The lock gates refresh attempts, including failures, across all callers.
 func (v *Verifier) forceFetchJWKS(ctx context.Context) (map[string]*rsa.PublicKey, error) {
 	v.keysMu.Lock()
 	defer v.keysMu.Unlock()
+	now := v.now()
+	if !v.lastSigFailFetch.IsZero() && now.Sub(v.lastSigFailFetch) < v.refreshInterval {
+		return v.keys, nil
+	}
+	v.lastSigFailFetch = now
 	fetched, err := v.fetchJWKS(ctx)
 	if err != nil {
 		return nil, err
 	}
-	now := v.now()
+	now = v.now()
 	v.keys = fetched
 	if v.keyLoaded == nil {
 		v.keyLoaded = make(map[string]time.Time, len(fetched))

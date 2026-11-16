@@ -9,10 +9,12 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -123,6 +125,32 @@ func TestVerifyWrongIssuer(t *testing.T) {
 	v := newTestVerifier(t, key, "kid-1")
 	if _, err := v.Verify(context.Background(), token); err == nil {
 		t.Fatal("expected error for wrong issuer")
+	}
+}
+
+func TestVerifyAuthorizedParty(t *testing.T) {
+	key := mustKey(t)
+	now := time.Now()
+	v := newTestVerifier(t, key, "kid-1")
+	v.SetNow(func() time.Time { return now })
+	v.AuthorizedParties = []string{"https://hireloop.example"}
+
+	for name, claims := range map[string]map[string]any{
+		"allowed":           {"azp": "https://hireloop.example"},
+		"absent by default": {},
+	} {
+		if _, err := v.Verify(context.Background(), signToken(t, key, now, claims, "kid-1")); err != nil {
+			t.Errorf("%s party: verify = %v", name, err)
+		}
+	}
+	for name, claims := range map[string]map[string]any{
+		"unlisted":            {"azp": "https://attacker.example"},
+		"required but absent": {},
+	} {
+		v.RequireAuthorizedParty = name == "required but absent"
+		if _, err := v.Verify(context.Background(), signToken(t, key, now, claims, "kid-1")); err == nil {
+			t.Errorf("%s party: expected rejection", name)
+		}
 	}
 }
 
@@ -256,8 +284,8 @@ func TestVerifyKeyRefreshAfterTTL(t *testing.T) {
 	v.client.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	v.keyTTL = time.Second       // keys age out after one second
-	v.refreshInterval = 0        // allow immediate refetch in the test
+	v.keyTTL = time.Second // keys age out after one second
+	v.refreshInterval = 0  // allow immediate refetch in the test
 	fake := time.Now()
 	v.now = func() time.Time { return fake }
 
@@ -369,8 +397,8 @@ func TestVerifyStaleKeyFailsClosedOnRefreshFailure(t *testing.T) {
 	v.client.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	v.keyTTL = time.Second       // keys age out after one second
-	v.refreshInterval = 0        // always attempt a refresh when stale
+	v.keyTTL = time.Second // keys age out after one second
+	v.refreshInterval = 0  // always attempt a refresh when stale
 	fake := time.Now()
 	v.now = func() time.Time { return fake }
 
@@ -463,6 +491,55 @@ func TestNewVerifierRejectsNonHTTPIssuer(t *testing.T) {
 func TestNewVerifierRejectsEmptyIssuer(t *testing.T) {
 	if _, err := NewVerifier("", "https://clerk.example.com/.well-known/jwks.json"); err == nil {
 		t.Fatal("expected error for empty issuer")
+	}
+}
+
+func TestConcurrentBadSignaturesShareOneRefresh(t *testing.T) {
+	for _, failRefresh := range []bool{false, true} {
+		t.Run(fmt.Sprint("refreshFailure=", failRefresh), func(t *testing.T) {
+			key, wrongKey := mustKey(t), mustKey(t)
+			var fetches atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n := fetches.Add(1)
+				if n > 1 {
+					time.Sleep(10 * time.Millisecond)
+					if failRefresh {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+				}
+				_, _ = w.Write(jwksPayload("kid-1", &key.PublicKey))
+			}))
+			defer server.Close()
+			v, err := NewVerifier(server.URL, server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v.client = server.Client()
+			now := time.Now()
+			valid := signToken(t, key, now, map[string]any{"iss": server.URL}, "kid-1")
+			if _, err := v.Verify(context.Background(), valid); err != nil {
+				t.Fatal(err)
+			}
+			invalid := signToken(t, wrongKey, now, map[string]any{"iss": server.URL}, "kid-1")
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			for i := 0; i < 20; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					if _, err := v.Verify(context.Background(), invalid); err == nil {
+						t.Error("accepted bad signature")
+					}
+				}()
+			}
+			close(start)
+			wg.Wait()
+			if n := fetches.Load(); n != 2 {
+				t.Fatalf("JWKS fetches = %d, want initial + one bounded retry", n)
+			}
+		})
 	}
 }
 

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
-import { useAuth, useSession, useSignIn } from "@clerk/nextjs";
+import { useSession } from "@clerk/nextjs";
 import {
   createApplication,
   deleteApplication,
@@ -18,53 +18,39 @@ function messageFrom(error: unknown) {
 }
 
 export default function ApplicationTracker() {
-  const { session } = useSession();
-  // `useAuth()` reports load state via `isLoaded` (not `isLoading`).
-  const { isLoaded } = useAuth();
-  // `signIn` may be undefined until Clerk is ready; guard before use.
-  const { signIn } = useSignIn();
+  const { session, isLoaded } = useSession();
+  if (!isLoaded) {
+    return <main className="page-shell"><p className="loading" role="status">Checking your sign-in…</p></main>;
+  }
+  return <SessionTracker key={session?.id ?? "signed-out"} session={session ?? null} />;
+}
 
+function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof useSession>["session"]> | null }) {
   const [applications, setApplications] = useState<Application[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(session !== null);
   const [loadError, setLoadError] = useState(false);
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [authError, setAuthError] = useState("");
 
-  async function sessionToken(): Promise<string | null> {
-    if (!session) return null;
-    return session.getToken();
+  async function sessionToken(): Promise<string> {
+    const token = await session?.getToken();
+    if (!token) throw new Error("Your session is unavailable. Please sign in again.");
+    return token;
   }
 
   useEffect(() => {
-    // Clerk loads asynchronously. While it is initializing, show the
-    // checking shell; once loaded, either sign in or load applications.
-    if (!isLoaded) return;
-    if (!session) {
-      // No active session: clear previously loaded applications so data from
-      // a prior user is never shown after sign-out (user isolation). Defer
-      // the update to avoid calling setState synchronously inside the effect
-      // body, which React flags as cascading renders.
-      let cancelled = false;
-      queueMicrotask(() => {
-        if (cancelled) return;
-        setApplications([]);
-        setLoading(false);
-      });
-      return () => {
-        cancelled = true;
-      };
-    }
+    if (!session) return;
     let cancelled = false;
     void (async () => {
-      const token = await session.getToken();
-      if (cancelled || !token) return;
-      setLoading(true);
-      setLoadError(false);
-      setError("");
       try {
+        const token = await session.getToken();
+        if (cancelled) return;
+        if (!token) throw new Error("Your session is unavailable. Please sign in again.");
+        setLoading(true);
+        setLoadError(false);
+        setError("");
         const items = await listApplications(token);
         if (!cancelled) {
           setApplications(items);
@@ -82,7 +68,7 @@ export default function ApplicationTracker() {
     return () => {
       cancelled = true;
     };
-  }, [session, isLoaded]);
+  }, [session]);
 
   async function addApplication(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -100,7 +86,6 @@ export default function ApplicationTracker() {
     setNotice("");
     try {
       const token = await sessionToken();
-      if (!token) return;
       const application = await createApplication(token, {
         company,
         role,
@@ -123,7 +108,6 @@ export default function ApplicationTracker() {
     setNotice("");
     try {
       const token = await sessionToken();
-      if (!token) return;
       const updated = await patchApplication(token, application.id, { status });
       setApplications((current) =>
         current.map((item) => (item.id === updated.id ? updated : item)),
@@ -147,7 +131,6 @@ export default function ApplicationTracker() {
     setNotice("");
     try {
       const token = await sessionToken();
-      if (!token) return;
       await deleteApplication(token, application.id);
       setApplications((current) => current.filter((item) => item.id !== application.id));
       setNotice(`Application at ${application.company} was deleted.`);
@@ -158,30 +141,8 @@ export default function ApplicationTracker() {
     }
   }
 
-  async function handleSignIn() {
-    setAuthError("");
-    if (!signIn) return;
-    // Clerk v7: start the Google OAuth redirect via the supported `signIn.sso`
-    // API on the resource returned by `useSignIn()`. `redirectUrl` is where the
-    // user lands after a successful sign-in (the app home); `redirectCallbackUrl`
-    // is the route Clerk calls back to (which renders `<HandleSSOCallback />`).
-    // No `__internal_future` hop is needed anymore.
-    const { error } = await signIn.sso({
-      strategy: "oauth_google",
-      redirectUrl: window.location.origin,
-      redirectCallbackUrl: `${window.location.origin}/sso-callback`,
-    });
-    if (error) {
-      setAuthError(error.message ?? "Sign-in failed. Please try again.");
-    }
-  }
-
-  if (!isLoaded) {
-    return <main className="page-shell"><p className="loading" role="status">Checking your sign-in…</p></main>;
-  }
-
   if (!session) {
-    return <SignInPanel error={authError} onSignIn={handleSignIn} />;
+    return <SignInPanel />;
   }
 
   return <ApplicationDashboard
