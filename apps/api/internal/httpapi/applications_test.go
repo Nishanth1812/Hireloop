@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,5 +164,48 @@ func TestApplicationsRequireClerkAndEnforceOwnerIsolation(t *testing.T) {
 	store.err = errors.New("private database error")
 	if w := request("GET", tokenA, "", "/api/applications"); w.Code != http.StatusServiceUnavailable || bytes.Contains(w.Body.Bytes(), []byte("private")) {
 		t.Fatalf("database failure: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestApplicationHTTPRejectsMalformedAndOversizedRequests(t *testing.T) {
+	now := time.Now()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signTestRS256WithKey(t, key, now, map[string]any{"sub": "clerk-a"}, "kid")
+	verifier := clerk.NewStaticVerifier("https://clerk.example.com", map[string]*rsa.PublicKey{"kid": &key.PublicKey})
+	verifier.SetNow(func() time.Time { return now })
+	store := &testStore{records: make(map[string][]applications.Application)}
+	handler := NewHandler(verifier, testMapper{bindings: map[string]string{"clerk-a": "owner-a"}}, store)
+	request := func(auth, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/api/applications", bytes.NewBufferString(body))
+		if auth != "" {
+			r.Header.Set("Authorization", auth)
+		}
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+
+	for name, auth := range map[string]string{"missing": "", "wrong scheme": "Basic " + token, "missing token": "Bearer", "extra token": "Bearer " + token + " extra", "oversized token": "Bearer " + strings.Repeat("x", 8193)} {
+		if w := request(auth, `{"company":"Acme","role":"Engineer","status":"saved"}`); w.Code != http.StatusUnauthorized {
+			t.Errorf("%s Authorization: status = %d, want 401", name, w.Code)
+		}
+	}
+	for name, body := range map[string]string{
+		"malformed JSON":    `{"company":`,
+		"trailing JSON":     `{"company":"Acme","role":"Engineer","status":"saved"}{}`,
+		"unknown field":     `{"company":"Acme","role":"Engineer","status":"saved","owner":"other"}`,
+		"NUL in company":    `{"company":"Acme\u0000","role":"Engineer","status":"saved"}`,
+		"NUL in role":       `{"company":"Acme","role":"Eng\u0000ineer","status":"saved"}`,
+		"oversized payload": `{"company":"` + strings.Repeat("x", 16<<10) + `","role":"Engineer","status":"saved"}`,
+	} {
+		if w := request("Bearer "+token, body); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", name, w.Code)
+		}
+	}
+	if len(store.records["owner-a"]) != 0 {
+		t.Fatalf("invalid requests created records: %+v", store.records["owner-a"])
 	}
 }

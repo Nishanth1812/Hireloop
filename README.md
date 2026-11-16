@@ -1,6 +1,6 @@
 # Hireloop
 
-Hireloop is a job application and deadline tracker. The project is in its foundation stage.
+Hireloop is a job application and deadline tracker. Follow the [product roadmap](docs/superpowers/plans/2026-11-15-hireloop-technical-phases.md) to see current work and upcoming phases.
 
 ## API development
 
@@ -12,7 +12,7 @@ bun run start
 
 This command loads the root `.env` and `apps/web/.env.local`, then starts the API. If `DATABASE_URL` is set, startup applies only pending embedded migrations before opening the listener. Migration failure stops startup; migrations use the existing advisory lock and history table and never reset schema or data.
 
-The API listens on `http://127.0.0.1:8080`. `GET /health` returns `{"status":"ok"}` when the API process is responding. This endpoint does not check the database.
+The API listens on `http://127.0.0.1:8080`. If that port belongs to another service, set `HIRELOOP_API_ADDR` (for example `127.0.0.1:8081`) for the API and the matching `HIRELOOP_API_URL` (`http://127.0.0.1:8081`) for the web app. `GET /health` returns `{"status":"ok"}` when the API process is responding. This endpoint does not check the database.
 
 Run checks from `apps/api`:
 
@@ -43,10 +43,10 @@ Application routes return 503 if database configuration or access is unavailable
 
 Migrations use an advisory lock and a migration history table; use the Supabase session pooler, not transaction pooling. If a migration fails, inspect the migration history and database state before repairing it; do not blindly reset the history or drop data. An existing manually created applications table is not automatically adopted. Use a backup and a reviewed corrective migration when needed. API routes previously prefixed `/api/v1/` have moved to `/api/`.
 
-Authentication and API tests use local mocks. API startup has connected through the configured Supabase session pooler and confirmed the migration history; signed-in application CRUD and write permissions still need an end-to-end check. No database is required to run the tests.
+Default authentication and API tests use local mocks. Temporary Clerk development users have also completed signed-in browser CRUD against PostgreSQL, including reload persistence and cross-account GET/PATCH/DELETE denial through the web proxy; those users and their test records were removed afterward. A complete Google OAuth round trip and visual/screen-reader checks remain pending. No database is required to run the default tests; the migration idempotence test is opt-in through `HIRELOOP_TEST_DATABASE_URL`.
 
 ## Web development
 
 The Next.js app in `apps/web` provides Clerk Google sign-in and the manual application workflow. Set `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` in `apps/web/.env.local`; set `CLERK_ISSUER` and `CLERK_JWKS_URL` for that same instance in the root `.env`. Set `DATABASE_URL` there when enabling Supabase persistence. Start the API as described above, then run `bun install` and `bun run dev` from `apps/web`. The web app proxies `/api/*` to `HIRELOOP_API_URL`, which defaults to `http://127.0.0.1:8080`.
 
-Run web checks from `apps/web` with `bun test`, `bun run lint`, and `bun run build`. The first screen currently covers application capture and saved/applied state; deadline and task workflows are still to come.
+Run web checks from `apps/web` with `bun run test`, `bun run lint`, and `bun run build`. Component tests use Happy DOM to exercise token failures, sign-out, and late responses during account changes. The first screen currently covers application capture and saved/applied state; deadline and task workflows are still to come.

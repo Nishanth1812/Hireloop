@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test src/lib/api.test.mjs src/lib/theme.test.mjs"
+    "test": "node --experimental-strip-types --test src/lib/api.test.mjs src/lib/theme.test.mjs && bun test src/app/ApplicationTracker.test.jsx"
   },
   "dependencies": {
     "@clerk/nextjs": "7.10.0",
@@ -22,6 +22,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.4.6",
+    "happy-dom": "^21.0.4",
     "typescript": "^5"
   }
 }

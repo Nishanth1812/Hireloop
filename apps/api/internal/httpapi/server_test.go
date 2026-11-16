@@ -253,3 +253,20 @@ func TestClerkInvalidTokenReturns401(t *testing.T) {
 		}
 	}
 }
+
+func TestClerkJWKSOutageReturnsUnavailable(t *testing.T) {
+	now := time.Now()
+	server := httptest.NewTLSServer(http.NotFoundHandler())
+	defer server.Close()
+	verifier, err := clerk.NewVerifier(server.URL, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier.SetNow(func() time.Time { return now })
+	token, _ := signTestRS256(t, now, map[string]any{"iss": server.URL, "sub": "clerk-a"}, "kid")
+	handler := NewHandler(verifier, testMapper{bindings: map[string]string{}}, &isolationStore{})
+	res := requireAuth(t, handler, http.MethodGet, "/api/me", token, "")
+	if res.Code != http.StatusServiceUnavailable || strings.Contains(res.Body.String(), "tls") {
+		t.Fatalf("JWKS failure response = %d %q, want redacted 503", res.Code, res.Body.String())
+	}
+}
