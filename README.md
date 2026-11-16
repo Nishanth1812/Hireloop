@@ -25,7 +25,7 @@ go vet ./...
 
 `GET /api/me` accepts a Clerk session JWT in an `Authorization: Bearer <token>` header. The API verifies the token's signature, issuer, expiry, and authorized party against Clerk's JWKS, then resolves the Clerk subject to its explicitly bound Supabase owner (an unbound Clerk subject is treated as a new signup that owns itself). Missing or invalid tokens receive 401; a transient verification failure receives 503.
 
-To configure the API for Clerk, set `CLERK_JWKS_URL` to your instance's `/.well-known/jwks.json` endpoint and `CLERK_ISSUER` to its Frontend API origin (both HTTPS and sharing the same host). Optionally set `CLERK_AUTHORIZED_PARTIES` to a comma-separated list of origins matched against the token's `azp` claim. Without Clerk configuration, authenticated requests fail closed. The reversible Supabase Auth fallback remains available while `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` are set.
+To configure the API for Clerk, set `CLERK_JWKS_URL` to your instance's `/.well-known/jwks.json` endpoint and `CLERK_ISSUER` to its Frontend API origin (both HTTPS and sharing the same host). Optionally set `CLERK_AUTHORIZED_PARTIES` to a comma-separated list of origins matched against the token's `azp` claim. Without Clerk configuration, authenticated requests fail closed with 503. Supabase is used for PostgreSQL persistence only.
 
 Never put a service-role key, database password or access token in source control.
 

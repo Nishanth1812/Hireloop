@@ -32,7 +32,9 @@ func (s *isolationStore) Create(ctx context.Context, userID string, in applicati
 	s.create = userID
 	return applications.Application{ID: "app-1", Company: in.Company, Role: in.Role, Status: in.Status}, nil
 }
-func (s *isolationStore) List(ctx context.Context, userID string) ([]applications.Application, error) { return nil, nil }
+func (s *isolationStore) List(ctx context.Context, userID string) ([]applications.Application, error) {
+	return nil, nil
+}
 func (s *isolationStore) Get(ctx context.Context, userID, id string) (applications.Application, error) {
 	s.getUser = userID
 	s.getID = id
@@ -41,8 +43,12 @@ func (s *isolationStore) Get(ctx context.Context, userID, id string) (applicatio
 	}
 	return applications.Application{}, nil
 }
-func (s *isolationStore) Patch(ctx context.Context, userID, id string, in applications.PatchInput) (applications.Application, error) { return applications.Application{}, nil }
-func (s *isolationStore) Delete(ctx context.Context, userID, id string) (bool, error) { return false, nil }
+func (s *isolationStore) Patch(ctx context.Context, userID, id string, in applications.PatchInput) (applications.Application, error) {
+	return applications.Application{}, nil
+}
+func (s *isolationStore) Delete(ctx context.Context, userID, id string) (bool, error) {
+	return false, nil
+}
 
 type testMapper struct {
 	bindings map[string]string
@@ -60,17 +66,22 @@ func signTestRS256(t *testing.T, now time.Time, claims map[string]any, kid strin
 	if err != nil {
 		t.Fatal(err)
 	}
+	return signTestRS256WithKey(t, key, now, claims, kid), key
+}
+
+func signTestRS256WithKey(t *testing.T, key *rsa.PrivateKey, now time.Time, claims map[string]any, kid string) string {
+	t.Helper()
 	header := map[string]any{"alg": "RS256", "typ": "JWT", "kid": kid}
 	headerBytes, err := json.Marshal(header)
 	if err != nil {
 		t.Fatal(err)
 	}
 	payload := map[string]any{
-		"iss":  "https://clerk.example.com",
-		"sub":  "user_clerk_a",
+		"iss":   "https://clerk.example.com",
+		"sub":   "user_clerk_a",
 		"email": "person@example.com",
-		"exp":  now.Add(time.Hour).Unix(),
-		"nbf":  now.Add(-time.Minute).Unix(),
+		"exp":   now.Add(time.Hour).Unix(),
+		"nbf":   now.Add(-time.Minute).Unix(),
 	}
 	for k, v := range claims {
 		payload[k] = v
@@ -85,7 +96,7 @@ func signTestRS256(t *testing.T, now time.Time, claims map[string]any, kid strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	return base64.RawURLEncoding.EncodeToString(headerBytes) + "." + base64.RawURLEncoding.EncodeToString(payloadBytes) + "." + base64.RawURLEncoding.EncodeToString(sig), key
+	return base64.RawURLEncoding.EncodeToString(headerBytes) + "." + base64.RawURLEncoding.EncodeToString(payloadBytes) + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
 
 func clerkHandler(t *testing.T, subject, owner string) (http.Handler, *isolationStore, string) {
@@ -96,13 +107,13 @@ func clerkHandler(t *testing.T, subject, owner string) (http.Handler, *isolation
 	verifier.SetNow(func() time.Time { return now })
 	store := &isolationStore{owner: owner}
 	mapper := testMapper{bindings: map[string]string{subject: owner}}
-	handler := NewHandler("", "", nil, verifier, mapper, store)
+	handler := NewHandler(verifier, mapper, store)
 	return handler, store, token
 }
 
 func TestHealth(t *testing.T) {
 	response := httptest.NewRecorder()
-	NewHandler("", "", nil, nil, nil, nil).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health", nil))
+	NewHandler(nil, nil, nil).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", response.Code)
 	}
@@ -128,84 +139,9 @@ func TestUnknownRouteAndMethod(t *testing.T) {
 	} {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			response := httptest.NewRecorder()
-			NewHandler("", "", nil, nil, nil, nil).ServeHTTP(response, httptest.NewRequest(tc.method, tc.path, nil))
+			NewHandler(nil, nil, nil).ServeHTTP(response, httptest.NewRequest(tc.method, tc.path, nil))
 			if response.Code != tc.want {
 				t.Fatalf("status = %d, want %d", response.Code, tc.want)
-			}
-		})
-	}
-}
-
-func TestCurrentUser(t *testing.T) {
-	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/auth/v1/user" || r.Header.Get("apikey") != "public-key" {
-			t.Errorf("unexpected provider request: %s", r.URL.Path)
-		}
-		if r.Header.Get("Authorization") != "Bearer valid-token" {
-			http.Error(w, "invalid", http.StatusUnauthorized)
-			return
-		}
-		_, _ = w.Write([]byte(`{"id":"user-123","email":"person@example.com","extra":"private"}`))
-	}))
-	defer provider.Close()
-	handler := NewHandler(provider.URL, "public-key", provider.Client(), nil, nil, nil)
-	for _, tc := range []struct {
-		name, auth string
-		want       int
-		body       string
-	}{
-		{"missing", "", http.StatusUnauthorized, ""},
-		{"malformed", "Basic abc", http.StatusUnauthorized, ""},
-		{"invalid", "Bearer bad-token", http.StatusUnauthorized, ""},
-		{"valid", "Bearer valid-token", http.StatusOK, `"id":"user-123"`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
-			if tc.auth != "" {
-				req.Header.Set("Authorization", tc.auth)
-			}
-			res := httptest.NewRecorder()
-			handler.ServeHTTP(res, req)
-			if res.Code != tc.want || (tc.body != "" && !strings.Contains(res.Body.String(), tc.body)) || strings.Contains(res.Body.String(), "private") {
-				t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
-			}
-		})
-	}
-}
-
-func TestCurrentUserFailsClosedWhenUnconfigured(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
-	req.Header.Set("Authorization", "Bearer token")
-	res := httptest.NewRecorder()
-	NewHandler("", "", nil, nil, nil, nil).ServeHTTP(res, req)
-	if res.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", res.Code)
-	}
-}
-
-func TestCurrentUserFailsClosedOnProviderFailure(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		status int
-		body   string
-	}{
-		{"unavailable", 500, `private provider detail`},
-		{"invalid body", 200, `{}`},
-		{"redirect", 302, ``},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Location", "https://example.com")
-				w.WriteHeader(tc.status)
-				_, _ = w.Write([]byte(tc.body))
-			}))
-			defer provider.Close()
-			req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
-			req.Header.Set("Authorization", "Bearer token")
-			res := httptest.NewRecorder()
-			NewHandler(provider.URL, "public-key", provider.Client(), nil, nil, nil).ServeHTTP(res, req)
-			if res.Code != http.StatusServiceUnavailable || strings.Contains(res.Body.String(), "private") {
-				t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
 			}
 		})
 	}
@@ -265,7 +201,7 @@ func TestClerkOtherUserCannotReadApplication(t *testing.T) {
 		"user_clerk_a": ownerA,
 		"user_clerk_b": ownerB,
 	}}
-	handler := NewHandler("", "", nil, verifier, mapper, store)
+	handler := NewHandler(verifier, mapper, store)
 
 	// User B's token is signed by a different key, so it fails verification:
 	// cross-user access is rejected before any store lookup.
@@ -296,7 +232,7 @@ func TestClerkUnlinkedSubjectOwnsItself(t *testing.T) {
 	// Clerk user is a new signup whose stable owner is the Clerk subject
 	// itself — not rejected, not mapped to any Supabase auth.users row.
 	mapper := testMapper{bindings: map[string]string{}}
-	handler := NewHandler("", "", nil, verifier, mapper, store)
+	handler := NewHandler(verifier, mapper, store)
 	res := requireAuth(t, handler, http.MethodPost, "/api/applications", token, `{"company":"Acme","role":"Engineer","status":"saved"}`)
 	if res.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s, want 201 for unbound Clerk subject", res.Code, res.Body.String())
