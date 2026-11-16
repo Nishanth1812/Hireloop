@@ -5,22 +5,26 @@ import { followsSystemTheme, resolveTheme } from "@/lib/theme";
 import type { Theme } from "@/lib/theme";
 
 export function ThemeControl() {
-  const [theme, setTheme] = useState<Theme>();
+  const [theme, setTheme] = useState<Theme>(() => {
+    if (typeof window === "undefined") return "light";
+    const saved = localStorage.getItem("hireloop-theme") as Theme | null;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    return resolveTheme(saved, media.matches);
+  });
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const saved = localStorage.getItem("hireloop-theme") as Theme | null;
     const apply = (next: Theme) => {
       document.documentElement.dataset.theme = next;
       setTheme(next);
     };
-    apply(resolveTheme(saved, media.matches));
+    apply(theme);
     const onSystemChange = (event: MediaQueryListEvent) => {
       if (followsSystemTheme(localStorage.getItem("hireloop-theme"))) apply(event.matches ? "dark" : "light");
     };
     media.addEventListener("change", onSystemChange);
     return () => media.removeEventListener("change", onSystemChange);
-  }, []);
+  }, [theme]);
 
   function toggleTheme() {
     const next = theme === "dark" ? "light" : "dark";
