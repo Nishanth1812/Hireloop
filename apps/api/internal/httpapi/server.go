@@ -5,9 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
-	"time"
 
 	"hireloop/api/internal/applications"
 	"hireloop/api/internal/clerk"
@@ -19,7 +17,7 @@ type user struct {
 	Email string `json:"email"`
 }
 
-func NewHandler(supabaseURL, publicKey string, client *http.Client, clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store) http.Handler {
+func NewHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -68,46 +66,6 @@ func NewHandler(supabaseURL, publicKey string, client *http.Client, clerkVerifie
 				owner = supabaseID
 			}
 			return user{ID: owner, Email: cu.Email}, true
-		}
-
-		// Supabase authentication path: reversible fallback used while Clerk
-		// is not configured. Existing ownership and behavior are preserved.
-		if supabaseURL != "" && publicKey != "" {
-			base, err := url.Parse(supabaseURL)
-			if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || (base.Path != "" && base.Path != "/") {
-				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-				return user{}, false
-			}
-			base.Path = "/auth/v1/user"
-			req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, base.String(), nil)
-			if err != nil {
-				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-				return user{}, false
-			}
-			req.Header.Set("Authorization", "Bearer "+token)
-			req.Header.Set("apikey", publicKey)
-			authClient := &http.Client{Timeout: 5 * time.Second}
-			if client != nil {
-				*authClient = *client
-				authClient.Timeout = 5 * time.Second
-			}
-			authClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-			res, err := authClient.Do(req)
-			if err != nil {
-				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-				return user{}, false
-			}
-			defer res.Body.Close()
-			if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return user{}, false
-			}
-			var u user
-			if res.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&u) != nil || u.ID == "" {
-				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-				return user{}, false
-			}
-			return u, true
 		}
 
 		http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)

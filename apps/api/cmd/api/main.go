@@ -36,14 +36,13 @@ func main() {
 	// carry no audience by default, so there is no audience to configure (the
 	// app ID is not the audience). CLERK_AUTHORIZED_PARTIES optionally lists
 	// the origins (comma separated) permitted to mint tokens, matched against
-	// the token's `azp` claim. With Clerk unset, the API falls back to
-	// Supabase Auth verification, keeping the change reversible.
+	// the token's `azp` claim. Authentication fails closed when Clerk is unset.
 	var clerkVerifier *clerk.Verifier
-	if jwksURL := os.Getenv("CLERK_JWKS_URL"); jwksURL != "" {
-		issuer := os.Getenv("CLERK_ISSUER")
-		if issuer == "" {
-			log.Fatal("CLERK_ISSUER is required when CLERK_JWKS_URL is set")
-		}
+	issuer, jwksURL := os.Getenv("CLERK_ISSUER"), os.Getenv("CLERK_JWKS_URL")
+	if (issuer == "") != (jwksURL == "") {
+		log.Fatal("CLERK_ISSUER and CLERK_JWKS_URL must be configured together")
+	}
+	if jwksURL != "" {
 		var err error
 		clerkVerifier, err = clerk.NewVerifier(issuer, jwksURL)
 		if err != nil {
@@ -67,7 +66,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              "127.0.0.1:8080",
-		Handler:           httpapi.NewHandler(os.Getenv("SUPABASE_URL"), os.Getenv("SUPABASE_PUBLISHABLE_KEY"), nil, clerkVerifier, identityMapper, store),
+		Handler:           httpapi.NewHandler(clerkVerifier, identityMapper, store),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("Hireloop API listening on http://%s", server.Addr)
