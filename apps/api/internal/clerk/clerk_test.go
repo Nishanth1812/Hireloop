@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -540,6 +541,69 @@ func TestConcurrentBadSignaturesShareOneRefresh(t *testing.T) {
 				t.Fatalf("JWKS fetches = %d, want initial + one bounded retry", n)
 			}
 		})
+	}
+}
+
+func TestConcurrentUnknownKeysDuringJWKSOutage(t *testing.T) {
+	key := mustKey(t)
+	var fetches atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		time.Sleep(10 * time.Millisecond)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	v, err := NewVerifier(server.URL, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.client = server.Client()
+	token := signToken(t, key, time.Now(), map[string]any{"iss": server.URL}, "unknown")
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := v.Verify(context.Background(), token); !errors.Is(err, ErrUnavailable) {
+				t.Errorf("verification error = %v, want ErrUnavailable", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if n := fetches.Load(); n != 1 {
+		t.Fatalf("JWKS fetches during outage = %d, want 1", n)
+	}
+}
+
+func TestExpiredKeyRefreshesBeforeLongerRateLimit(t *testing.T) {
+	key := mustKey(t)
+	var fetches atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		_, _ = w.Write(jwksPayload("kid-1", &key.PublicKey))
+	}))
+	defer server.Close()
+	v, err := NewVerifier(server.URL, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.client = server.Client()
+	v.SetKeyRefresh(time.Minute, time.Second)
+	now := time.Now()
+	v.SetNow(func() time.Time { return now })
+	token := signToken(t, key, now, map[string]any{"iss": server.URL}, "kid-1")
+	if _, err := v.Verify(context.Background(), token); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Second)
+	if _, err := v.Verify(context.Background(), token); err != nil {
+		t.Fatalf("verification after expiry = %v", err)
+	}
+	if n := fetches.Load(); n != 2 {
+		t.Fatalf("JWKS fetches = %d, want refresh of expired key", n)
 	}
 }
 

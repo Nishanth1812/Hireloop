@@ -1,6 +1,6 @@
 # Hireloop
 
-Hireloop is a job application and deadline tracker. Follow the [product roadmap](docs/superpowers/plans/2026-11-15-hireloop-technical-phases.md) to see current work and upcoming phases.
+Hireloop is a job application and deadline tracker. The product roadmap is maintained locally under `docs/`.
 
 ## API development
 

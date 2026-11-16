@@ -91,8 +91,9 @@ type Verifier struct {
 	// not retained indefinitely. Zero disables automatic aging.
 	keyTTL time.Duration
 
-	// lastFetch is the time of the last successful JWKS fetch.
-	lastFetch time.Time
+	// lastFetch and lastFetchErr track the most recent ordinary refresh attempt.
+	lastFetch    time.Time
+	lastFetchErr error
 	// lastSigFailFetch is the time of the last forced JWKS refresh triggered
 	// by a signature failure. It bounds forced refreshes.
 	lastSigFailFetch time.Time
@@ -337,13 +338,21 @@ func (v *Verifier) refreshJWKS(ctx context.Context) (map[string]*rsa.PublicKey, 
 	v.keysMu.Lock()
 	defer v.keysMu.Unlock()
 	now := v.now()
-	if len(v.keys) > 0 && now.Sub(v.lastFetch) < v.refreshInterval {
-		return v.keys, false, nil
+	if !v.lastFetch.IsZero() && now.Sub(v.lastFetch) < v.refreshInterval {
+		if v.lastFetchErr != nil {
+			return nil, false, v.lastFetchErr
+		}
+		if v.keyTTL <= 0 || now.Sub(v.lastFetch) < v.keyTTL {
+			return v.keys, false, nil
+		}
 	}
+	v.lastFetch = now
 	fetched, err := v.fetchJWKS(ctx)
 	if err != nil {
+		v.lastFetchErr = err
 		return nil, false, err
 	}
+	v.lastFetchErr = nil
 	now = v.now()
 	v.keys = fetched
 	if v.keyLoaded == nil {
@@ -380,6 +389,7 @@ func (v *Verifier) forceFetchJWKS(ctx context.Context) (map[string]*rsa.PublicKe
 		v.keyLoaded[kid] = now
 	}
 	v.lastFetch = now
+	v.lastFetchErr = nil
 	return fetched, nil
 }
 
