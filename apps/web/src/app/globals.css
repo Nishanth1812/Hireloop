@@ -117,7 +117,7 @@ h3 { margin-bottom: 8px; font-size: 1rem; }
 .summary strong { font-size: 1.16rem; line-height: 1.2; }
 .summary span { color: var(--muted); font-size: 0.78rem; }
 .workspace { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(280px, 0.8fr); align-items: start; gap: 22px; }
-.list-column, .capture-column { display: grid; gap: 22px; min-width: 0; }
+.list-column { display: grid; gap: 22px; min-width: 0; }
 .application-section, .capture-panel, .sign-in-panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
 .application-section { min-height: 310px; padding: 24px; }
 .section-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }

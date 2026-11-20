@@ -104,18 +104,14 @@ export function ApplicationDashboard({
             onClearFilters={onClearFilters}
           />
         </div>
-        <div className="capture-column" hidden={!!editingApplication}>
-          <ApplicationCaptureForm saving={saving} onSubmit={onCreate} />
-        </div>
+        <ApplicationCaptureForm saving={saving} hidden={!!editingApplication} onSubmit={onCreate} />
         {editingApplication && (
-          <div className="capture-column">
-            <ApplicationEditForm
-              application={editingApplication}
-              saving={saving}
-              onSave={onSaveEdit}
-              onCancel={onCancelEdit}
-            />
-          </div>
+          <ApplicationEditForm
+            application={editingApplication}
+            saving={saving}
+            onSave={onSaveEdit}
+            onCancel={onCancelEdit}
+          />
         )}
       </div>
       <footer className="footer-note">Hireloop keeps your job search organized, one next step at a time.</footer>
