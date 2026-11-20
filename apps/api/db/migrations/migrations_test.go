@@ -112,6 +112,53 @@ func TestManualFieldsMigrationIsAdditive(t *testing.T) {
 	}
 }
 
+// TestTasksMigrationIsAdditive pins the Phase 3 schema rule: migration 006
+// creates a new owner-scoped table and never rewrites an existing record. Its
+// date-only and instant columns stay distinct, and rollback is documented.
+func TestTasksMigrationIsAdditive(t *testing.T) {
+	source, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	reader, _, err := source.ReadUp(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	statements := make([]string, 0)
+	for _, line := range strings.Split(body, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" && !strings.HasPrefix(trimmed, "--") {
+			statements = append(statements, trimmed)
+		}
+	}
+	applied := strings.Join(statements, "\n")
+	for _, fragment := range []string{
+		"CREATE TABLE public.tasks",
+		"user_id text NOT NULL",
+		"due_date date",
+		"due_at timestamptz",
+		"time_zone text",
+		"ENABLE ROW LEVEL SECURITY",
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 006 is missing %q", fragment)
+		}
+	}
+	if strings.Contains(applied, "ALTER TABLE public.applications") ||
+		strings.Contains(applied, "DROP ") || strings.Contains(applied, "DELETE FROM") {
+		t.Error("migration 006 must not change or remove existing data")
+	}
+	if !strings.Contains(body, "Rollback:") {
+		t.Error("migration 006 must document how to reverse it")
+	}
+}
+
 func TestApplyIsIdempotentAgainstConfiguredDatabase(t *testing.T) {
 	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
 	if databaseURL == "" {
