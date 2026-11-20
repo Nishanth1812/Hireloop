@@ -319,33 +319,61 @@ const applicationColumns = `id, company, role, status,
 	COALESCE(source, ''), COALESCE(address, ''), COALESCE(url, ''),
 	COALESCE(channel, ''), COALESCE(job_id, ''), COALESCE(applied_on::text, ''), COALESCE(notes, '')`
 
-const applicationScan = `&a.ID, &a.Company, &a.Role, &a.Status, &a.Source, &a.Address,
-	&a.URL, &a.Channel, &a.JobID, &a.AppliedOn, &a.Notes`
+// applicationScanDest returns the scan destinations for the applicationColumns
+// projection, in column order. database/sql requires one pointer per selected
+// column, so these cannot be a shared string.
+func applicationScanDest(a *Application) []any {
+	return []any{&a.ID, &a.Company, &a.Role, &a.Status, &a.Source, &a.Address,
+		&a.URL, &a.Channel, &a.JobID, &a.AppliedOn, &a.Notes}
+}
 
 func (s PostgresStore) Create(ctx context.Context, userID string, in Input) (Application, error) {
 	var a Application
-	// An empty date must reach Postgres as NULL, not as an empty string cast to
-	// date.
+	// Empty optional values reach Postgres as NULL, never as an empty string.
+	// The channel column only permits NULL or the two campus values, so writing
+	// "" would violate its CHECK constraint, and an empty date is not a valid
+	// date. COALESCE(..., '') on read turns NULL back into "not recorded".
 	var appliedOn any
 	if in.AppliedOn != "" {
 		appliedOn = in.AppliedOn
 	}
+	var channel any
+	if in.Channel != "" {
+		channel = in.Channel
+	}
 	err := s.DB.QueryRowContext(ctx, `INSERT INTO applications (user_id, company, role, status, source, address, url, channel, job_id, applied_on, notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING `+applicationColumns,
-		userID, in.Company, in.Role, in.Status, in.Source, in.Address, in.URL, in.Channel, in.JobID, appliedOn, in.Notes).Scan(applicationScan)
+		userID, in.Company, in.Role, in.Status, in.Source, in.Address, in.URL, channel, in.JobID, appliedOn, in.Notes).Scan(applicationScanDest(&a)...)
 	return a, err
 }
 
 func (s PostgresStore) List(ctx context.Context, userID string, query Query) (ListResult, error) {
-	// Counts ignore the status filter so the saved/applied summary describes
-	// the whole (otherwise filtered) set rather than the current page.
+	result := ListResult{Page: query.Page, PageSize: query.PageSize, Items: []Application{}}
+
+	// Count and page must describe one consistent view, so both run inside a
+	// single read-only REPEATABLE READ transaction. Under the default READ
+	// COMMITTED a concurrent commit between the two statements could make the
+	// total disagree with the rows the page returns.
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return ListResult{}, err
+	}
+	defer tx.Rollback()
+
+	// Counts ignore the status filter so the saved/applied summary describes the
+	// whole (otherwise filtered) set; the total and the page use the status
+	// filter so total/total_pages always match the rows the page can return.
 	baseWhere, baseArgs := filterClause(query, false, userID)
 	totalWhere, totalArgs := filterClause(query, true, userID)
 
-	result := ListResult{Page: query.Page, PageSize: query.PageSize, Items: []Application{}}
-	countRow := s.DB.QueryRowContext(ctx, `SELECT count(*),
-		count(*) FILTER (WHERE status = 'saved'),
-		count(*) FILTER (WHERE status = 'applied')
-		FROM applications WHERE `+baseWhere, baseArgs...)
+	totalExpr := "count(*)"
+	countArgs := baseArgs
+	if query.Status != "" {
+		countArgs = append(append([]any{}, baseArgs...), query.Status)
+		totalExpr = fmt.Sprintf("count(*) FILTER (WHERE status = $%d)", len(countArgs))
+	}
+	countRow := tx.QueryRowContext(ctx, `SELECT `+totalExpr+
+		`, count(*) FILTER (WHERE status = 'saved'), count(*) FILTER (WHERE status = 'applied')`+
+		` FROM applications WHERE `+baseWhere, countArgs...)
 	var saved, applied int
 	if err := countRow.Scan(&result.Total, &saved, &applied); err != nil {
 		return ListResult{}, err
@@ -353,10 +381,19 @@ func (s PostgresStore) List(ctx context.Context, userID string, query Query) (Li
 	result.Counts = Counts{Saved: saved, Applied: applied}
 	result.TotalPages = (result.Total + query.PageSize - 1) / query.PageSize
 
-	// Stable ordering: newest first, then id, so pagination never repeats or
-	// skips a row when created_at ties.
-	offset := (query.Page - 1) * query.PageSize
-	rows, err := s.DB.QueryContext(ctx, `SELECT `+applicationColumns+` FROM applications WHERE `+totalWhere+
+	// OFFSET pagination is inherently unstable if rows are inserted or deleted
+	// between page reads: a shift can repeat the previous page's last row or skip
+	// one. Keyset (seek) pagination would remove that, but is out of scope here.
+	// Within a single request the page stays bounded: a page past the last one
+	// returns no rows without ever forming an offset, so an oversized page number
+	// cannot overflow into a negative OFFSET and cannot surface as a database
+	// error.
+	if result.Total == 0 || query.Page > result.TotalPages {
+		return result, nil
+	}
+	offset := int64(query.Page-1) * int64(query.PageSize)
+
+	rows, err := tx.QueryContext(ctx, `SELECT `+applicationColumns+` FROM applications WHERE `+totalWhere+
 		` ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(totalArgs)+1)+` OFFSET $`+strconv.Itoa(len(totalArgs)+2),
 		append(totalArgs, query.PageSize, offset)...)
 	if err != nil {
@@ -365,7 +402,7 @@ func (s PostgresStore) List(ctx context.Context, userID string, query Query) (Li
 	defer rows.Close()
 	for rows.Next() {
 		var a Application
-		if err := rows.Scan(applicationScan); err != nil {
+		if err := rows.Scan(applicationScanDest(&a)...); err != nil {
 			return ListResult{}, err
 		}
 		result.Items = append(result.Items, a)
@@ -407,7 +444,7 @@ func likePattern(search string) string {
 
 func (s PostgresStore) Get(ctx context.Context, userID, id string) (Application, error) {
 	var a Application
-	err := s.DB.QueryRowContext(ctx, `SELECT `+applicationColumns+` FROM applications WHERE user_id = $1 AND id = $2`, userID, id).Scan(applicationScan)
+	err := s.DB.QueryRowContext(ctx, `SELECT `+applicationColumns+` FROM applications WHERE user_id = $1 AND id = $2`, userID, id).Scan(applicationScanDest(&a)...)
 	if err == sql.ErrNoRows {
 		err = nil
 	}
@@ -441,7 +478,13 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 		set("url", *input.URL)
 	}
 	if input.Channel != nil {
-		set("channel", *input.Channel)
+		if *input.Channel == "" {
+			// Clearing the channel writes SQL NULL: the column only permits NULL
+			// or the two campus values, so "" would violate its CHECK.
+			sets = append(sets, "channel = NULL")
+		} else {
+			set("channel", *input.Channel)
+		}
 	}
 	if input.JobID != nil {
 		set("job_id", *input.JobID)
@@ -459,7 +502,7 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 		}
 	}
 	err := s.DB.QueryRowContext(ctx, `UPDATE applications SET `+strings.Join(sets, ", ")+
-		` WHERE user_id = $1 AND id = $2 RETURNING `+applicationColumns, args...).Scan(applicationScan)
+		` WHERE user_id = $1 AND id = $2 RETURNING `+applicationColumns, args...).Scan(applicationScanDest(&a)...)
 	if err == sql.ErrNoRows {
 		err = nil
 	}
