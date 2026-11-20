@@ -88,6 +88,17 @@ test("API unavailability returns a useful message", async () => {
   }
 });
 
+test("network failure returns a useful message", async () => {
+  assert.ok(api, "application API client is missing");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new TypeError("Failed to fetch"); };
+  try {
+    await assert.rejects(api.listApplications("access-token"), /API or database is unavailable/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("delete accepts the API's empty success response", async () => {
   assert.ok(api, "application API client is missing");
   const originalFetch = globalThis.fetch;

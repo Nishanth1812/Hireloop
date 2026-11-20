@@ -91,6 +91,9 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         role,
         status: String(data.get("status")) as Application["status"],
       });
+      // A successful write proves the API is reachable, so a stale load error
+      // from an earlier failed refresh must not keep contradicting the new row.
+      setLoadError(false);
       setApplications((current) => [application, ...current]);
       form.reset();
       setNotice(`${application.role} at ${application.company} was added.`);
