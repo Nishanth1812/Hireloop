@@ -17,13 +17,15 @@ mock.module("@clerk/nextjs", () => ({
 mock.module("./_components/ApplicationDashboard", () => ({
   ApplicationDashboard: (props) => {
     dashboardProps = props;
-    const { email, applications, error, loading, loadError } = props;
+    const { email, result, filters, page, error, loading, loadError } = props;
     return <div>
       <span>{email}</span>
       <span>{loading ? "Loading" : "Ready"}</span>
+      <span data-testid="page">{page}</span>
+      <span data-testid="filters">{`${filters.q}|${filters.status}|${filters.channel}`}</span>
       {loadError && <p data-testid="load-error">Load failed</p>}
       {error && <p role="alert">{error}</p>}
-      {applications.map((item) => <p key={item.id}>{item.company}</p>)}
+      {result.items.map((item) => <p key={item.id}>{item.company}</p>)}
     </div>;
   },
 }));
@@ -39,11 +41,34 @@ let root, container;
 function account(id, getToken = async () => id) {
   return { id, getToken, user: { emailAddresses: [{ emailAddress: `${id}@example.test` }] } };
 }
+function page(overrides = {}) {
+  return {
+    items: [],
+    page: 1,
+    pageSize: 25,
+    total: 0,
+    totalPages: 0,
+    counts: { saved: 0, applied: 0 },
+    ...overrides,
+  };
+}
 function response(company) {
-  return new Response(JSON.stringify([{ id: company, company, role: "Engineer", status: "saved" }]));
+  const items = company ? [{ id: company, company, role: "Engineer", status: "saved" }] : [];
+  return Response.json(page({ items, total: items.length, totalPages: items.length ? 1 : 0, counts: { saved: items.length, applied: 0 } }));
 }
 async function render() {
   await act(async () => { root.render(<ApplicationTracker />); });
+}
+
+function formWith(values) {
+  const form = document.createElement("form");
+  for (const [name, value] of Object.entries(values)) {
+    const input = document.createElement("input");
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }
+  return form;
 }
 
 beforeEach(() => {
@@ -82,55 +107,129 @@ test("API session rejection is visible and does not leave loading active", async
 
 test("a successful create clears a stale load error so the new record is visible", async () => {
   let calls = 0;
-  globalThis.fetch = async () => {
+  globalThis.fetch = async (url, options) => {
     calls++;
     if (calls === 1) return new Response("unavailable", { status: 503 });
-    return new Response(JSON.stringify({ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }), { status: 201 });
+    if (options.method === "POST") {
+      return Response.json({ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }, { status: 201 });
+    }
+    const items = [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }];
+    return Response.json(page({ items, total: 1, totalPages: 1, counts: { saved: 1, applied: 0 } }));
   };
   session = account("a");
   await render();
   expect(container.querySelector('[data-testid="load-error"]') !== null).toBe(true);
   expect(container.textContent).toContain("Ready");
 
-  const form = document.createElement("form");
-  for (const [name, value] of Object.entries({ company: "Acme", role: "Engineer", status: "saved" })) {
-    const input = document.createElement("input");
-    input.name = name;
-    input.value = value;
-    form.appendChild(input);
-  }
-  await act(async () => { await dashboardProps.onCreate({ preventDefault() {}, currentTarget: form }); });
+  await act(async () => {
+    await dashboardProps.onCreate({ preventDefault() {}, currentTarget: formWith({ company: "Acme", role: "Engineer", status: "saved" }) });
+  });
 
   expect(container.querySelector('[data-testid="load-error"]') === null).toBe(true);
-  expect(container.textContent).toContain("Acme");
+  // The new record is confirmed by the follow-up list request, not assumed.
+  expect(calls).toBe(3);
 });
 
-test("saving an edit patches the record and updates the displayed row", async () => {
-  let patchBody;
-  let patchUrl;
-  globalThis.fetch = async (url, options) => {
-    if (options.method === "PATCH") {
-      patchUrl = url;
-      patchBody = JSON.parse(options.body);
-      return new Response(JSON.stringify({ id: "app-1", company: "Acme Labs", role: "Engineer", status: "applied", source: "Referral", address: "me@example.com" }));
+test("changing the page requests that page from the API", async () => {
+  const urls = [];
+  globalThis.fetch = async (url) => { urls.push(url); return response(null); };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onPageChange(2); });
+  expect(urls.at(-1)).toBe("/api/applications?page=2");
+  expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("2");
+});
+
+test("a page beyond the last one settles on the last real page", async () => {
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(url);
+    if (url.includes("page=3")) {
+      return Response.json(page({ items: [], page: 3, total: 42, totalPages: 2, counts: { saved: 40, applied: 2 } }));
     }
-    return new Response(JSON.stringify([{ id: "app-1", company: "Acme", role: "Engineer", status: "saved", source: "", address: "" }]));
+    const items = [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }];
+    return Response.json(page({ items, total: 42, totalPages: 2, counts: { saved: 40, applied: 2 } }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onPageChange(3); });
+  expect(urls.at(-1)).toBe("/api/applications?page=2");
+  expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("2");
+});
+
+test("applying filters returns to page one and sends every filter", async () => {
+  const urls = [];
+  globalThis.fetch = async (url) => { urls.push(url); return response(null); };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onPageChange(3); });
+  await act(async () => {
+    dashboardProps.onApplyFilters({ q: "acme", status: "applied", channel: "campus" });
+  });
+  expect(urls.at(-1)).toBe("/api/applications?page=1&q=acme&status=applied&channel=campus");
+  expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("1");
+});
+
+test("creating an application clears the filters and shows page one", async () => {
+  const urls = [];
+  globalThis.fetch = async (url, options) => {
+    urls.push(url);
+    if (options.method === "POST") {
+      return Response.json({ id: "app-9", company: "NewCo", role: "Engineer", status: "saved" }, { status: 201 });
+    }
+    return response(null);
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onPageChange(3); });
+  await act(async () => { dashboardProps.onApplyFilters({ q: "old", status: "saved", channel: "" }); });
+
+  await act(async () => {
+    await dashboardProps.onCreate({ preventDefault() {}, currentTarget: formWith({ company: "NewCo", role: "Engineer", status: "saved" }) });
+  });
+
+  expect(urls.at(-1)).toBe("/api/applications?page=1");
+  expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("1");
+  expect(container.querySelector('[data-testid="filters"]')?.textContent).toBe("||");
+});
+
+test("saving an edit patches the record and reloads the current page", async () => {
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, method: options.method, body: options.body });
+    if (options.method === "PATCH") {
+      return Response.json({ id: "app-1", company: "Acme Labs", role: "Engineer", status: "applied", job_id: "REQ-1" });
+    }
+    const items = [{ id: "app-1", company: "Acme Labs", role: "Engineer", status: "applied", job_id: "REQ-1" }];
+    return Response.json(page({ items, total: 1, totalPages: 1, counts: { saved: 0, applied: 1 } }));
   };
   session = account("a");
   await render();
 
-  const form = document.createElement("form");
-  for (const [name, value] of Object.entries({ company: "Acme Labs", role: "Engineer", status: "applied", source: "Referral", address: "me@example.com" })) {
-    const input = document.createElement("input");
-    input.name = name;
-    input.value = value;
-    form.appendChild(input);
-  }
-  await act(async () => { await dashboardProps.onSaveEdit({ preventDefault() {}, currentTarget: form }, "app-1"); });
+  await act(async () => {
+    await dashboardProps.onSaveEdit({ preventDefault() {}, currentTarget: formWith({ company: "Acme Labs", role: "Engineer", status: "applied" }) }, "app-1");
+  });
 
-  expect(patchUrl).toBe("/api/applications/app-1");
-  expect(patchBody).toEqual({ company: "Acme Labs", role: "Engineer", status: "applied", source: "Referral", address: "me@example.com" });
+  const patch = requests.find((item) => item.method === "PATCH");
+  expect(patch.url).toBe("/api/applications/app-1");
+  expect(JSON.parse(patch.body)).toEqual({ company: "Acme Labs", role: "Engineer", status: "applied", url: "", source: "", channel: "", job_id: "", applied_on: "", address: "", notes: "" });
+  // A patch is followed by a reload so counts and ordering come from the API.
+  expect(requests.at(-1).url).toBe("/api/applications?page=1");
   expect(container.textContent).toContain("Acme Labs");
+});
+
+test("a rejected edit keeps the form open and surfaces the API message", async () => {
+  globalThis.fetch = async (url, options) => {
+    if (options.method === "PATCH") return new Response("invalid application", { status: 400 });
+    return response(null);
+  };
+  session = account("a");
+  await render();
+  await act(async () => {
+    await dashboardProps.onSaveEdit({ preventDefault() {}, currentTarget: formWith({ company: "Acme", role: "Engineer", status: "saved" }) }, "app-1");
+  });
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("API rejected");
+  expect(dashboardProps.editingApplication).toBeNull();
 });
 
 test("a token resolving after sign-out cannot trigger an application request", async () => {
