@@ -9,7 +9,9 @@ export type Application = {
   source: string;
   address: string;
   url: string;
-  channel: string;
+  // "" means the candidate did not record a channel; the API only stores the
+  // two agreed values.
+  channel: "" | ApplicationChannel;
   // job_id and applied_on keep the API's field names so the client stays a
   // thin, literal view of the wire format. applied_on is date-only.
   job_id: string;
@@ -61,6 +63,12 @@ async function request<T>(path: string, token: string, init: RequestInit = {}): 
   if (!response.ok) throw new Error(`Could not complete the request (${response.status}).`);
   if (response.status === 204) return undefined as T;
   return response.json();
+}
+
+// toChannel narrows a form value to the two channels the API accepts; anything
+// else is recorded as "not recorded" instead of being sent and rejected.
+export function toChannel(value: string): Application["channel"] {
+  return value === "campus" || value === "off-campus" ? value : "";
 }
 
 export function listApplications(token: string, filters: ApplicationFilters, page = 1): Promise<ApplicationPage> {

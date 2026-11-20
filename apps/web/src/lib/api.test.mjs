@@ -68,6 +68,14 @@ test("list sends only the filters that are set and the requested page", async ()
   }
 });
 
+test("toChannel narrows form values to the channels the API accepts", async () => {
+  assert.ok(api, "application API client is missing");
+  assert.equal(api.toChannel("campus"), "campus");
+  assert.equal(api.toChannel("off-campus"), "off-campus");
+  assert.equal(api.toChannel(""), "");
+  assert.equal(api.toChannel("remote"), "");
+});
+
 test("create posts the validated application fields as JSON", async () => {
   assert.ok(api, "application API client is missing");
   const originalFetch = globalThis.fetch;
