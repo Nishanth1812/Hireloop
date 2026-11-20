@@ -1,10 +1,15 @@
 package applications
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"strconv"
 	"strings"
@@ -26,12 +31,18 @@ const (
 	MaxPageSize     = 50
 
 	// QueryKeys are the only accepted list query parameters; anything else is
-	// rejected rather than silently ignored.
+	// rejected rather than silently ignored. QueryPage is deliberately absent:
+	// offset paging is unstable under concurrent writes, so a list is walked
+	// with the opaque keyset cursor in QueryCursor.
 	QuerySearch   = "q"
 	QueryStatus   = "status"
 	QueryChannel  = "channel"
-	QueryPage     = "page"
+	QueryCursor   = "cursor"
 	QueryPageSize = "page_size"
+
+	// maxCursorLength bounds the opaque cursor so a caller cannot send an
+	// unbounded token. A real cursor is a few hundred bytes at most.
+	maxCursorLength = 1024
 )
 
 type Input struct {
@@ -217,20 +228,31 @@ type Query struct {
 	Search   string
 	Status   string
 	Channel  string
-	Page     int
 	PageSize int
+	// After is the keyset position the page starts after. nil means the first
+	// page. ParseQuery produces it; callers never build one from raw input.
+	After *Cursor
+}
+
+// Cursor is a decoded keyset position: the (created_at, id) pair of the last
+// row on the previous page. The pair is unique because id is the primary key,
+// so it is a deterministic tie-break when several rows share a timestamp.
+type Cursor struct {
+	CreatedAt time.Time
+	ID        string
 }
 
 // ListResult carries the page plus honest totals. Counts describes the same
 // filters except status, so the saved/applied summary stays truthful when a
 // status filter is active: total = counts.Saved + counts.Applied.
 type ListResult struct {
-	Items      []Application
-	Page       int
-	PageSize   int
-	Total      int
-	TotalPages int
-	Counts     Counts
+	Items    []Application
+	PageSize int
+	Total    int
+	Counts   Counts
+	// NextCursor is the opaque token that returns the rows after this page, or
+	// "" when this is the last page.
+	NextCursor string
 }
 
 type Counts struct {
@@ -243,7 +265,7 @@ type Counts struct {
 func ParseQuery(values url.Values) (Query, error) {
 	for key := range values {
 		switch key {
-		case QuerySearch, QueryStatus, QueryChannel, QueryPage, QueryPageSize:
+		case QuerySearch, QueryStatus, QueryChannel, QueryCursor, QueryPageSize:
 		default:
 			return Query{}, fmt.Errorf("unsupported query parameter %q", key)
 		}
@@ -252,13 +274,6 @@ func ParseQuery(values url.Values) (Query, error) {
 		Search:  values.Get(QuerySearch),
 		Status:  values.Get(QueryStatus),
 		Channel: values.Get(QueryChannel),
-	}
-	if raw := values.Get(QueryPage); raw != "" {
-		page, err := strconv.Atoi(raw)
-		if err != nil || page < 1 {
-			return Query{}, fmt.Errorf("%s must be a positive integer", QueryPage)
-		}
-		query.Page = page
 	}
 	if raw := values.Get(QueryPageSize); raw != "" {
 		pageSize, err := strconv.Atoi(raw)
@@ -269,6 +284,17 @@ func ParseQuery(values url.Values) (Query, error) {
 	}
 	if !query.valid() {
 		return Query{}, fmt.Errorf("invalid application query")
+	}
+	// The cursor is bound to the normalized filters: a token minted for one
+	// filter set must not be silently applied to another, which would skip or
+	// repeat rows without the caller noticing. An explicitly empty cursor is
+	// invalid rather than "first page", so a client bug cannot hide here.
+	if values.Has(QueryCursor) {
+		cursor, err := query.decodeCursor(values.Get(QueryCursor))
+		if err != nil {
+			return Query{}, err
+		}
+		query.After = &cursor
 	}
 	return query, nil
 }
@@ -286,12 +312,6 @@ func (q *Query) valid() bool {
 	if !validChannel(q.Channel) {
 		return false
 	}
-	if q.Page == 0 {
-		q.Page = 1
-	}
-	if q.Page < 1 {
-		return false
-	}
 	if q.PageSize == 0 {
 		q.PageSize = DefaultPageSize
 	}
@@ -301,6 +321,85 @@ func (q *Query) valid() bool {
 // Normalize applies defaults to a Query built in-process (tests, future
 // callers) and reports whether it is usable.
 func (q *Query) Normalize() bool { return q.valid() }
+
+// cursorToken is the decoded form of the opaque cursor. Version lets a future
+// format reject old tokens explicitly instead of misreading them.
+type cursorToken struct {
+	Version   int    `json:"v"`
+	CreatedAt string `json:"c"`
+	ID        string `json:"i"`
+	Filters   string `json:"f"`
+}
+
+const cursorVersion = 1
+
+// cursorFilterHash binds a cursor to the filters that produced it. It hashes
+// the normalized query so insignificant differences (a trimmed search, an
+// omitted empty filter) still match.
+func (q Query) cursorFilterHash() string {
+	sum := sha256.Sum256([]byte("q=" + q.Search + "\x00status=" + q.Status + "\x00channel=" + q.Channel))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// encodeCursor builds the opaque continuation token for a position.
+func (q Query) encodeCursor(createdAt time.Time, id string) string {
+	payload, err := json.Marshal(cursorToken{
+		Version:   cursorVersion,
+		CreatedAt: createdAt.UTC().Format(time.RFC3339Nano),
+		ID:        id,
+		Filters:   q.cursorFilterHash(),
+	})
+	if err != nil {
+		// The struct only contains strings and an int, so this cannot fail.
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+// EncodeCursor builds a continuation token for a query and position. Tokens
+// are not signed; authorization is enforced by the owner-scoped query.
+func EncodeCursor(query Query, createdAt time.Time, id string) string {
+	return query.encodeCursor(createdAt, id)
+}
+
+// decodeCursor validates an opaque cursor against the current filters. A
+// well-formed cursor stays usable even if the row it points at was deleted: it
+// is a position, not a row reference.
+func (q Query) decodeCursor(raw string) (Cursor, error) {
+	if raw == "" {
+		return Cursor{}, fmt.Errorf("%s must not be empty", QueryCursor)
+	}
+	if len(raw) > maxCursorLength {
+		return Cursor{}, fmt.Errorf("%s is too long", QueryCursor)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	var token cursorToken
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&token); err != nil {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	if token.Version != cursorVersion {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	if token.Filters != q.cursorFilterHash() {
+		return Cursor{}, fmt.Errorf("%s does not match these filters", QueryCursor)
+	}
+	if !ValidID(token.ID) {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, token.CreatedAt)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	return Cursor{CreatedAt: createdAt, ID: token.ID}, nil
+}
 
 type Store interface {
 	Create(context.Context, string, Input) (Application, error)
@@ -347,7 +446,7 @@ func (s PostgresStore) Create(ctx context.Context, userID string, in Input) (App
 }
 
 func (s PostgresStore) List(ctx context.Context, userID string, query Query) (ListResult, error) {
-	result := ListResult{Page: query.Page, PageSize: query.PageSize, Items: []Application{}}
+	result := ListResult{PageSize: query.PageSize, Items: []Application{}}
 
 	// Count and page must describe one consistent view, so both run inside a
 	// single read-only REPEATABLE READ transaction. Under the default READ
@@ -361,9 +460,9 @@ func (s PostgresStore) List(ctx context.Context, userID string, query Query) (Li
 
 	// Counts ignore the status filter so the saved/applied summary describes the
 	// whole (otherwise filtered) set; the total and the page use the status
-	// filter so total/total_pages always match the rows the page can return.
+	// filter so the total always describes the rows the page can return.
 	baseWhere, baseArgs := filterClause(query, false, userID)
-	totalWhere, totalArgs := filterClause(query, true, userID)
+	pageWhere, pageArgs := filterClause(query, true, userID)
 
 	totalExpr := "count(*)"
 	countArgs := baseArgs
@@ -379,38 +478,59 @@ func (s PostgresStore) List(ctx context.Context, userID string, query Query) (Li
 		return ListResult{}, err
 	}
 	result.Counts = Counts{Saved: saved, Applied: applied}
-	result.TotalPages = (result.Total + query.PageSize - 1) / query.PageSize
 
-	// OFFSET pagination is inherently unstable if rows are inserted or deleted
-	// between page reads: a shift can repeat the previous page's last row or skip
-	// one. Keyset (seek) pagination would remove that, but is out of scope here.
-	// Within a single request the page stays bounded: a page past the last one
-	// returns no rows without ever forming an offset, so an oversized page number
-	// cannot overflow into a negative OFFSET and cannot surface as a database
-	// error.
-	if result.Total == 0 || query.Page > result.TotalPages {
+	// No rows in this snapshot means there is no page to seek into.
+	if result.Total == 0 {
 		return result, nil
 	}
-	offset := int64(query.Page-1) * int64(query.PageSize)
 
-	rows, err := tx.QueryContext(ctx, `SELECT `+applicationColumns+` FROM applications WHERE `+totalWhere+
-		` ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(totalArgs)+1)+` OFFSET $`+strconv.Itoa(len(totalArgs)+2),
-		append(totalArgs, query.PageSize, offset)...)
+	// Keyset (seek) pagination. The page starts strictly after the cursor's
+	// (created_at, id) pair, so rows inserted or deleted between requests
+	// cannot shift this page the way OFFSET would. Fetching one extra row tells
+	// us whether another page exists without a second count.
+	pageSQL := `SELECT ` + applicationColumns + `, created_at FROM applications WHERE ` + pageWhere
+	args := append([]any{}, pageArgs...)
+	if query.After != nil {
+		args = append(args, query.After.CreatedAt, query.After.ID)
+		pageSQL += fmt.Sprintf(` AND (created_at, id) < ($%d::timestamptz, $%d::uuid)`, len(pageArgs)+1, len(pageArgs)+2)
+	}
+	args = append(args, query.PageSize+1)
+	pageSQL += ` ORDER BY created_at DESC, id DESC LIMIT $` + strconv.Itoa(len(args))
+
+	rows, err := tx.QueryContext(ctx, pageSQL, args...)
 	if err != nil {
 		return ListResult{}, err
 	}
 	defer rows.Close()
+	page := make([]pageRow, 0, query.PageSize+1)
 	for rows.Next() {
-		var a Application
-		if err := rows.Scan(applicationScanDest(&a)...); err != nil {
+		var row pageRow
+		if err := rows.Scan(append(applicationScanDest(&row.Application), &row.CreatedAt)...); err != nil {
 			return ListResult{}, err
 		}
-		result.Items = append(result.Items, a)
+		page = append(page, row)
 	}
 	if err := rows.Err(); err != nil {
 		return ListResult{}, err
 	}
+	if len(page) > query.PageSize {
+		// The extra row proves another page exists; the cursor points at the
+		// last row this page actually returns, never at the look-ahead row.
+		last := page[query.PageSize-1]
+		result.NextCursor = query.encodeCursor(last.CreatedAt, last.ID)
+		page = page[:query.PageSize]
+	}
+	for _, row := range page {
+		result.Items = append(result.Items, row.Application)
+	}
 	return result, nil
+}
+
+// pageRow is a list row plus the created_at value the keyset cursor needs. The
+// timestamp is not part of the public record; it only positions the next page.
+type pageRow struct {
+	Application
+	CreatedAt time.Time
 }
 
 // filterClause builds a parameterized WHERE clause. Column names and

@@ -50,11 +50,10 @@ const noFilters = { q: "", status: "", channel: "" };
 function pageOf(items, overrides = {}) {
   return {
     items,
-    page: 1,
-    pageSize: 25,
+    page_size: 25,
     total: items.length,
-    totalPages: items.length ? 1 : 0,
     counts: { saved: items.length, applied: 0 },
+    next_cursor: null,
     ...overrides,
   };
 }
@@ -66,7 +65,9 @@ function listProps(overrides = {}) {
   return {
     result,
     filters: noFilters,
-    page: result.page,
+    page: 1,
+    hasPrevious: false,
+    hasNext: result.next_cursor != null,
     loading: false,
     loadError: false,
     busyId: "",
@@ -74,7 +75,8 @@ function listProps(overrides = {}) {
     onStatusChange: noop,
     onEdit: noop,
     onRemove: noop,
-    onPageChange: noop,
+    onPrevious: noop,
+    onNext: noop,
     onClearFilters: noop,
     ...overrides,
   };
@@ -166,27 +168,27 @@ test("a load failure is announced and does not render stale rows", async () => {
 });
 
 test("the result summary reports the honest total, not the page size", async () => {
-  await render(<ApplicationList {...listProps({ result: pageOf(applications(), { total: 42, totalPages: 2, counts: { saved: 40, applied: 2 } }) })} />);
+  await render(<ApplicationList {...listProps({ result: pageOf(applications(), { total: 42, counts: { saved: 40, applied: 2 } }) })} />);
   const summary = container.querySelector(".results-summary");
   expect(summary.getAttribute("role")).toBe("status");
-  expect(summary.textContent).toMatch(/Showing 1–25 of 42/);
+  expect(summary.textContent).toMatch(/Showing 2 on this page · 42 total/);
 });
 
 test("pagination is native, named, and bounded at both ends", async () => {
-  await render(<ApplicationList {...listProps({ result: pageOf(applications(), { total: 42, totalPages: 2 }) })} />);
+  await render(<ApplicationList {...listProps({ result: pageOf(applications(), { total: 42, next_cursor: "cursor-1" }) })} />);
   let nav = container.querySelector("nav.pagination");
   expect(nav).not.toBeNull();
   expect(nav.getAttribute("aria-label")).toMatch(/pages/i);
-  expect(nav.textContent).toMatch(/Page 1 of 2/);
+  expect(nav.textContent).toMatch(/Page 1/);
   const buttons = [...nav.querySelectorAll("button")];
   expect(buttons.map((button) => button.textContent.trim())).toEqual(["Previous", "Next"]);
   for (const button of buttons) assertFocusableWithName(button);
   expect(buttons[0].disabled).toBe(true);
   expect(buttons[1].disabled).toBe(false);
 
-  await render(<ApplicationList {...listProps({ result: pageOf(applications(), { page: 2, total: 42, totalPages: 2 }) })} />);
+  await render(<ApplicationList {...listProps({ page: 2, hasPrevious: true, result: pageOf(applications(), { total: 42, next_cursor: null }) })} />);
   nav = container.querySelector("nav.pagination");
-  expect(nav.textContent).toMatch(/Page 2 of 2/);
+  expect(nav.textContent).toMatch(/Page 2/);
   const lastButtons = [...nav.querySelectorAll("button")];
   expect(lastButtons[0].disabled).toBe(false);
   expect(lastButtons[1].disabled).toBe(true);

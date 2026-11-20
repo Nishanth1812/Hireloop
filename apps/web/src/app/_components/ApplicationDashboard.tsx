@@ -16,6 +16,8 @@ type Props = {
   result: ApplicationPage;
   filters: ApplicationFilters;
   page: number;
+  hasPrevious: boolean;
+  hasNext: boolean;
   loading: boolean;
   loadError: boolean;
   saving: boolean;
@@ -31,12 +33,13 @@ type Props = {
   onRemove: (application: Application) => void;
   onApplyFilters: (filters: ApplicationFilters) => void;
   onClearFilters: () => void;
-  onPageChange: (page: number) => void;
+  onPrevious: () => void;
+  onNext: () => void;
 };
 
 export function ApplicationDashboard({
-  email, result, filters, page, loading, loadError, saving, busyId, editingApplication, error, notice,
-  onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onApplyFilters, onClearFilters, onPageChange,
+  email, result, filters, page, hasPrevious, hasNext, loading, loadError, saving, busyId, editingApplication, error, notice,
+  onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onApplyFilters, onClearFilters, onPrevious, onNext,
 }: Props) {
   // Counts come from the API for every matching row, never from the current
   // page, so the summary stays honest while paging or filtering.
@@ -92,6 +95,8 @@ export function ApplicationDashboard({
             result={result}
             filters={filters}
             page={page}
+            hasPrevious={hasPrevious}
+            hasNext={hasNext}
             loading={loading}
             loadError={loadError}
             busyId={busyId}
@@ -100,7 +105,8 @@ export function ApplicationDashboard({
             onStatusChange={onStatusChange}
             onEdit={onEdit}
             onRemove={onRemove}
-            onPageChange={onPageChange}
+            onPrevious={onPrevious}
+            onNext={onNext}
             onClearFilters={onClearFilters}
           />
         </div>

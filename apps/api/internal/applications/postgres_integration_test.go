@@ -139,8 +139,8 @@ func TestPostgresCreateAndClearDefaultChannel(t *testing.T) {
 func strptr(s string) *string { return &s }
 
 // TestPostgresStatusFilteredTotalsMatchItems is the regression test for the
-// totals defect: with a status filter, total/total_pages must match the rows the
-// page query returns, while the saved/applied counts still describe the whole
+// totals defect: with a status filter, total must describe the rows the keyset
+// page can return, while the saved/applied counts still describe the whole
 // filtered set.
 func TestPostgresStatusFilteredTotalsMatchItems(t *testing.T) {
 	store, db, owner := openIntegrationStore(t)
@@ -152,14 +152,14 @@ func TestPostgresStatusFilteredTotalsMatchItems(t *testing.T) {
 	insertSeedRow(ctx, t, db, owner, "Acme", "Saved Two", "saved", base.Add(time.Minute))
 	insertSeedRow(ctx, t, db, owner, "Globex", "Applied One", "applied", base.Add(2*time.Minute))
 
-	applied, err := store.List(ctx, owner, Query{Status: "applied", Page: 1, PageSize: 2})
+	applied, err := store.List(ctx, owner, Query{Status: "applied", PageSize: 2})
 	if err != nil {
 		t.Fatalf("list applied: %v", err)
 	}
 	if applied.Total != 1 {
 		t.Fatalf("status-filtered total = %d, want 1", applied.Total)
 	}
-	if applied.TotalPages != 1 || len(applied.Items) != 1 {
+	if len(applied.Items) != 1 || applied.NextCursor != "" {
 		t.Fatalf("status-filtered page = %+v", applied)
 	}
 	if applied.Items[0].Status != "applied" {
@@ -170,30 +170,117 @@ func TestPostgresStatusFilteredTotalsMatchItems(t *testing.T) {
 		t.Fatalf("counts under status filter = %+v, want saved 2 applied 1", applied.Counts)
 	}
 
-	saved, err := store.List(ctx, owner, Query{Status: "saved", Page: 1, PageSize: 1})
+	saved, err := store.List(ctx, owner, Query{Status: "saved", PageSize: 1})
 	if err != nil {
 		t.Fatalf("list saved: %v", err)
 	}
-	if saved.Total != 2 || saved.TotalPages != 2 || len(saved.Items) != 1 {
-		t.Fatalf("saved page one = %+v, want total 2 pages 2 one row", saved)
+	if saved.Total != 2 || len(saved.Items) != 1 || saved.NextCursor == "" {
+		t.Fatalf("saved page one = %+v, want total 2 one row and a next page", saved)
 	}
 
-	unfiltered, err := store.List(ctx, owner, Query{Page: 1, PageSize: 2})
+	unfiltered, err := store.List(ctx, owner, Query{PageSize: 2})
 	if err != nil {
 		t.Fatalf("list unfiltered: %v", err)
 	}
-	if unfiltered.Total != 3 || unfiltered.TotalPages != 2 {
-		t.Fatalf("unfiltered = %+v, want total 3 pages 2", unfiltered)
+	if unfiltered.Total != 3 || len(unfiltered.Items) != 2 || unfiltered.NextCursor == "" {
+		t.Fatalf("unfiltered = %+v, want total 3 two rows and a next page", unfiltered)
 	}
 	if unfiltered.Counts.Saved != 2 || unfiltered.Counts.Applied != 1 {
 		t.Fatalf("unfiltered counts = %+v", unfiltered.Counts)
 	}
 }
 
-// TestPostgresPaginationBoundariesAndBoundedOffset covers page boundaries, the
-// out-of-range page, and a very large page number that must not overflow into a
-// negative OFFSET (which would surface as a database error).
-func TestPostgresPaginationBoundariesAndBoundedOffset(t *testing.T) {
+// TestPostgresKeysetPaginationWalksEveryRowOnce covers the keyset contract:
+// walking with next_cursor returns every row exactly once in newest-first
+// order, the last page offers no further cursor, and a cursor that points past
+// the end (or before the start) is a valid position rather than an error.
+func TestPostgresKeysetPaginationWalksEveryRowOnce(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	ids := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		ids = append(ids, insertSeedRow(ctx, t, db, owner, "Acme", fmt.Sprintf("Role %d", i), "saved", base.Add(time.Duration(i)*time.Minute)))
+	}
+
+	seen := map[string]bool{}
+	order := make([]string, 0, 5)
+	var after *Cursor
+	for page := 1; ; page++ {
+		if page > 10 {
+			t.Fatal("cursor walk did not terminate")
+		}
+		result, err := store.List(ctx, owner, Query{PageSize: 2, After: after})
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if result.Total != 5 || result.PageSize != 2 {
+			t.Fatalf("page %d = %+v, want total 5", page, result)
+		}
+		for _, item := range result.Items {
+			if seen[item.ID] {
+				t.Fatalf("row %s repeated across pages", item.ID)
+			}
+			seen[item.ID] = true
+			order = append(order, item.Role)
+		}
+		if result.NextCursor == "" {
+			if page != 3 {
+				t.Fatalf("walk ended after %d pages, want 3", page)
+			}
+			break
+		}
+		next, err := Query{PageSize: 2}.decodeCursor(result.NextCursor)
+		if err != nil {
+			t.Fatalf("decode next cursor: %v", err)
+		}
+		after = &next
+	}
+	if len(seen) != 5 {
+		t.Fatalf("saw %d distinct rows across pages, want 5", len(seen))
+	}
+	// Newest first, with the page boundaries at 2 and 4.
+	wantOrder := []string{"Role 4", "Role 3", "Role 2", "Role 1", "Role 0"}
+	for i := range wantOrder {
+		if order[i] != wantOrder[i] {
+			t.Fatalf("order = %v, want %v", order, wantOrder)
+		}
+	}
+
+	// A cursor at the last row (the oldest, because the list is newest first)
+	// returns nothing and offers no next page.
+	atEnd := Cursor{CreatedAt: base, ID: ids[0]}
+	end, err := store.List(ctx, owner, Query{PageSize: 2, After: &atEnd})
+	if err != nil {
+		t.Fatalf("cursor at the last row: %v", err)
+	}
+	if len(end.Items) != 0 || end.NextCursor != "" || end.Total != 5 {
+		t.Fatalf("cursor at the last row = %+v, want empty total 5", end)
+	}
+
+	// A cursor in the future is a valid position before every row, so it
+	// returns the first page of the whole list. A cursor before the oldest row
+	// is past the end and returns nothing. Neither may error: a cursor is a
+	// position, not a row lookup.
+	future := Cursor{CreatedAt: base.Add(24 * time.Hour), ID: ids[0]}
+	ahead, err := store.List(ctx, owner, Query{PageSize: 2, After: &future})
+	if err != nil || len(ahead.Items) != 2 || ahead.NextCursor == "" {
+		t.Fatalf("cursor beyond the newest row = %+v, err = %v", ahead, err)
+	}
+	past := Cursor{CreatedAt: base.Add(-24 * time.Hour), ID: ids[0]}
+	behind, err := store.List(ctx, owner, Query{PageSize: 2, After: &past})
+	if err != nil || len(behind.Items) != 0 || behind.NextCursor != "" {
+		t.Fatalf("cursor before the oldest row = %+v, err = %v", behind, err)
+	}
+}
+
+// TestPostgresKeysetIgnoresInsertsBetweenRequests is the core Phase 2
+// regression: inserting rows between two page requests must not repeat or skip
+// a row the way OFFSET paging does. A row inserted ahead of the cursor appears
+// only if it sorts after the cursor; rows already behind it never shift.
+func TestPostgresKeysetIgnoresInsertsBetweenRequests(t *testing.T) {
 	store, db, owner := openIntegrationStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -203,49 +290,251 @@ func TestPostgresPaginationBoundariesAndBoundedOffset(t *testing.T) {
 		insertSeedRow(ctx, t, db, owner, "Acme", fmt.Sprintf("Role %d", i), "saved", base.Add(time.Duration(i)*time.Minute))
 	}
 
-	seen := map[string]bool{}
-	for page := 1; page <= 3; page++ {
-		result, err := store.List(ctx, owner, Query{Page: page, PageSize: 2})
-		if err != nil {
-			t.Fatalf("page %d: %v", page, err)
-		}
-		wantRows := 2
-		if page == 3 {
-			wantRows = 1
-		}
-		if result.Total != 5 || result.TotalPages != 3 || len(result.Items) != wantRows {
-			t.Fatalf("page %d = %+v, want total 5 pages 3 %d rows", page, result, wantRows)
-		}
-		for _, item := range result.Items {
-			if seen[item.ID] {
-				t.Fatalf("row %s repeated across pages", item.ID)
-			}
-			seen[item.ID] = true
-		}
-	}
-	if len(seen) != 5 {
-		t.Fatalf("saw %d distinct rows across pages, want 5", len(seen))
-	}
-
-	// Newest first: page one begins with the most recently created row.
-	first, err := store.List(ctx, owner, Query{Page: 1, PageSize: 2})
+	first, err := store.List(ctx, owner, Query{PageSize: 2})
 	if err != nil {
 		t.Fatalf("first page: %v", err)
 	}
-	if first.Items[0].Role != "Role 4" {
-		t.Fatalf("newest-first order = %q, want Role 4", first.Items[0].Role)
+	if len(first.Items) != 2 || first.Items[0].Role != "Role 4" || first.Items[1].Role != "Role 3" {
+		t.Fatalf("first page = %+v", first)
+	}
+	if first.NextCursor == "" {
+		t.Fatal("first page must offer a next cursor")
+	}
+	after, err := Query{PageSize: 2}.decodeCursor(first.NextCursor)
+	if err != nil {
+		t.Fatalf("decode cursor: %v", err)
 	}
 
-	// Out-of-range and huge pages are empty but still report the true total and
-	// must not error (no negative OFFSET overflow).
-	for _, page := range []int{9, 1000000000} {
-		result, err := store.List(ctx, owner, Query{Page: page, PageSize: 2})
+	// A newer row sorts before the cursor and must not shift later pages; a row
+	// between the cursor and the next page (older than 3m, newer than 2m) sorts
+	// after it and must appear.
+	insertSeedRow(ctx, t, db, owner, "Acme", "Role 5", "saved", base.Add(5*time.Minute))
+	insertSeedRow(ctx, t, db, owner, "Acme", "Role 3b", "saved", base.Add(2*time.Minute+30*time.Second))
+
+	second, err := store.List(ctx, owner, Query{PageSize: 2, After: &after})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if got := roles(second.Items); !equalStrings(got, []string{"Role 3b", "Role 2"}) {
+		t.Fatalf("second page roles = %v, want [Role 3b Role 2]", got)
+	}
+	third, err := store.List(ctx, owner, Query{PageSize: 2, After: mustCursor(t, second)})
+	if err != nil {
+		t.Fatalf("third page: %v", err)
+	}
+	if got := roles(third.Items); !equalStrings(got, []string{"Role 1", "Role 0"}) {
+		t.Fatalf("third page roles = %v, want [Role 1 Role 0]", got)
+	}
+	// Role 5 was inserted ahead of the cursor and never reappears on a later
+	// page; every original row is still present exactly once.
+	seen := map[string]bool{}
+	for _, item := range append(append([]Application{}, first.Items...), append(second.Items, third.Items...)...) {
+		if seen[item.Role] {
+			t.Fatalf("role %s repeated across pages", item.Role)
+		}
+		seen[item.Role] = true
+	}
+	for _, role := range []string{"Role 0", "Role 1", "Role 2", "Role 3", "Role 4"} {
+		if !seen[role] {
+			t.Fatalf("original row %s was skipped", role)
+		}
+	}
+}
+
+// TestPostgresKeysetSurvivesDeletesBetweenRequests proves the cursor is a
+// position, not a row reference: deleting rows between requests, including the
+// row the cursor points at, must not break the walk or repeat a row.
+func TestPostgresKeysetSurvivesDeletesBetweenRequests(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	ids := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		ids = append(ids, insertSeedRow(ctx, t, db, owner, "Acme", fmt.Sprintf("Role %d", i), "saved", base.Add(time.Duration(i)*time.Minute)))
+	}
+
+	first, err := store.List(ctx, owner, Query{PageSize: 2})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if got := roles(first.Items); !equalStrings(got, []string{"Role 4", "Role 3"}) {
+		t.Fatalf("first page roles = %v", got)
+	}
+	after, err := Query{PageSize: 2}.decodeCursor(first.NextCursor)
+	if err != nil {
+		t.Fatalf("decode cursor: %v", err)
+	}
+
+	// Delete the row already seen (Role 4), the row the cursor points at
+	// (Role 3), and an unseen row (Role 2).
+	for _, id := range []string{ids[4], ids[3], ids[2]} {
+		if _, err := db.ExecContext(ctx, `DELETE FROM applications WHERE user_id = $1 AND id = $2`, owner, id); err != nil {
+			t.Fatalf("delete seed row: %v", err)
+		}
+	}
+
+	second, err := store.List(ctx, owner, Query{PageSize: 2, After: &after})
+	if err != nil {
+		t.Fatalf("second page after deletes: %v", err)
+	}
+	if got := roles(second.Items); !equalStrings(got, []string{"Role 1", "Role 0"}) {
+		t.Fatalf("second page roles = %v, want [Role 1 Role 0]", got)
+	}
+	if second.NextCursor != "" {
+		t.Fatalf("second page should be the last page, got cursor %q", second.NextCursor)
+	}
+	if second.Total != 2 {
+		t.Fatalf("total after deletes = %d, want 2", second.Total)
+	}
+}
+
+// TestPostgresKeysetBreaksTiesById covers the deterministic tie-break: rows
+// that share a created_at are ordered by id, so a page boundary through a run
+// of identical timestamps still returns each row exactly once.
+func TestPostgresKeysetBreaksTiesById(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	same := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		insertSeedRow(ctx, t, db, owner, "Acme", fmt.Sprintf("Role %d", i), "saved", same)
+	}
+
+	rows, err := db.QueryContext(ctx, `SELECT id FROM applications WHERE user_id = $1 ORDER BY id DESC`, owner)
+	if err != nil {
+		t.Fatalf("read expected order: %v", err)
+	}
+	want := make([]string, 0, 5)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan expected order: %v", err)
+		}
+		want = append(want, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("expected order rows: %v", err)
+	}
+	if len(want) != 5 {
+		t.Fatalf("expected order has %d rows, want 5", len(want))
+	}
+
+	got := make([]string, 0, 5)
+	var after *Cursor
+	for page := 1; ; page++ {
+		if page > 10 {
+			t.Fatal("cursor walk did not terminate")
+		}
+		result, err := store.List(ctx, owner, Query{PageSize: 2, After: after})
 		if err != nil {
-			t.Fatalf("page %d overflowed: %v", page, err)
+			t.Fatalf("page %d: %v", page, err)
 		}
-		if len(result.Items) != 0 || result.Total != 5 || result.TotalPages != 3 {
-			t.Fatalf("page %d = %+v, want empty total 5 pages 3", page, result)
+		for _, item := range result.Items {
+			got = append(got, item.ID)
 		}
+		if result.NextCursor == "" {
+			break
+		}
+		next, err := Query{PageSize: 2}.decodeCursor(result.NextCursor)
+		if err != nil {
+			t.Fatalf("decode next cursor: %v", err)
+		}
+		after = &next
+	}
+	if !equalStrings(got, want) {
+		t.Fatalf("same-timestamp order = %v, want %v", got, want)
+	}
+}
+
+// TestPostgresKeysetDoesNotOfferAnEmptyNextPage pins the look-ahead boundary:
+// a page that ends exactly on the last row offers no next cursor, so the UI
+// never renders a control that leads to an empty page.
+func TestPostgresKeysetDoesNotOfferAnEmptyNextPage(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 4; i++ {
+		insertSeedRow(ctx, t, db, owner, "Acme", fmt.Sprintf("Role %d", i), "saved", base.Add(time.Duration(i)*time.Minute))
+	}
+
+	first, err := store.List(ctx, owner, Query{PageSize: 2})
+	if err != nil || len(first.Items) != 2 || first.NextCursor == "" {
+		t.Fatalf("first page = %+v, err = %v", first, err)
+	}
+	after, err := Query{PageSize: 2}.decodeCursor(first.NextCursor)
+	if err != nil {
+		t.Fatalf("decode cursor: %v", err)
+	}
+	second, err := store.List(ctx, owner, Query{PageSize: 2, After: &after})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(second.Items) != 2 || second.NextCursor != "" {
+		t.Fatalf("second page = %+v, want two rows and no next cursor", second)
+	}
+
+	// Exactly one page of rows also offers no next cursor.
+	exact, err := store.List(ctx, owner, Query{PageSize: 4})
+	if err != nil || len(exact.Items) != 4 || exact.NextCursor != "" {
+		t.Fatalf("exact page = %+v, err = %v", exact, err)
+	}
+}
+
+// TestPostgresKeysetStaysOwnerScopedAndFiltered proves the page query applies
+// owner and filter predicates together with the cursor: a cursor minted for one
+// owner or filter set cannot widen another owner's or filter's results.
+func TestPostgresKeysetStaysOwnerScopedAndFiltered(t *testing.T) {
+	store, db, ownerA := openIntegrationStore(t)
+	ownerB := randomOwner(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	insertSeedRow(ctx, t, db, ownerA, "Acme", "Saved Old", "saved", base)
+	insertSeedRow(ctx, t, db, ownerA, "Acme", "Applied Mid", "applied", base.Add(time.Minute))
+	insertSeedRow(ctx, t, db, ownerA, "Acme", "Saved New", "saved", base.Add(2*time.Minute))
+	insertSeedRow(ctx, t, db, ownerB, "Globex", "Other Owner", "saved", base.Add(-time.Minute))
+
+	first, err := store.List(ctx, ownerA, Query{PageSize: 1})
+	if err != nil || len(first.Items) != 1 || first.Items[0].Role != "Saved New" || first.NextCursor == "" {
+		t.Fatalf("owner A first page = %+v, err = %v", first, err)
+	}
+	after, err := Query{PageSize: 1}.decodeCursor(first.NextCursor)
+	if err != nil {
+		t.Fatalf("decode cursor: %v", err)
+	}
+
+	// The same cursor under owner B returns only B's row, never A's.
+	other, err := store.List(ctx, ownerB, Query{PageSize: 10, After: &after})
+	if err != nil {
+		t.Fatalf("owner B list: %v", err)
+	}
+	if other.Total != 1 || len(other.Items) != 1 || other.Items[0].Role != "Other Owner" {
+		t.Fatalf("owner B page = %+v, want only its own row", other)
+	}
+
+	// A status filter composes with the cursor: only saved rows after it.
+	saved, err := store.List(ctx, ownerA, Query{Status: "saved", PageSize: 10, After: &after})
+	if err != nil {
+		t.Fatalf("filtered list: %v", err)
+	}
+	if saved.Total != 2 || len(saved.Items) != 1 || saved.Items[0].Role != "Saved Old" {
+		t.Fatalf("saved page = %+v, want Saved Old", saved)
+	}
+
+	// The same position without the status filter returns both older rows.
+	all, err := store.List(ctx, ownerA, Query{PageSize: 10, After: &after})
+	if err != nil {
+		t.Fatalf("unfiltered list: %v", err)
+	}
+	if got := roles(all.Items); !equalStrings(got, []string{"Applied Mid", "Saved Old"}) {
+		t.Fatalf("unfiltered page roles = %v", got)
 	}
 }
 
@@ -262,7 +551,7 @@ func TestPostgresOwnershipIsolation(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if list, err := store.List(ctx, ownerB, Query{Page: 1, PageSize: 25}); err != nil || list.Total != 0 || len(list.Items) != 0 {
+	if list, err := store.List(ctx, ownerB, Query{PageSize: 25}); err != nil || list.Total != 0 || len(list.Items) != 0 {
 		t.Fatalf("other owner list = %+v, err = %v", list, err)
 	}
 	if got, err := store.Get(ctx, ownerB, created.ID); err != nil || got.ID != "" {
@@ -306,7 +595,7 @@ func TestPostgresPreExistingRowsReadAsNotRecorded(t *testing.T) {
 		t.Fatalf("pre-005 row optional fields = %+v, want all empty", got)
 	}
 
-	list, err := store.List(ctx, owner, Query{Page: 1, PageSize: 25})
+	list, err := store.List(ctx, owner, Query{PageSize: 25})
 	if err != nil || list.Total != 1 || len(list.Items) != 1 {
 		t.Fatalf("list pre-005 row = %+v, err = %v", list, err)
 	}
@@ -365,20 +654,54 @@ func TestPostgresSearchMatchesAndEscapesWildcards(t *testing.T) {
 	}
 
 	// Case-insensitive match on company.
-	byCompany, err := store.List(ctx, owner, Query{Search: "acme", Page: 1, PageSize: 25})
+	byCompany, err := store.List(ctx, owner, Query{Search: "acme", PageSize: 25})
 	if err != nil || byCompany.Total != 1 || byCompany.Items[0].Company != "Acme" {
 		t.Fatalf("search acme = %+v, err = %v", byCompany, err)
 	}
 
 	// Searching for "%" matches only the literal one, not every row.
-	byPercent, err := store.List(ctx, owner, Query{Search: "%", Page: 1, PageSize: 25})
+	byPercent, err := store.List(ctx, owner, Query{Search: "%", PageSize: 25})
 	if err != nil || byPercent.Total != 1 || byPercent.Items[0].ID != wildcardID {
 		t.Fatalf("search %% = %+v, err = %v", byPercent, err)
 	}
 
 	// Searching for "_" matches only the literal underscore in the job ID.
-	byUnderscore, err := store.List(ctx, owner, Query{Search: "_", Page: 1, PageSize: 25})
+	byUnderscore, err := store.List(ctx, owner, Query{Search: "_", PageSize: 25})
 	if err != nil || byUnderscore.Total != 1 || byUnderscore.Items[0].ID != wildcardID {
 		t.Fatalf("search _ = %+v, err = %v", byUnderscore, err)
 	}
+}
+
+func roles(items []Application) []string {
+	values := make([]string, 0, len(items))
+	for _, item := range items {
+		values = append(values, item.Role)
+	}
+	return values
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// mustCursor decodes a list's next cursor or fails the test. The unfiltered
+// Query matches the filter binding of every list that uses it here.
+func mustCursor(t *testing.T, result ListResult) *Cursor {
+	t.Helper()
+	if result.NextCursor == "" {
+		t.Fatalf("result has no next cursor: %+v", result)
+	}
+	cursor, err := Query{PageSize: result.PageSize}.decodeCursor(result.NextCursor)
+	if err != nil {
+		t.Fatalf("decode next cursor: %v", err)
+	}
+	return &cursor
 }

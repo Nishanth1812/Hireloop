@@ -17,16 +17,16 @@ type user struct {
 	Email string `json:"email"`
 }
 
-// applicationPage is the bounded list envelope. Items is one page; Total and
-// Counts describe every matching row so the UI never has to infer totals from a
-// page, and never claims more or fewer results than the query returned.
+// applicationPage is the bounded list envelope. Items is one keyset page;
+// Total and Counts describe every matching row so the UI never has to infer
+// totals from a page, and never claims more or fewer results than the query
+// returned. NextCursor is null on the last page.
 type applicationPage struct {
 	Items      []applications.Application `json:"items"`
-	Page       int                        `json:"page"`
 	PageSize   int                        `json:"page_size"`
 	Total      int                        `json:"total"`
-	TotalPages int                        `json:"total_pages"`
 	Counts     applicationCounts          `json:"counts"`
+	NextCursor *string                    `json:"next_cursor"`
 }
 
 // applicationCounts describe the current filters except status, so the
@@ -145,17 +145,21 @@ func NewHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper,
 		if result.Items == nil {
 			result.Items = []applications.Application{}
 		}
+		var nextCursor *string
+		if result.NextCursor != "" {
+			cursor := result.NextCursor
+			nextCursor = &cursor
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(applicationPage{
-			Items:      result.Items,
-			Page:       result.Page,
-			PageSize:   result.PageSize,
-			Total:      result.Total,
-			TotalPages: result.TotalPages,
+			Items:    result.Items,
+			PageSize: result.PageSize,
+			Total:    result.Total,
 			Counts: applicationCounts{
 				Saved:   result.Counts.Saved,
 				Applied: result.Counts.Applied,
 			},
+			NextCursor: nextCursor,
 		})
 	})
 	mux.HandleFunc("GET /api/applications/{id}", func(w http.ResponseWriter, r *http.Request) {

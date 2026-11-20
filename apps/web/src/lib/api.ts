@@ -29,15 +29,16 @@ export type ApplicationFilters = {
   channel: "" | ApplicationChannel;
 };
 
-// ApplicationPage is the API's bounded list envelope. Total and Counts describe
-// every matching row, so the UI never infers totals from a single page.
+// ApplicationPage is the API's bounded keyset page. Field names mirror the
+// wire format exactly, including snake_case. Total and Counts describe every
+// matching row, so the UI never infers totals from a single page. next_cursor
+// is an opaque position returned by the API, or null on the last page.
 export type ApplicationPage = {
   items: Application[];
-  page: number;
-  pageSize: number;
+  page_size: number;
   total: number;
-  totalPages: number;
   counts: { saved: number; applied: number };
+  next_cursor: string | null;
 };
 
 async function request<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
@@ -71,12 +72,18 @@ export function toChannel(value: string): Application["channel"] {
   return value === "campus" || value === "off-campus" ? value : "";
 }
 
-export function listApplications(token: string, filters: ApplicationFilters, page = 1): Promise<ApplicationPage> {
-  const params = new URLSearchParams({ page: String(page) });
+// listApplications fetches one keyset page. cursor is the API's opaque
+// next_cursor; null (or omitted) requests the first page. Filters are sent
+// together with the cursor so the API can reject a token minted for a
+// different filter set instead of silently skipping rows.
+export function listApplications(token: string, filters: ApplicationFilters, cursor: string | null = null): Promise<ApplicationPage> {
+  const params = new URLSearchParams();
+  if (cursor) params.set("cursor", cursor);
   if (filters.q.trim()) params.set("q", filters.q.trim());
   if (filters.status) params.set("status", filters.status);
   if (filters.channel) params.set("channel", filters.channel);
-  return request(`/api/applications?${params.toString()}`, token);
+  const query = params.toString();
+  return request(`/api/applications${query ? `?${query}` : ""}`, token);
 }
 
 export function createApplication(token: string, input: ApplicationInput): Promise<Application> {

@@ -18,11 +18,10 @@ const noFilters: ApplicationFilters = { q: "", status: "", channel: "" };
 
 const firstPage: ApplicationPage = {
   items: [],
-  page: 1,
-  pageSize: 25,
+  page_size: 25,
   total: 0,
-  totalPages: 0,
   counts: { saved: 0, applied: 0 },
+  next_cursor: null,
 };
 
 function messageFrom(error: unknown) {
@@ -40,7 +39,13 @@ export default function ApplicationTracker() {
 function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof useSession>["session"]> | null }) {
   const [result, setResult] = useState<ApplicationPage>(firstPage);
   const [filters, setFilters] = useState<ApplicationFilters>(noFilters);
-  const [page, setPage] = useState(1);
+  // Keyset pagination: history[index] is the cursor that produced the page at
+  // that index, with null for the first page. Keeping the trail lets Previous
+  // return to an exact position instead of recomputing an offset, and changing
+  // filters or creating a record resets it to the first page.
+  const [history, setHistory] = useState<Array<string | null>>([null]);
+  const [pageIndex, setPageIndex] = useState(0);
+  const cursor = history[pageIndex] ?? null;
   // Bumping this refetches the current query after a mutation so totals and
   // counts always come from the API instead of local arithmetic.
   const [reloadKey, setReloadKey] = useState(0);
@@ -64,24 +69,28 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   useEffect(() => {
     if (!session) return;
     let cancelled = false;
+    // Set when the requested page lost its last rows to a concurrent delete;
+    // loading must stay true while the previous page is fetched.
+    let steppingBack = false;
     void (async () => {
+      setLoading(true);
+      setLoadError(false);
+      setError("");
       try {
         const token = await session.getToken();
         if (cancelled) return;
         if (!token) throw new Error("Your session is unavailable. Please sign in again.");
-        setLoading(true);
-        setLoadError(false);
-        setError("");
-        const next = await listApplications(token, filters, page);
-        if (!cancelled) {
-          setResult(next);
-          setLoadError(false);
-          // A page can fall out of range when rows are deleted elsewhere; settle
-          // on the last real page instead of showing a misleading empty page.
-          if (next.totalPages > 0 && page > next.totalPages) {
-            setPage(next.totalPages);
-          }
+        const next = await listApplications(token, filters, cursor);
+        if (cancelled) return;
+        if (next.items.length === 0 && pageIndex > 0) {
+          // The cursor page is empty because rows were deleted elsewhere. Step
+          // back to the previous position instead of showing a dead page.
+          steppingBack = true;
+          setPageIndex(pageIndex - 1);
+          return;
         }
+        setResult(next);
+        setLoadError(false);
       } catch (caught: unknown) {
         if (!cancelled) {
           // Drop the previous page's rows: they describe a different query.
@@ -90,21 +99,36 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
           setError(messageFrom(caught));
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled && !steppingBack) setLoading(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [session, filters, page, reloadKey]);
+  }, [session, filters, cursor, pageIndex, reloadKey]);
 
   function reload() {
     setReloadKey((key) => key + 1);
   }
 
   function applyFilters(next: ApplicationFilters) {
-    setPage(1);
+    // A cursor is bound to the filters that produced it, so a new query must
+    // start from the first page rather than seek from the old position.
+    setHistory([null]);
+    setPageIndex(0);
     setFilters(next);
+  }
+
+  function goPrevious() {
+    if (pageIndex === 0) return;
+    setPageIndex(pageIndex - 1);
+  }
+
+  function goNext() {
+    const next = result.next_cursor;
+    if (!next) return;
+    setHistory((previous) => [...previous.slice(0, pageIndex + 1), next]);
+    setPageIndex(pageIndex + 1);
   }
 
   async function addApplication(event: FormEvent<HTMLFormElement>) {
@@ -253,13 +277,9 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     try {
       const token = await sessionToken();
       await deleteApplication(token, application.id);
-      // Deleting the last row of a later page must move back a page instead of
-      // leaving the user on an empty page.
-      if (result.items.length === 1 && page > 1) {
-        setPage(page - 1);
-      } else {
-        reload();
-      }
+      // Reload the same keyset position. If that was the last row on a later
+      // page, the load effect steps back instead of showing a dead page.
+      reload();
       setNotice(`Application at ${application.company} was deleted.`);
     } catch (caught) {
       setError(messageFrom(caught));
@@ -278,7 +298,9 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     email={session.user.emailAddresses[0]?.emailAddress ?? ""}
     result={result}
     filters={filters}
-    page={page}
+    page={pageIndex + 1}
+    hasPrevious={pageIndex > 0}
+    hasNext={result.next_cursor !== null}
     loading={loading}
     loadError={loadError}
     saving={saving}
@@ -294,6 +316,7 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     onRemove={(application) => void removeApplication(application)}
     onApplyFilters={applyFilters}
     onClearFilters={() => applyFilters(noFilters)}
-    onPageChange={setPage}
+    onPrevious={goPrevious}
+    onNext={goNext}
   />;
 }

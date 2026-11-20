@@ -5,11 +5,10 @@ const api = await import("./api.ts").catch(() => null);
 
 const page = (overrides = {}) => ({
   items: [],
-  page: 1,
-  pageSize: 25,
+  page_size: 25,
   total: 0,
-  totalPages: 0,
   counts: { saved: 0, applied: 0 },
+  next_cursor: null,
   ...overrides,
 });
 
@@ -21,27 +20,27 @@ test("application client exposes the supported API operations", () => {
   assert.equal(typeof api.deleteApplication, "function");
 });
 
-test("list sends the session token and reads the paged envelope", async () => {
+test("list sends the session token and reads the keyset envelope", async () => {
   assert.ok(api, "application API client is missing");
   const originalFetch = globalThis.fetch;
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url, options };
-    return Response.json(page({ items: [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }], total: 1, totalPages: 1 }));
+    return Response.json(page({ items: [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }], total: 1, next_cursor: "cursor-1" }));
   };
   try {
     const result = await api.listApplications("access-token", { q: "", status: "", channel: "" });
-    assert.equal(request.url, "/api/applications?page=1");
+    assert.equal(request.url, "/api/applications");
     assert.equal(request.options.headers.Authorization, "Bearer access-token");
     assert.equal(result.items[0].id, "app-1");
     assert.equal(result.total, 1);
-    assert.equal(result.totalPages, 1);
+    assert.equal(result.next_cursor, "cursor-1");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("list sends only the filters that are set and the requested page", async () => {
+test("list sends only the filters that are set and the requested cursor", async () => {
   assert.ok(api, "application API client is missing");
   const originalFetch = globalThis.fetch;
   let request;
@@ -50,19 +49,22 @@ test("list sends only the filters that are set and the requested page", async ()
     return Response.json(page());
   };
   try {
-    await api.listApplications("access-token", { q: "  acme  ", status: "applied", channel: "campus" }, 3);
+    await api.listApplications("access-token", { q: "  acme  ", status: "applied", channel: "campus" }, "cursor-1");
     const url = new URL(request.url, "http://localhost");
     assert.equal(url.pathname, "/api/applications");
-    assert.equal(url.searchParams.get("page"), "3");
+    assert.equal(url.searchParams.get("cursor"), "cursor-1");
     assert.equal(url.searchParams.get("q"), "acme");
     assert.equal(url.searchParams.get("status"), "applied");
     assert.equal(url.searchParams.get("channel"), "campus");
 
-    await api.listApplications("access-token", { q: "   ", status: "", channel: "" }, 1);
+    await api.listApplications("access-token", { q: "   ", status: "", channel: "" }, null);
     const bare = new URL(request.url, "http://localhost");
     assert.equal(bare.searchParams.has("q"), false);
     assert.equal(bare.searchParams.has("status"), false);
     assert.equal(bare.searchParams.has("channel"), false);
+    assert.equal(bare.searchParams.has("cursor"), false);
+    // The default argument is the first page, not a cursor.
+    assert.equal(bare.pathname, "/api/applications");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -193,7 +195,7 @@ test("a rejected request returns a useful message", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response("invalid application query", { status: 400 });
   try {
-    await assert.rejects(api.listApplications("access-token", { q: "", status: "", channel: "" }, 0), /API rejected/);
+    await assert.rejects(api.listApplications("access-token", { q: "", status: "", channel: "" }, "cursor-1"), /API rejected/);
   } finally {
     globalThis.fetch = originalFetch;
   }

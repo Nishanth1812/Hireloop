@@ -44,17 +44,16 @@ function account(id, getToken = async () => id) {
 function page(overrides = {}) {
   return {
     items: [],
-    page: 1,
-    pageSize: 25,
+    page_size: 25,
     total: 0,
-    totalPages: 0,
     counts: { saved: 0, applied: 0 },
+    next_cursor: null,
     ...overrides,
   };
 }
 function response(company) {
   const items = company ? [{ id: company, company, role: "Engineer", status: "saved" }] : [];
-  return Response.json(page({ items, total: items.length, totalPages: items.length ? 1 : 0, counts: { saved: items.length, applied: 0 } }));
+  return Response.json(page({ items, total: items.length, counts: { saved: items.length, applied: 0 } }));
 }
 async function render() {
   await act(async () => { root.render(<ApplicationTracker />); });
@@ -114,7 +113,7 @@ test("a successful create clears a stale load error so the new record is visible
       return Response.json({ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }, { status: 201 });
     }
     const items = [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }];
-    return Response.json(page({ items, total: 1, totalPages: 1, counts: { saved: 1, applied: 0 } }));
+    return Response.json(page({ items, total: 1, counts: { saved: 1, applied: 0 } }));
   };
   session = account("a");
   await render();
@@ -130,43 +129,71 @@ test("a successful create clears a stale load error so the new record is visible
   expect(calls).toBe(3);
 });
 
-test("changing the page requests that page from the API", async () => {
-  const urls = [];
-  globalThis.fetch = async (url) => { urls.push(url); return response(null); };
-  session = account("a");
-  await render();
-  await act(async () => { dashboardProps.onPageChange(2); });
-  expect(urls.at(-1)).toBe("/api/applications?page=2");
-  expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("2");
-});
-
-test("a page beyond the last one settles on the last real page", async () => {
+test("next requests the page after the current cursor", async () => {
   const urls = [];
   globalThis.fetch = async (url) => {
     urls.push(url);
-    if (url.includes("page=3")) {
-      return Response.json(page({ items: [], page: 3, total: 42, totalPages: 2, counts: { saved: 40, applied: 2 } }));
-    }
-    const items = [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }];
-    return Response.json(page({ items, total: 42, totalPages: 2, counts: { saved: 40, applied: 2 } }));
+    return Response.json(page({ items: [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }], total: 2, next_cursor: "cursor-1" }));
   };
   session = account("a");
   await render();
-  await act(async () => { dashboardProps.onPageChange(3); });
-  expect(urls.at(-1)).toBe("/api/applications?page=2");
+  await act(async () => { dashboardProps.onNext(); });
+  expect(urls.at(-1)).toBe("/api/applications?cursor=cursor-1");
   expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("2");
 });
 
-test("applying filters returns to page one and sends every filter", async () => {
+test("previous returns to the cursor that produced the earlier page", async () => {
   const urls = [];
-  globalThis.fetch = async (url) => { urls.push(url); return response(null); };
+  globalThis.fetch = async (url) => {
+    urls.push(url);
+    if (url.includes("cursor=cursor-1")) {
+      return Response.json(page({ items: [{ id: "app-2", company: "Globex", role: "Engineer", status: "saved" }], total: 2 }));
+    }
+    return Response.json(page({ items: [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }], total: 2, next_cursor: "cursor-1" }));
+  };
   session = account("a");
   await render();
-  await act(async () => { dashboardProps.onPageChange(3); });
+  await act(async () => { dashboardProps.onNext(); });
+  await act(async () => { dashboardProps.onPrevious(); });
+  expect(urls.at(-1)).toBe("/api/applications");
+  expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("1");
+});
+
+test("a page emptied by a concurrent delete steps back to the previous page", async () => {
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(url);
+    if (url.includes("cursor=cursor-1")) {
+      return Response.json(page({ items: [], total: 1 }));
+    }
+    if (urls.length === 1) {
+      return Response.json(page({ items: [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }], total: 2, next_cursor: "cursor-1" }));
+    }
+    return Response.json(page({ items: [{ id: "app-2", company: "Globex", role: "Engineer", status: "saved" }], total: 1 }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onNext(); });
+  expect(urls.at(-1)).toBe("/api/applications");
+  expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("1");
+});
+
+test("applying filters resets the cursor and sends every filter", async () => {
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(url);
+    if (url.includes("cursor=")) {
+      return Response.json(page({ items: [{ id: "app-2", company: "Globex", role: "Engineer", status: "saved" }], total: 2 }));
+    }
+    return Response.json(page({ items: [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }], total: 2, next_cursor: "cursor-1" }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onNext(); });
   await act(async () => {
     dashboardProps.onApplyFilters({ q: "acme", status: "applied", channel: "campus" });
   });
-  expect(urls.at(-1)).toBe("/api/applications?page=1&q=acme&status=applied&channel=campus");
+  expect(urls.at(-1)).toBe("/api/applications?q=acme&status=applied&channel=campus");
   expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("1");
 });
 
@@ -177,18 +204,21 @@ test("creating an application clears the filters and shows page one", async () =
     if (options.method === "POST") {
       return Response.json({ id: "app-9", company: "NewCo", role: "Engineer", status: "saved" }, { status: 201 });
     }
-    return response(null);
+    if (url.includes("cursor=")) {
+      return Response.json(page({ items: [], total: 1 }));
+    }
+    return Response.json(page({ items: [], total: 1, next_cursor: "cursor-1" }));
   };
   session = account("a");
   await render();
-  await act(async () => { dashboardProps.onPageChange(3); });
+  await act(async () => { dashboardProps.onNext(); });
   await act(async () => { dashboardProps.onApplyFilters({ q: "old", status: "saved", channel: "" }); });
 
   await act(async () => {
     await dashboardProps.onCreate({ preventDefault() {}, currentTarget: formWith({ company: "NewCo", role: "Engineer", status: "saved" }) });
   });
 
-  expect(urls.at(-1)).toBe("/api/applications?page=1");
+  expect(urls.at(-1)).toBe("/api/applications");
   expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("1");
   expect(container.querySelector('[data-testid="filters"]')?.textContent).toBe("||");
 });
@@ -202,7 +232,7 @@ test("saving an edit patches only the changed fields and reloads the current pag
       return Response.json({ ...original, company: "Acme Labs", status: "applied" });
     }
     const items = [{ ...original, company: "Acme Labs", status: "applied" }];
-    return Response.json(page({ items, total: 1, totalPages: 1, counts: { saved: 0, applied: 1 } }));
+    return Response.json(page({ items, total: 1, counts: { saved: 0, applied: 1 } }));
   };
   session = account("a");
   await render();
@@ -218,15 +248,40 @@ test("saving an edit patches only the changed fields and reloads the current pag
   // change to an untouched field is never overwritten.
   expect(JSON.parse(patch.body)).toEqual({ company: "Acme Labs", status: "applied" });
   // A patch is followed by a reload so counts and ordering come from the API.
-  expect(requests.at(-1).url).toBe("/api/applications?page=1");
+  expect(requests.at(-1).url).toBe("/api/applications");
   expect(container.textContent).toContain("Acme Labs");
+});
+
+test("saving an edit reloads the current cursor page", async () => {
+  const requests = [];
+  const original = { id: "app-1", company: "Acme", role: "Engineer", status: "saved", url: "", source: "", channel: "", job_id: "", applied_on: "", address: "", notes: "" };
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, method: options.method, body: options.body });
+    if (options.method === "PATCH") {
+      return Response.json({ ...original, company: "Acme Labs" });
+    }
+    if (url.includes("cursor=")) {
+      return Response.json(page({ items: [{ ...original, company: "Acme Labs" }], total: 2 }));
+    }
+    return Response.json(page({ items: [original], total: 2, next_cursor: "cursor-1" }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onNext(); });
+  await act(async () => { dashboardProps.onEdit(original); });
+  await act(async () => {
+    await dashboardProps.onSaveEdit({ preventDefault() {}, currentTarget: formWith({ company: "Acme Labs", role: "Engineer", status: "saved" }) }, "app-1");
+  });
+
+  // The reload keeps the keyset position instead of jumping back to page one.
+  expect(requests.at(-1).url).toBe("/api/applications?cursor=cursor-1");
 });
 
 test("a rejected edit keeps the form open and surfaces the API message", async () => {
   const original = { id: "app-1", company: "Acme", role: "Engineer", status: "saved", url: "", source: "", channel: "", job_id: "", applied_on: "", address: "", notes: "" };
   globalThis.fetch = async (url, options) => {
     if (options.method === "PATCH") return new Response("invalid application", { status: 400 });
-    return Response.json(page({ items: [original], total: 1, totalPages: 1, counts: { saved: 1, applied: 0 } }));
+    return Response.json(page({ items: [original], total: 1, counts: { saved: 1, applied: 0 } }));
   };
   session = account("a");
   await render();
@@ -243,15 +298,22 @@ test("a rejected edit keeps the form open and surfaces the API message", async (
   expect(dashboardProps.editingApplication?.id).toBe("app-1");
 });
 
-test("changing the page or filters keeps an open edit instead of discarding it", async () => {
+test("paging or filtering keeps an open edit instead of discarding it", async () => {
   const original = { id: "app-1", company: "Acme", role: "Engineer", status: "saved", url: "", source: "", channel: "", job_id: "", applied_on: "", address: "", notes: "" };
-  globalThis.fetch = async () => Response.json(page({ items: [original], total: 1, totalPages: 1, counts: { saved: 1, applied: 0 } }));
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    if (calls === 1) {
+      return Response.json(page({ items: [original], total: 2, next_cursor: "cursor-1", counts: { saved: 1, applied: 1 } }));
+    }
+    return Response.json(page({ items: [original], total: 1, counts: { saved: 1, applied: 0 } }));
+  };
   session = account("a");
   await render();
   await act(async () => { dashboardProps.onEdit(original); });
   expect(dashboardProps.editingApplication?.id).toBe("app-1");
 
-  await act(async () => { dashboardProps.onPageChange(2); });
+  await act(async () => { dashboardProps.onNext(); });
   expect(dashboardProps.editingApplication?.id).toBe("app-1");
 
   await act(async () => { dashboardProps.onApplyFilters({ q: "acme", status: "", channel: "" }); });
