@@ -8,6 +8,7 @@ import {
   deleteApplication,
   listApplications,
   patchApplication,
+  toChannel,
 } from "@/lib/api";
 import type { Application, ApplicationFilters, ApplicationPage } from "@/lib/api";
 import { ApplicationDashboard } from "./_components/ApplicationDashboard";
@@ -130,7 +131,7 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         status: String(data.get("status")) as Application["status"],
         url,
         source: String(data.get("source") ?? "").trim(),
-        channel: String(data.get("channel") ?? "").trim(),
+        channel: toChannel(String(data.get("channel") ?? "").trim()),
         job_id: String(data.get("job_id") ?? "").trim(),
         applied_on: String(data.get("applied_on") ?? "").trim(),
         address: String(data.get("address") ?? "").trim(),
@@ -195,7 +196,7 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         status: String(data.get("status")) as Application["status"],
         url,
         source: String(data.get("source") ?? "").trim(),
-        channel: String(data.get("channel") ?? "").trim(),
+        channel: toChannel(String(data.get("channel") ?? "").trim()),
         job_id: String(data.get("job_id") ?? "").trim(),
         applied_on: String(data.get("applied_on") ?? "").trim(),
         address: String(data.get("address") ?? "").trim(),
