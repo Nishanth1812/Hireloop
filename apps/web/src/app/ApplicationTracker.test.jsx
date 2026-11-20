@@ -10,16 +10,22 @@ globalThis.FormData = browser.FormData;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 let session;
+let dashboardProps;
 mock.module("@clerk/nextjs", () => ({
   useSession: () => ({ isLoaded: true, session }),
 }));
 mock.module("./_components/ApplicationDashboard", () => ({
-  ApplicationDashboard: ({ email, applications, error, loading }) => <div>
-    <span>{email}</span>
-    <span>{loading ? "Loading" : "Ready"}</span>
-    {error && <p role="alert">{error}</p>}
-    {applications.map((item) => <p key={item.id}>{item.company}</p>)}
-  </div>,
+  ApplicationDashboard: (props) => {
+    dashboardProps = props;
+    const { email, applications, error, loading, loadError } = props;
+    return <div>
+      <span>{email}</span>
+      <span>{loading ? "Loading" : "Ready"}</span>
+      {loadError && <p data-testid="load-error">Load failed</p>}
+      {error && <p role="alert">{error}</p>}
+      {applications.map((item) => <p key={item.id}>{item.company}</p>)}
+    </div>;
+  },
 }));
 mock.module("./_components/SignInPanel", () => ({
   SignInPanel: () => <p>Sign in</p>,
@@ -72,6 +78,31 @@ test("API session rejection is visible and does not leave loading active", async
   await render();
   expect(container.querySelector('[role="alert"]')?.textContent).toContain("session has expired");
   expect(container.textContent).toContain("Ready");
+});
+
+test("a successful create clears a stale load error so the new record is visible", async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    if (calls === 1) return new Response("unavailable", { status: 503 });
+    return new Response(JSON.stringify({ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }), { status: 201 });
+  };
+  session = account("a");
+  await render();
+  expect(container.querySelector('[data-testid="load-error"]') !== null).toBe(true);
+  expect(container.textContent).toContain("Ready");
+
+  const form = document.createElement("form");
+  for (const [name, value] of Object.entries({ company: "Acme", role: "Engineer", status: "saved" })) {
+    const input = document.createElement("input");
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }
+  await act(async () => { await dashboardProps.onCreate({ preventDefault() {}, currentTarget: form }); });
+
+  expect(container.querySelector('[data-testid="load-error"]') === null).toBe(true);
+  expect(container.textContent).toContain("Acme");
 });
 
 test("a token resolving after sign-out cannot trigger an application request", async () => {

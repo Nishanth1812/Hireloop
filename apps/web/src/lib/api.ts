@@ -9,13 +9,21 @@ export type ApplicationInput = Pick<Application, "company" | "role" | "status">;
 export type ApplicationPatch = Partial<ApplicationInput>;
 
 async function request<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: {
-      ...init.headers,
-      Authorization: `Bearer ${token}`,
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      headers: {
+        ...init.headers,
+        Authorization: `Bearer ${token}`,
+      },
+    });
+  } catch {
+    // A thrown fetch (offline, DNS/connection refused, CORS) is a transport
+    // failure, not an application error. Surface the same honest message as a
+    // 503 so the UI never shows a raw "Failed to fetch".
+    throw new Error("The API or database is unavailable. Check that the API is running and configured.");
+  }
 
   if (response.status === 401) throw new Error("Your session has expired. Sign out and sign in again.");
   if (response.status === 503) throw new Error("The API or database is unavailable. Check that the API is running and configured.");
