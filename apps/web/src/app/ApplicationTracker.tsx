@@ -10,7 +10,7 @@ import {
   patchApplication,
   toChannel,
 } from "@/lib/api";
-import type { Application, ApplicationFilters, ApplicationPage } from "@/lib/api";
+import type { Application, ApplicationFilters, ApplicationPage, ApplicationPatch } from "@/lib/api";
 import { ApplicationDashboard } from "./_components/ApplicationDashboard";
 import { SignInPanel } from "./_components/SignInPanel";
 
@@ -48,7 +48,10 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   const [loadError, setLoadError] = useState(false);
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState("");
-  const [editingId, setEditingId] = useState("");
+  // The open editor keeps its own snapshot of the record. Deriving it from the
+  // current page instead would unmount the form and drop unsaved input whenever
+  // a page or filter change (or a background reload) pushed the row off it.
+  const [editing, setEditing] = useState<Application | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -172,6 +175,13 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   async function saveEdit(event: FormEvent<HTMLFormElement>, id: string) {
     event.preventDefault();
     if (!session) return;
+    const original = editing;
+    if (!original) {
+      // The edit form only exists while a record is open, so there is nothing
+      // to diff against if this fires without one.
+      setError("Reopen the application to edit it.");
+      return;
+    }
     const form = event.currentTarget;
     const data = new FormData(form);
     const company = String(data.get("company") ?? "").trim();
@@ -185,25 +195,44 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
       setError("Enter the job posting link starting with http:// or https://.");
       return;
     }
+    // Send only the fields the user actually changed. A full-record PATCH would
+    // overwrite a field someone else edited between load and save; a partial
+    // patch leaves every untouched field alone.
+    const patch: ApplicationPatch = {};
+    if (company !== original.company) patch.company = company;
+    if (role !== original.role) patch.role = role;
+    const status = String(data.get("status")) as Application["status"];
+    if (status !== original.status) patch.status = status;
+    if (url !== original.url) patch.url = url;
+    const source = String(data.get("source") ?? "").trim();
+    if (source !== original.source) patch.source = source;
+    const channel = toChannel(String(data.get("channel") ?? "").trim());
+    if (channel !== original.channel) patch.channel = channel;
+    const jobID = String(data.get("job_id") ?? "").trim();
+    if (jobID !== original.job_id) patch.job_id = jobID;
+    const appliedOn = String(data.get("applied_on") ?? "").trim();
+    if (appliedOn !== original.applied_on) patch.applied_on = appliedOn;
+    const address = String(data.get("address") ?? "").trim();
+    if (address !== original.address) patch.address = address;
+    const notes = String(data.get("notes") ?? "").trim();
+    if (notes !== original.notes) patch.notes = notes;
+
+    if (Object.keys(patch).length === 0) {
+      // Nothing changed; close without a pointless write that could still
+      // clobber a concurrent edit.
+      setEditing(null);
+      setNotice("No changes to save.");
+      return;
+    }
+
     setSaving(true);
     setError("");
     setNotice("");
     try {
       const token = await sessionToken();
-      const updated = await patchApplication(token, id, {
-        company,
-        role,
-        status: String(data.get("status")) as Application["status"],
-        url,
-        source: String(data.get("source") ?? "").trim(),
-        channel: toChannel(String(data.get("channel") ?? "").trim()),
-        job_id: String(data.get("job_id") ?? "").trim(),
-        applied_on: String(data.get("applied_on") ?? "").trim(),
-        address: String(data.get("address") ?? "").trim(),
-        notes: String(data.get("notes") ?? "").trim(),
-      });
+      const updated = await patchApplication(token, id, patch);
       reload();
-      setEditingId("");
+      setEditing(null);
       setNotice(`Details updated for ${updated.company}.`);
     } catch (caught) {
       setError(messageFrom(caught));
@@ -243,7 +272,7 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     return <SignInPanel />;
   }
 
-  const editingApplication = result.items.find((item) => item.id === editingId) ?? null;
+  const editingApplication = editing;
 
   return <ApplicationDashboard
     email={session.user.emailAddresses[0]?.emailAddress ?? ""}
@@ -259,8 +288,8 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     notice={notice}
     onCreate={addApplication}
     onStatusChange={(application, status) => void changeStatus(application, status)}
-    onEdit={(application) => { setEditingId(application.id); setError(""); setNotice(""); }}
-    onCancelEdit={() => setEditingId("")}
+    onEdit={(application) => { setEditing(application); setError(""); setNotice(""); }}
+    onCancelEdit={() => setEditing(null)}
     onSaveEdit={(event, id) => void saveEdit(event, id)}
     onRemove={(application) => void removeApplication(application)}
     onApplyFilters={applyFilters}
