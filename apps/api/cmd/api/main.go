@@ -13,12 +13,14 @@ import (
 	"hireloop/api/internal/clerk"
 	"hireloop/api/internal/httpapi"
 	"hireloop/api/internal/identities"
+	"hireloop/api/internal/tasks"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func main() {
 	var store applications.Store
+	var taskStore tasks.Store
 	var db *sql.DB
 	if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" {
 		var err error
@@ -28,6 +30,7 @@ func main() {
 		}
 		defer db.Close()
 		store = applications.PostgresStore{DB: db}
+		taskStore = tasks.PostgresStore{DB: db}
 	}
 
 	// Clerk authentication (migration target). Supabase remains the database.
@@ -70,7 +73,7 @@ func main() {
 	}
 	server := &http.Server{
 		Addr:              address,
-		Handler:           httpapi.NewHandler(clerkVerifier, identityMapper, store),
+		Handler:           httpapi.NewHandlerWithTasks(clerkVerifier, identityMapper, store, taskStore),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("Hireloop API listening on http://%s", server.Addr)

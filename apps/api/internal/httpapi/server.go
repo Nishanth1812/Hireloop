@@ -10,6 +10,7 @@ import (
 	"hireloop/api/internal/applications"
 	"hireloop/api/internal/clerk"
 	"hireloop/api/internal/identities"
+	"hireloop/api/internal/tasks"
 )
 
 type user struct {
@@ -36,7 +37,13 @@ type applicationCounts struct {
 	Applied int `json:"applied"`
 }
 
+// NewHandler keeps the applications-only handler used by existing callers and
+// tests. Production wires task routes through NewHandlerWithTasks.
 func NewHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store) http.Handler {
+	return NewHandlerWithTasks(clerkVerifier, identityMapper, store, nil)
+}
+
+func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store, taskStore tasks.Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -245,6 +252,131 @@ func NewHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper,
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// Task routes. The owner always comes from the verified session; a body
+	// field or a guessed id can only ever narrow to that owner's rows.
+	taskFailure := func(w http.ResponseWriter, err error) {
+		if errors.Is(err, tasks.ErrNotFound) {
+			http.Error(w, "task not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "tasks unavailable", http.StatusServiceUnavailable)
+	}
+	mux.HandleFunc("POST /api/tasks", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		var input tasks.Input
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&input) != nil || decoder.Decode(&struct{}{}) != io.EOF || !input.Valid() {
+			http.Error(w, "invalid task", http.StatusBadRequest)
+			return
+		}
+		if taskStore == nil {
+			http.Error(w, "tasks unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		task, err := taskStore.Create(r.Context(), u.ID, input)
+		if err != nil {
+			taskFailure(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(task)
+	})
+	mux.HandleFunc("GET /api/tasks", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		if taskStore == nil {
+			http.Error(w, "tasks unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		values := r.URL.Query()
+		for key := range values {
+			if key != "filter" {
+				http.Error(w, "invalid task query", http.StatusBadRequest)
+				return
+			}
+		}
+		filter := tasks.Filter{}
+		if values.Has("filter") && values.Get("filter") == "" {
+			http.Error(w, "invalid task query", http.StatusBadRequest)
+			return
+		}
+		switch values.Get("filter") {
+		case "", "open":
+		case "all":
+			filter.ShowAll = true
+		default:
+			http.Error(w, "invalid task query", http.StatusBadRequest)
+			return
+		}
+		items, err := taskStore.List(r.Context(), u.ID, filter)
+		if err != nil {
+			taskFailure(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			Items []tasks.Task `json:"items"`
+		}{Items: items})
+	})
+	mux.HandleFunc("GET /api/tasks/{id}", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		id := r.PathValue("id")
+		if !tasks.ValidID(id) {
+			http.Error(w, "invalid task ID", http.StatusBadRequest)
+			return
+		}
+		if taskStore == nil {
+			http.Error(w, "tasks unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		task, err := taskStore.Get(r.Context(), u.ID, id)
+		if err != nil {
+			taskFailure(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(task)
+	})
+	mux.HandleFunc("PATCH /api/tasks/{id}", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		id := r.PathValue("id")
+		if !tasks.ValidID(id) {
+			http.Error(w, "invalid task ID", http.StatusBadRequest)
+			return
+		}
+		var input tasks.PatchInput
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&input) != nil || decoder.Decode(&struct{}{}) != io.EOF || !input.Valid() {
+			http.Error(w, "invalid task", http.StatusBadRequest)
+			return
+		}
+		if taskStore == nil {
+			http.Error(w, "tasks unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		task, err := taskStore.Patch(r.Context(), u.ID, id, input)
+		if err != nil {
+			taskFailure(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(task)
 	})
 	return mux
 }
