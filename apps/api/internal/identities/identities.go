@@ -1,15 +1,15 @@
 // Package identities maps verified Clerk subjects to existing Supabase
-// auth.users owners. Existing applications.user_id ownership (a UUID FK to
-// auth.users(id)) is preserved; Clerk subjects are never written into it.
+// auth.users owners. Existing applications.user_id ownership is preserved:
+// migration 003 stores user_id as text and drops its auth.users foreign key, so
+// a bound Clerk subject keeps writing its Supabase owner id while an unbound
+// Clerk signup owns its records by Clerk subject. Linking is explicit and never
+// inferred from matching email addresses, which prevents insecure identity
+// linking between providers.
 //
-// Linking is explicit: a row in user_identities binds one Clerk subject to
-// one Supabase owner. We never auto-link by matching email addresses, which
-// prevents insecure identity linking between separate providers.
-//
-// Resolve returns found=false when no binding exists. The authentication
-// layer treats an unbound Clerk subject as a new Clerk signup whose stable
-// owner is the Clerk subject itself; it never guesses a Supabase owner from
-// email or any other claim.
+// Resolve returns found=false when no binding exists. The authentication layer
+// treats an unbound Clerk subject as a new Clerk signup whose stable owner is
+// the Clerk subject itself; it never guesses a Supabase owner from email or any
+// other claim.
 package identities
 
 import (
