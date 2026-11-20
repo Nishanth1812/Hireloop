@@ -21,6 +21,10 @@ export function ApplicationCaptureForm({ saving, onSubmit }: {
           <option value="saved">Saved</option>
           <option value="applied">Applied</option>
         </select>
+        <label htmlFor="source">Source <span className="optional">optional</span></label>
+        <input id="source" name="source" maxLength={200} placeholder="e.g. LinkedIn, referral" />
+        <label htmlFor="address">Address used <span className="optional">optional</span></label>
+        <input id="address" name="address" maxLength={200} autoComplete="email" placeholder="e.g. me@example.com" />
         <button className="button primary" type="submit" disabled={saving}>
           {saving ? "Adding…" : "Add application"}
         </button>

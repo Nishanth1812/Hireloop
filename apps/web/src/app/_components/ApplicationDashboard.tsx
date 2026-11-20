@@ -1,10 +1,12 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import type { FormEvent } from "react";
 import Link from "next/link";
 import { SignOutButton } from "@clerk/nextjs";
 import type { Application } from "@/lib/api";
 import { ApplicationCaptureForm } from "./ApplicationCaptureForm";
+import { ApplicationEditForm } from "./ApplicationEditForm";
 import { ApplicationList } from "./ApplicationList";
 import { ThemeControl } from "./ThemeControl";
 
@@ -15,19 +17,34 @@ type Props = {
   loadError: boolean;
   saving: boolean;
   busyId: string;
+  editingApplication: Application | null;
   error: string;
   notice: string;
   onCreate: (event: FormEvent<HTMLFormElement>) => void;
   onStatusChange: (application: Application, status: Application["status"]) => void;
+  onEdit: (application: Application) => void;
+  onCancelEdit: () => void;
+  onSaveEdit: (event: FormEvent<HTMLFormElement>, id: string) => void;
   onRemove: (application: Application) => void;
 };
 
 export function ApplicationDashboard({
-  email, applications, loading, loadError, saving, busyId, error, notice,
-  onCreate, onStatusChange, onRemove,
+  email, applications, loading, loadError, saving, busyId, editingApplication, error, notice,
+  onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove,
 }: Props) {
   const savedCount = applications.filter((item) => item.status === "saved").length;
   const appliedCount = applications.length - savedCount;
+  const lastEditingId = useRef("");
+  const editingId = editingApplication?.id ?? "";
+
+  useEffect(() => {
+    if (editingId) {
+      document.getElementById("edit-company")?.focus();
+    } else if (lastEditingId.current) {
+      document.getElementById(`edit-button-${lastEditingId.current}`)?.focus();
+    }
+    lastEditingId.current = editingId;
+  }, [editingId]);
 
   return (
     <main className="page-shell">
@@ -62,10 +79,23 @@ export function ApplicationDashboard({
           loading={loading}
           loadError={loadError}
           busyId={busyId}
+          saving={saving}
+          editingId={editingApplication?.id ?? ""}
           onStatusChange={onStatusChange}
+          onEdit={onEdit}
           onRemove={onRemove}
         />
-        <ApplicationCaptureForm saving={saving} onSubmit={onCreate} />
+        <div hidden={!!editingApplication}>
+          <ApplicationCaptureForm saving={saving} onSubmit={onCreate} />
+        </div>
+        {editingApplication && (
+          <ApplicationEditForm
+            application={editingApplication}
+            saving={saving}
+            onSave={onSaveEdit}
+            onCancel={onCancelEdit}
+          />
+        )}
       </div>
       <footer className="footer-note">Hireloop keeps your job search organized, one next step at a time.</footer>
     </main>

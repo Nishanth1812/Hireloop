@@ -105,6 +105,34 @@ test("a successful create clears a stale load error so the new record is visible
   expect(container.textContent).toContain("Acme");
 });
 
+test("saving an edit patches the record and updates the displayed row", async () => {
+  let patchBody;
+  let patchUrl;
+  globalThis.fetch = async (url, options) => {
+    if (options.method === "PATCH") {
+      patchUrl = url;
+      patchBody = JSON.parse(options.body);
+      return new Response(JSON.stringify({ id: "app-1", company: "Acme Labs", role: "Engineer", status: "applied", source: "Referral", address: "me@example.com" }));
+    }
+    return new Response(JSON.stringify([{ id: "app-1", company: "Acme", role: "Engineer", status: "saved", source: "", address: "" }]));
+  };
+  session = account("a");
+  await render();
+
+  const form = document.createElement("form");
+  for (const [name, value] of Object.entries({ company: "Acme Labs", role: "Engineer", status: "applied", source: "Referral", address: "me@example.com" })) {
+    const input = document.createElement("input");
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }
+  await act(async () => { await dashboardProps.onSaveEdit({ preventDefault() {}, currentTarget: form }, "app-1"); });
+
+  expect(patchUrl).toBe("/api/applications/app-1");
+  expect(patchBody).toEqual({ company: "Acme Labs", role: "Engineer", status: "applied", source: "Referral", address: "me@example.com" });
+  expect(container.textContent).toContain("Acme Labs");
+});
+
 test("a token resolving after sign-out cannot trigger an application request", async () => {
   let completeToken;
   let requests = 0;

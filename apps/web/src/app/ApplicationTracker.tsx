@@ -31,6 +31,7 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   const [loadError, setLoadError] = useState(false);
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState("");
+  const [editingId, setEditingId] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -77,6 +78,8 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     const data = new FormData(form);
     const company = String(data.get("company") ?? "").trim();
     const role = String(data.get("role") ?? "").trim();
+    const source = String(data.get("source") ?? "").trim();
+    const address = String(data.get("address") ?? "").trim();
     if (!company || !role) {
       setError("Enter a company and role to add this application.");
       return;
@@ -90,6 +93,8 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         company,
         role,
         status: String(data.get("status")) as Application["status"],
+        source,
+        address,
       });
       // A successful write proves the API is reachable, so a stale load error
       // from an earlier failed refresh must not keep contradicting the new row.
@@ -123,6 +128,41 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     }
   }
 
+  async function saveEdit(event: FormEvent<HTMLFormElement>, id: string) {
+    event.preventDefault();
+    if (!session) return;
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const company = String(data.get("company") ?? "").trim();
+    const role = String(data.get("role") ?? "").trim();
+    if (!company || !role) {
+      setError("Enter a company and role to save this application.");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    setNotice("");
+    try {
+      const token = await sessionToken();
+      const updated = await patchApplication(token, id, {
+        company,
+        role,
+        status: String(data.get("status")) as Application["status"],
+        source: String(data.get("source") ?? "").trim(),
+        address: String(data.get("address") ?? "").trim(),
+      });
+      setApplications((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      setEditingId("");
+      setNotice(`Details updated for ${updated.company}.`);
+    } catch (caught) {
+      setError(messageFrom(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function removeApplication(application: Application) {
     if (
       !session ||
@@ -148,6 +188,8 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     return <SignInPanel />;
   }
 
+  const editingApplication = applications.find((item) => item.id === editingId) ?? null;
+
   return <ApplicationDashboard
     email={session.user.emailAddresses[0]?.emailAddress ?? ""}
     applications={applications}
@@ -155,10 +197,14 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     loadError={loadError}
     saving={saving}
     busyId={busyId}
+    editingApplication={editingApplication}
     error={error}
     notice={notice}
     onCreate={addApplication}
     onStatusChange={(application, status) => void changeStatus(application, status)}
+    onEdit={(application) => { setEditingId(application.id); setError(""); setNotice(""); }}
+    onCancelEdit={() => setEditingId("")}
+    onSaveEdit={(event, id) => void saveEdit(event, id)}
     onRemove={(application) => void removeApplication(application)}
   />;
 }
