@@ -193,18 +193,20 @@ test("creating an application clears the filters and shows page one", async () =
   expect(container.querySelector('[data-testid="filters"]')?.textContent).toBe("||");
 });
 
-test("saving an edit patches the record and reloads the current page", async () => {
+test("saving an edit patches only the changed fields and reloads the current page", async () => {
   const requests = [];
+  const original = { id: "app-1", company: "Acme", role: "Engineer", status: "saved", url: "", source: "", channel: "", job_id: "", applied_on: "", address: "", notes: "" };
   globalThis.fetch = async (url, options) => {
     requests.push({ url, method: options.method, body: options.body });
     if (options.method === "PATCH") {
-      return Response.json({ id: "app-1", company: "Acme Labs", role: "Engineer", status: "applied", job_id: "REQ-1" });
+      return Response.json({ ...original, company: "Acme Labs", status: "applied" });
     }
-    const items = [{ id: "app-1", company: "Acme Labs", role: "Engineer", status: "applied", job_id: "REQ-1" }];
+    const items = [{ ...original, company: "Acme Labs", status: "applied" }];
     return Response.json(page({ items, total: 1, totalPages: 1, counts: { saved: 0, applied: 1 } }));
   };
   session = account("a");
   await render();
+  await act(async () => { dashboardProps.onEdit(original); });
 
   await act(async () => {
     await dashboardProps.onSaveEdit({ preventDefault() {}, currentTarget: formWith({ company: "Acme Labs", role: "Engineer", status: "applied" }) }, "app-1");
@@ -212,24 +214,48 @@ test("saving an edit patches the record and reloads the current page", async () 
 
   const patch = requests.find((item) => item.method === "PATCH");
   expect(patch.url).toBe("/api/applications/app-1");
-  expect(JSON.parse(patch.body)).toEqual({ company: "Acme Labs", role: "Engineer", status: "applied", url: "", source: "", channel: "", job_id: "", applied_on: "", address: "", notes: "" });
+  // Only fields that differ from the loaded record are sent, so a concurrent
+  // change to an untouched field is never overwritten.
+  expect(JSON.parse(patch.body)).toEqual({ company: "Acme Labs", status: "applied" });
   // A patch is followed by a reload so counts and ordering come from the API.
   expect(requests.at(-1).url).toBe("/api/applications?page=1");
   expect(container.textContent).toContain("Acme Labs");
 });
 
 test("a rejected edit keeps the form open and surfaces the API message", async () => {
+  const original = { id: "app-1", company: "Acme", role: "Engineer", status: "saved", url: "", source: "", channel: "", job_id: "", applied_on: "", address: "", notes: "" };
   globalThis.fetch = async (url, options) => {
     if (options.method === "PATCH") return new Response("invalid application", { status: 400 });
-    return response(null);
+    return Response.json(page({ items: [original], total: 1, totalPages: 1, counts: { saved: 1, applied: 0 } }));
   };
   session = account("a");
   await render();
+  await act(async () => { dashboardProps.onEdit(original); });
+  // The form is open before the rejected save.
+  expect(dashboardProps.editingApplication?.id).toBe("app-1");
+
   await act(async () => {
-    await dashboardProps.onSaveEdit({ preventDefault() {}, currentTarget: formWith({ company: "Acme", role: "Engineer", status: "saved" }) }, "app-1");
+    await dashboardProps.onSaveEdit({ preventDefault() {}, currentTarget: formWith({ company: "Acme", role: "Engineer", status: "applied" }) }, "app-1");
   });
+
   expect(container.querySelector('[role="alert"]')?.textContent).toContain("API rejected");
-  expect(dashboardProps.editingApplication).toBeNull();
+  // The form stays open with the user's edits intact after a rejection.
+  expect(dashboardProps.editingApplication?.id).toBe("app-1");
+});
+
+test("changing the page or filters keeps an open edit instead of discarding it", async () => {
+  const original = { id: "app-1", company: "Acme", role: "Engineer", status: "saved", url: "", source: "", channel: "", job_id: "", applied_on: "", address: "", notes: "" };
+  globalThis.fetch = async () => Response.json(page({ items: [original], total: 1, totalPages: 1, counts: { saved: 1, applied: 0 } }));
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onEdit(original); });
+  expect(dashboardProps.editingApplication?.id).toBe("app-1");
+
+  await act(async () => { dashboardProps.onPageChange(2); });
+  expect(dashboardProps.editingApplication?.id).toBe("app-1");
+
+  await act(async () => { dashboardProps.onApplyFilters({ q: "acme", status: "", channel: "" }); });
+  expect(dashboardProps.editingApplication?.id).toBe("app-1");
 });
 
 test("a token resolving after sign-out cannot trigger an application request", async () => {
