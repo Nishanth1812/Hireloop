@@ -4,15 +4,18 @@ import { useEffect, useRef } from "react";
 import type { FormEvent } from "react";
 import Link from "next/link";
 import { SignOutButton } from "@clerk/nextjs";
-import type { Application } from "@/lib/api";
+import type { Application, ApplicationFilters, ApplicationPage } from "@/lib/api";
 import { ApplicationCaptureForm } from "./ApplicationCaptureForm";
 import { ApplicationEditForm } from "./ApplicationEditForm";
+import { ApplicationFilterBar } from "./ApplicationFilterBar";
 import { ApplicationList } from "./ApplicationList";
 import { ThemeControl } from "./ThemeControl";
 
 type Props = {
   email: string;
-  applications: Application[];
+  result: ApplicationPage;
+  filters: ApplicationFilters;
+  page: number;
   loading: boolean;
   loadError: boolean;
   saving: boolean;
@@ -26,14 +29,18 @@ type Props = {
   onCancelEdit: () => void;
   onSaveEdit: (event: FormEvent<HTMLFormElement>, id: string) => void;
   onRemove: (application: Application) => void;
+  onApplyFilters: (filters: ApplicationFilters) => void;
+  onClearFilters: () => void;
+  onPageChange: (page: number) => void;
 };
 
 export function ApplicationDashboard({
-  email, applications, loading, loadError, saving, busyId, editingApplication, error, notice,
-  onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove,
+  email, result, filters, page, loading, loadError, saving, busyId, editingApplication, error, notice,
+  onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onApplyFilters, onClearFilters, onPageChange,
 }: Props) {
-  const savedCount = applications.filter((item) => item.status === "saved").length;
-  const appliedCount = applications.length - savedCount;
+  // Counts come from the API for every matching row, never from the current
+  // page, so the summary stays honest while paging or filtering.
+  const total = result.counts.saved + result.counts.applied;
   const lastEditingId = useRef("");
   const editingId = editingApplication?.id ?? "";
 
@@ -64,9 +71,9 @@ export function ApplicationDashboard({
           <p className="muted">A calm place to keep track of every opportunity.</p>
         </div>
         <div className="summary" role="group" aria-label="Application counts">
-          <div><strong>{applications.length}</strong><span>Total</span></div>
-          <div><strong>{savedCount}</strong><span>Saved</span></div>
-          <div><strong>{appliedCount}</strong><span>Applied</span></div>
+          <div><strong>{total}</strong><span>Total</span></div>
+          <div><strong>{result.counts.saved}</strong><span>Saved</span></div>
+          <div><strong>{result.counts.applied}</strong><span>Applied</span></div>
         </div>
       </section>
 
@@ -74,27 +81,41 @@ export function ApplicationDashboard({
       {notice && <p className="message success-message" role="status">{notice}</p>}
 
       <div className="workspace">
-        <ApplicationList
-          applications={applications}
-          loading={loading}
-          loadError={loadError}
-          busyId={busyId}
-          saving={saving}
-          editingId={editingApplication?.id ?? ""}
-          onStatusChange={onStatusChange}
-          onEdit={onEdit}
-          onRemove={onRemove}
-        />
-        <div hidden={!!editingApplication}>
+        <div className="list-column">
+          <ApplicationFilterBar
+            filters={filters}
+            disabled={loading || saving}
+            onApply={onApplyFilters}
+            onClear={onClearFilters}
+          />
+          <ApplicationList
+            result={result}
+            filters={filters}
+            page={page}
+            loading={loading}
+            loadError={loadError}
+            busyId={busyId}
+            saving={saving}
+            editingId={editingApplication?.id ?? ""}
+            onStatusChange={onStatusChange}
+            onEdit={onEdit}
+            onRemove={onRemove}
+            onPageChange={onPageChange}
+            onClearFilters={onClearFilters}
+          />
+        </div>
+        <div className="capture-column" hidden={!!editingApplication}>
           <ApplicationCaptureForm saving={saving} onSubmit={onCreate} />
         </div>
         {editingApplication && (
-          <ApplicationEditForm
-            application={editingApplication}
-            saving={saving}
-            onSave={onSaveEdit}
-            onCancel={onCancelEdit}
-          />
+          <div className="capture-column">
+            <ApplicationEditForm
+              application={editingApplication}
+              saving={saving}
+              onSave={onSaveEdit}
+              onCancel={onCancelEdit}
+            />
+          </div>
         )}
       </div>
       <footer className="footer-note">Hireloop keeps your job search organized, one next step at a time.</footer>

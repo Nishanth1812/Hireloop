@@ -3,6 +3,16 @@ import { test } from "node:test";
 
 const api = await import("./api.ts").catch(() => null);
 
+const page = (overrides = {}) => ({
+  items: [],
+  page: 1,
+  pageSize: 25,
+  total: 0,
+  totalPages: 0,
+  counts: { saved: 0, applied: 0 },
+  ...overrides,
+});
+
 test("application client exposes the supported API operations", () => {
   assert.ok(api, "application API client is missing");
   assert.equal(typeof api.listApplications, "function");
@@ -11,19 +21,48 @@ test("application client exposes the supported API operations", () => {
   assert.equal(typeof api.deleteApplication, "function");
 });
 
-test("list sends the session token and returns applications", async () => {
+test("list sends the session token and reads the paged envelope", async () => {
   assert.ok(api, "application API client is missing");
   const originalFetch = globalThis.fetch;
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url, options };
-    return Response.json([{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }]);
+    return Response.json(page({ items: [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }], total: 1, totalPages: 1 }));
   };
   try {
-    const result = await api.listApplications("access-token");
-    assert.equal(request.url, "/api/applications");
+    const result = await api.listApplications("access-token", { q: "", status: "", channel: "" });
+    assert.equal(request.url, "/api/applications?page=1");
     assert.equal(request.options.headers.Authorization, "Bearer access-token");
-    assert.equal(result[0].id, "app-1");
+    assert.equal(result.items[0].id, "app-1");
+    assert.equal(result.total, 1);
+    assert.equal(result.totalPages, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("list sends only the filters that are set and the requested page", async () => {
+  assert.ok(api, "application API client is missing");
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json(page());
+  };
+  try {
+    await api.listApplications("access-token", { q: "  acme  ", status: "applied", channel: "campus" }, 3);
+    const url = new URL(request.url, "http://localhost");
+    assert.equal(url.pathname, "/api/applications");
+    assert.equal(url.searchParams.get("page"), "3");
+    assert.equal(url.searchParams.get("q"), "acme");
+    assert.equal(url.searchParams.get("status"), "applied");
+    assert.equal(url.searchParams.get("channel"), "campus");
+
+    await api.listApplications("access-token", { q: "   ", status: "", channel: "" }, 1);
+    const bare = new URL(request.url, "http://localhost");
+    assert.equal(bare.searchParams.has("q"), false);
+    assert.equal(bare.searchParams.has("status"), false);
+    assert.equal(bare.searchParams.has("channel"), false);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -57,31 +96,54 @@ test("create posts the validated application fields as JSON", async () => {
   }
 });
 
-test("create posts the optional source and address fields as JSON", async () => {
+test("create posts the manual capture fields as JSON", async () => {
   assert.ok(api, "application API client is missing");
   const originalFetch = globalThis.fetch;
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url, options };
-    return Response.json({ id: "app-3", company: "Northstar", role: "Designer", status: "applied", source: "Referral", address: "me@example.com" }, { status: 201 });
+    return Response.json({
+      id: "app-3",
+      company: "Northstar",
+      role: "Designer",
+      status: "applied",
+      url: "https://jobs.example.com/42",
+      source: "Referral",
+      channel: "campus",
+      job_id: "REQ-42",
+      applied_on: "2026-11-02",
+      address: "me@example.com",
+      notes: "Placement cell notice.",
+    }, { status: 201 });
   };
   try {
     const result = await api.createApplication("access-token", {
       company: "Northstar",
       role: "Designer",
       status: "applied",
+      url: "https://jobs.example.com/42",
       source: "Referral",
+      channel: "campus",
+      job_id: "REQ-42",
+      applied_on: "2026-11-02",
       address: "me@example.com",
+      notes: "Placement cell notice.",
     });
     assert.deepEqual(JSON.parse(request.options.body), {
       company: "Northstar",
       role: "Designer",
       status: "applied",
+      url: "https://jobs.example.com/42",
       source: "Referral",
+      channel: "campus",
+      job_id: "REQ-42",
+      applied_on: "2026-11-02",
       address: "me@example.com",
+      notes: "Placement cell notice.",
     });
-    assert.equal(result.source, "Referral");
-    assert.equal(result.address, "me@example.com");
+    assert.equal(result.channel, "campus");
+    assert.equal(result.applied_on, "2026-11-02");
+    assert.equal(result.notes, "Placement cell notice.");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -112,7 +174,18 @@ test("API unavailability returns a useful message", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(null, { status: 503 });
   try {
-    await assert.rejects(api.listApplications("access-token"), /API or database is unavailable/);
+    await assert.rejects(api.listApplications("access-token", { q: "", status: "", channel: "" }), /API or database is unavailable/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a rejected request returns a useful message", async () => {
+  assert.ok(api, "application API client is missing");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("invalid application query", { status: 400 });
+  try {
+    await assert.rejects(api.listApplications("access-token", { q: "", status: "", channel: "" }, 0), /API rejected/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -123,7 +196,7 @@ test("network failure returns a useful message", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => { throw new TypeError("Failed to fetch"); };
   try {
-    await assert.rejects(api.listApplications("access-token"), /API or database is unavailable/);
+    await assert.rejects(api.listApplications("access-token", { q: "", status: "", channel: "" }), /API or database is unavailable/);
   } finally {
     globalThis.fetch = originalFetch;
   }
