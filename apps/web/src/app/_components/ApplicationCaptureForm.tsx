@@ -2,12 +2,13 @@
 
 import type { FormEvent } from "react";
 
-export function ApplicationCaptureForm({ saving, onSubmit }: {
+export function ApplicationCaptureForm({ saving, hidden, onSubmit }: {
   saving: boolean;
+  hidden?: boolean;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   return (
-    <aside className="capture-panel" aria-labelledby="add-title">
+    <aside className="capture-panel" aria-labelledby="add-title" hidden={hidden}>
       <p className="eyebrow">Quick capture</p>
       <h2 id="add-title">Add an application</h2>
       <p className="muted">Save a role now. Only company and role are required.</p>

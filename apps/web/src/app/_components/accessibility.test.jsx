@@ -265,6 +265,14 @@ test("the filter bar is disabled while the list is loading or saving", async () 
   expect(container.querySelector('button[type="submit"]').disabled).toBe(true);
 });
 
+test("the capture panel is hidden while an edit is open without unmounting the form", async () => {
+  await render(<ApplicationCaptureForm saving={false} hidden onSubmit={noop} />);
+  const panel = container.querySelector(".capture-panel");
+  expect(panel.hasAttribute("hidden")).toBe(true);
+  // The form itself is still mounted, so half-typed capture is not lost.
+  expect(container.querySelector("#company")).not.toBeNull();
+});
+
 test("capture form labels every field and marks company and role required", async () => {
   await render(<ApplicationCaptureForm saving={false} onSubmit={noop} />);
   for (const id of ["company", "role", "status", "url", "source", "channel", "job_id", "applied_on", "address", "notes"]) {
