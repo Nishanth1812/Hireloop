@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -18,10 +19,26 @@ import (
 	"hireloop/api/internal/clerk"
 )
 
+// testRecord pairs a record with the created_at the real store would assign.
+// The fake models the same (created_at DESC, id DESC) order and keyset
+// predicate as PostgresStore so HTTP-level tests exercise real cursor tokens.
+type testRecord struct {
+	applications.Application
+	createdAt time.Time
+}
+
 type testStore struct {
-	records map[string][]applications.Application
+	records map[string][]testRecord
 	seq     int
+	base    time.Time
 	err     error
+}
+
+func newTestStore() *testStore {
+	return &testStore{
+		records: make(map[string][]testRecord),
+		base:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
 }
 
 func TestAuthenticationFailsClosedWithoutClerk(t *testing.T) {
@@ -37,6 +54,17 @@ func TestAuthenticationFailsClosedWithoutClerk(t *testing.T) {
 func (s *testStore) nextID() string {
 	s.seq++
 	return fmt.Sprintf("00000000-0000-0000-0000-%012d", s.seq)
+}
+
+// cursorAt returns the continuation token positioned at a stored row so a test
+// can request the page after a specific record without reaching into the fake.
+func (s *testStore) cursorAt(userID, id string) string {
+	for _, record := range s.records[userID] {
+		if record.ID == id {
+			return applications.EncodeCursor(applications.Query{}, record.createdAt, record.ID)
+		}
+	}
+	return ""
 }
 
 func (s *testStore) Create(_ context.Context, userID string, input applications.Input) (applications.Application, error) {
@@ -56,56 +84,79 @@ func (s *testStore) Create(_ context.Context, userID string, input applications.
 		AppliedOn: input.AppliedOn,
 		Notes:     input.Notes,
 	}
-	s.records[userID] = append(s.records[userID], a)
+	s.records[userID] = append(s.records[userID], testRecord{
+		Application: a,
+		createdAt:   s.base.Add(time.Duration(s.seq) * time.Minute),
+	})
 	return a, nil
 }
 
 // List models the Postgres store's contract: newest first, filters applied
-// before pagination, counts over the same filters except status. The real SQL
-// is not exercised here; no test connects to a database.
+// before pagination, counts over the same filters except status, and a real
+// keyset cursor. The real SQL is not exercised here; no test connects to a
+// database.
 func (s *testStore) List(_ context.Context, userID string, query applications.Query) (applications.ListResult, error) {
 	if s.err != nil {
 		return applications.ListResult{}, s.err
 	}
+	records := append([]testRecord(nil), s.records[userID]...)
+	sort.SliceStable(records, func(i, j int) bool {
+		if !records[i].createdAt.Equal(records[j].createdAt) {
+			return records[i].createdAt.After(records[j].createdAt)
+		}
+		return records[i].ID > records[j].ID
+	})
+
 	// Counts ignore the status filter so they describe the whole filtered set.
-	base := []applications.Application{}
-	for i := len(s.records[userID]) - 1; i >= 0; i-- {
-		app := s.records[userID][i]
-		if query.Channel != "" && app.Channel != query.Channel {
+	matched := make([]testRecord, 0, len(records))
+	for _, record := range records {
+		if query.Channel != "" && record.Channel != query.Channel {
 			continue
 		}
-		if query.Search != "" && !containsFold(app.Company, query.Search) && !containsFold(app.Role, query.Search) && !containsFold(app.JobID, query.Search) {
+		if query.Search != "" && !containsFold(record.Company, query.Search) && !containsFold(record.Role, query.Search) && !containsFold(record.JobID, query.Search) {
 			continue
 		}
-		base = append(base, app)
+		matched = append(matched, record)
 	}
-	result := applications.ListResult{Page: query.Page, PageSize: query.PageSize, Items: []applications.Application{}}
-	for _, app := range base {
-		if app.Status == "saved" {
+	result := applications.ListResult{PageSize: query.PageSize, Items: []applications.Application{}}
+	for _, record := range matched {
+		if record.Status == "saved" {
 			result.Counts.Saved++
 		} else {
 			result.Counts.Applied++
 		}
 	}
-	matches := []applications.Application{}
 	if query.Status != "" {
-		for _, app := range base {
-			if app.Status == query.Status {
-				matches = append(matches, app)
+		filtered := make([]testRecord, 0, len(matched))
+		for _, record := range matched {
+			if record.Status == query.Status {
+				filtered = append(filtered, record)
 			}
 		}
-	} else {
-		matches = base
+		matched = filtered
 	}
-	result.Total = len(matches)
-	result.TotalPages = (result.Total + query.PageSize - 1) / query.PageSize
-	start := (query.Page - 1) * query.PageSize
-	if start < len(matches) {
-		end := start + query.PageSize
-		if end > len(matches) {
-			end = len(matches)
+	result.Total = len(matched)
+
+	// Keyset predicate: strictly after (created_at, id) in descending order.
+	page := make([]testRecord, 0, len(matched))
+	for _, record := range matched {
+		if query.After != nil {
+			if record.createdAt.After(query.After.CreatedAt) {
+				continue
+			}
+			if record.createdAt.Equal(query.After.CreatedAt) && record.ID >= query.After.ID {
+				continue
+			}
 		}
-		result.Items = append(result.Items, matches[start:end]...)
+		page = append(page, record)
+	}
+	if len(page) > query.PageSize {
+		last := page[query.PageSize-1]
+		result.NextCursor = applications.EncodeCursor(query, last.createdAt, last.ID)
+		page = page[:query.PageSize]
+	}
+	for _, record := range page {
+		result.Items = append(result.Items, record.Application)
 	}
 	return result, nil
 }
@@ -118,9 +169,9 @@ func (s *testStore) Get(_ context.Context, userID, id string) (applications.Appl
 	if s.err != nil {
 		return applications.Application{}, s.err
 	}
-	for _, app := range s.records[userID] {
-		if app.ID == id {
-			return app, nil
+	for _, record := range s.records[userID] {
+		if record.ID == id {
+			return record.Application, nil
 		}
 	}
 	return applications.Application{}, nil
@@ -129,39 +180,41 @@ func (s *testStore) Patch(_ context.Context, userID, id string, input applicatio
 	if s.err != nil {
 		return applications.Application{}, s.err
 	}
-	for i, app := range s.records[userID] {
-		if app.ID == id {
+	for i, record := range s.records[userID] {
+		if record.ID == id {
+			app := record.Application
 			if input.Company != nil {
-				s.records[userID][i].Company = *input.Company
+				app.Company = *input.Company
 			}
 			if input.Role != nil {
-				s.records[userID][i].Role = *input.Role
+				app.Role = *input.Role
 			}
 			if input.Status != nil {
-				s.records[userID][i].Status = *input.Status
+				app.Status = *input.Status
 			}
 			if input.Source != nil {
-				s.records[userID][i].Source = *input.Source
+				app.Source = *input.Source
 			}
 			if input.Address != nil {
-				s.records[userID][i].Address = *input.Address
+				app.Address = *input.Address
 			}
 			if input.URL != nil {
-				s.records[userID][i].URL = *input.URL
+				app.URL = *input.URL
 			}
 			if input.Channel != nil {
-				s.records[userID][i].Channel = *input.Channel
+				app.Channel = *input.Channel
 			}
 			if input.JobID != nil {
-				s.records[userID][i].JobID = *input.JobID
+				app.JobID = *input.JobID
 			}
 			if input.AppliedOn != nil {
-				s.records[userID][i].AppliedOn = *input.AppliedOn
+				app.AppliedOn = *input.AppliedOn
 			}
 			if input.Notes != nil {
-				s.records[userID][i].Notes = *input.Notes
+				app.Notes = *input.Notes
 			}
-			return s.records[userID][i], nil
+			s.records[userID][i].Application = app
+			return app, nil
 		}
 	}
 	return applications.Application{}, nil
@@ -170,14 +223,14 @@ func (s *testStore) Delete(_ context.Context, userID, id string) (bool, error) {
 	if s.err != nil {
 		return false, s.err
 	}
-	var filtered []applications.Application
+	filtered := make([]testRecord, 0, len(s.records[userID]))
 	found := false
-	for _, app := range s.records[userID] {
-		if app.ID == id {
+	for _, record := range s.records[userID] {
+		if record.ID == id {
 			found = true
 			continue
 		}
-		filtered = append(filtered, app)
+		filtered = append(filtered, record)
 	}
 	s.records[userID] = filtered
 	return found, nil
@@ -194,7 +247,7 @@ func clerkStore(t *testing.T, bindings map[string]string) (*testStore, http.Hand
 	token := signTestRS256WithKey(t, key, now, map[string]any{"sub": "clerk-a"}, "kid")
 	verifier := clerk.NewStaticVerifier("https://clerk.example.com", map[string]*rsa.PublicKey{"kid": &key.PublicKey})
 	verifier.SetNow(func() time.Time { return now })
-	store := &testStore{records: make(map[string][]applications.Application)}
+	store := newTestStore()
 	return store, NewHandler(verifier, testMapper{bindings: bindings}, store), token
 }
 
@@ -209,7 +262,7 @@ func TestApplicationsRequireClerkAndEnforceOwnerIsolation(t *testing.T) {
 	expired := signTestRS256WithKey(t, key, now.Add(-2*time.Hour), map[string]any{"sub": "clerk-a"}, "kid")
 	verifier := clerk.NewStaticVerifier("https://clerk.example.com", map[string]*rsa.PublicKey{"kid": &key.PublicKey})
 	verifier.SetNow(func() time.Time { return now })
-	store := &testStore{records: make(map[string][]applications.Application)}
+	store := newTestStore()
 	handler := NewHandler(verifier, testMapper{bindings: map[string]string{"clerk-a": "owner-a", "clerk-b": "owner-b"}}, store)
 	request := func(method, token, body, path string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, bytes.NewBufferString(body))
@@ -368,11 +421,11 @@ func TestApplicationManualFieldsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestApplicationListIsPagedFilteredAndBounded covers the bounded, stable
-// pagination and filtering contract, including honest totals on out-of-range
-// pages and rejection of malformed query parameters.
+// TestApplicationListIsPagedFilteredAndBounded covers the bounded keyset
+// pagination and filtering contract: honest totals, no repeated rows, an empty
+// page past the end, and rejection of malformed query parameters and cursors.
 func TestApplicationListIsPagedFilteredAndBounded(t *testing.T) {
-	_, handler, token := clerkStore(t, map[string]string{"clerk-a": "owner-a"})
+	store, handler, token := clerkStore(t, map[string]string{"clerk-a": "owner-a"})
 	request := func(path string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
 		r.Header.Set("Authorization", "Bearer "+token)
@@ -396,10 +449,9 @@ func TestApplicationListIsPagedFilteredAndBounded(t *testing.T) {
 
 	type page struct {
 		Items      []applications.Application `json:"items"`
-		Page       int                        `json:"page"`
 		PageSize   int                        `json:"page_size"`
 		Total      int                        `json:"total"`
-		TotalPages int                        `json:"total_pages"`
+		NextCursor *string                    `json:"next_cursor"`
 		Counts     struct {
 			Saved   int `json:"saved"`
 			Applied int `json:"applied"`
@@ -417,16 +469,19 @@ func TestApplicationListIsPagedFilteredAndBounded(t *testing.T) {
 		return p
 	}
 
-	first := decode(request("/api/applications?page=1&page_size=2"))
-	if first.Total != 3 || first.Page != 1 || first.PageSize != 2 || first.TotalPages != 2 || len(first.Items) != 2 {
+	first := decode(request("/api/applications?page_size=2"))
+	if first.Total != 3 || first.PageSize != 2 || len(first.Items) != 2 || first.NextCursor == nil {
 		t.Fatalf("first page = %+v", first)
 	}
 	if first.Counts.Saved != 2 || first.Counts.Applied != 1 {
 		t.Fatalf("counts = %+v", first.Counts)
 	}
-	second := decode(request("/api/applications?page=2&page_size=2"))
+	second := decode(request("/api/applications?page_size=2&cursor=" + *first.NextCursor))
 	if len(second.Items) != 1 || second.Items[0].Company != "Acme" || second.Items[0].Role != "Backend Engineer" {
 		t.Fatalf("second page = %+v", second)
+	}
+	if second.NextCursor != nil {
+		t.Fatalf("last page must not offer a next cursor: %q", *second.NextCursor)
 	}
 	// Page order is stable: no row repeats and none is skipped across pages.
 	seen := map[string]bool{}
@@ -437,10 +492,12 @@ func TestApplicationListIsPagedFilteredAndBounded(t *testing.T) {
 		seen[app.ID] = true
 	}
 
-	// An out-of-range page is empty but still reports the true total.
-	past := decode(request("/api/applications?page=9&page_size=2"))
-	if len(past.Items) != 0 || past.Total != 3 || past.TotalPages != 2 {
-		t.Fatalf("page past the end = %+v", past)
+	// A cursor at the last row returns an empty page but still reports the true
+	// total, and offers no next cursor.
+	atEnd := store.cursorAt("owner-a", "00000000-0000-0000-0000-000000000001")
+	past := decode(request("/api/applications?page_size=2&cursor=" + atEnd))
+	if len(past.Items) != 0 || past.Total != 3 || past.NextCursor != nil {
+		t.Fatalf("cursor at the end = %+v", past)
 	}
 
 	// Search and filters narrow the set without lying about the count.
@@ -461,25 +518,111 @@ func TestApplicationListIsPagedFilteredAndBounded(t *testing.T) {
 		t.Fatalf("counts under status filter = %+v", applied.Counts)
 	}
 	empty := decode(request("/api/applications?q=nothing-matches"))
-	if empty.Total != 0 || len(empty.Items) != 0 || empty.TotalPages != 0 {
+	if empty.Total != 0 || len(empty.Items) != 0 || empty.NextCursor != nil {
 		t.Fatalf("no results = %+v", empty)
 	}
 
-	for _, path := range []string{
-		"/api/applications?page=0",
-		"/api/applications?page=-1",
-		"/api/applications?page=abc",
-		"/api/applications?page_size=0",
-		"/api/applications?page_size=51",
-		"/api/applications?page_size=1.5",
-		"/api/applications?status=archived",
-		"/api/applications?channel=remote",
-		"/api/applications?unknown=1",
-		"/api/applications?q=" + strings.Repeat("x", 101),
+	// A cursor minted for the unfiltered query must not be accepted when the
+	// caller changes the filters: that would silently skip or repeat rows.
+	if w := request("/api/applications?q=acme&cursor=" + *first.NextCursor); w.Code != http.StatusBadRequest {
+		t.Errorf("cursor with different filters: status = %d, want 400", w.Code)
+	}
+	for name, path := range map[string]string{
+		"page is gone":      "/api/applications?page=0",
+		"negative page":     "/api/applications?page=-1",
+		"non-numeric page":  "/api/applications?page=abc",
+		"empty cursor":      "/api/applications?cursor=",
+		"malformed cursor":  "/api/applications?cursor=abc",
+		"oversized cursor":  "/api/applications?cursor=" + strings.Repeat("a", 1025),
+		"zero page size":    "/api/applications?page_size=0",
+		"oversized page":    "/api/applications?page_size=51",
+		"fractional page":   "/api/applications?page_size=1.5",
+		"unknown status":    "/api/applications?status=archived",
+		"unknown channel":   "/api/applications?channel=remote",
+		"unknown parameter": "/api/applications?offset=1",
+		"overlong search":   "/api/applications?q=" + strings.Repeat("x", 101),
 	} {
 		if w := request(path); w.Code != http.StatusBadRequest {
-			t.Errorf("%s: status = %d, want 400", path, w.Code)
+			t.Errorf("%s: status = %d, want 400", name, w.Code)
 		}
+	}
+}
+
+// TestApplicationListCursorIsStableAcrossWrites is the HTTP-level regression
+// for Phase 2: rows inserted or deleted between two page requests must not
+// repeat or skip a row. A new row ahead of the cursor stays off later pages,
+// and deleting the row the cursor points at leaves the walk intact.
+func TestApplicationListCursorIsStableAcrossWrites(t *testing.T) {
+	_, handler, token := clerkStore(t, map[string]string{"clerk-a": "owner-a"})
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		r.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+
+	post := func(company, role string) {
+		t.Helper()
+		body := `{"company":"` + company + `","role":"` + role + `","status":"saved"}`
+		if w := request(http.MethodPost, "/api/applications", body); w.Code != http.StatusCreated {
+			t.Fatalf("seed create: %d %s", w.Code, w.Body.String())
+		}
+	}
+	post("Acme", "Role 1")
+	post("Acme", "Role 2")
+	post("Acme", "Role 3")
+
+	type page struct {
+		Items      []applications.Application `json:"items"`
+		Total      int                        `json:"total"`
+		NextCursor *string                    `json:"next_cursor"`
+	}
+	decode := func(w *httptest.ResponseRecorder) page {
+		t.Helper()
+		if w.Code != http.StatusOK {
+			t.Fatalf("list: %d %s", w.Code, w.Body.String())
+		}
+		var p page
+		if err := json.Unmarshal(w.Body.Bytes(), &p); err != nil {
+			t.Fatalf("decode: %v %s", err, w.Body.String())
+		}
+		return p
+	}
+
+	first := decode(request(http.MethodGet, "/api/applications?page_size=2", ""))
+	if len(first.Items) != 2 || first.NextCursor == nil {
+		t.Fatalf("first page = %+v", first)
+	}
+	cursor := *first.NextCursor
+	// The last row on page one is the cursor row; deleting it must not break the
+	// next request.
+	cursorRole := first.Items[1].Role
+
+	// A newer insert ahead of the cursor must not shift page two.
+	post("Globex", "Newest")
+	second := decode(request(http.MethodGet, "/api/applications?page_size=2&cursor="+cursor, ""))
+	if len(second.Items) != 1 || second.Items[0].Role != "Role 1" {
+		t.Fatalf("page two after an insert = %+v, want Role 1", second)
+	}
+
+	// Deleting the cursor row (already seen) and a row ahead of the cursor
+	// leaves page two positioned the same way.
+	var cursorID string
+	for _, app := range first.Items {
+		if app.Role == cursorRole {
+			cursorID = app.ID
+		}
+	}
+	if cursorID == "" {
+		t.Fatalf("cursor row %q not on the first page", cursorRole)
+	}
+	if w := request(http.MethodDelete, "/api/applications/"+cursorID, ""); w.Code != http.StatusNoContent {
+		t.Fatalf("delete cursor row: %d %s", w.Code, w.Body.String())
+	}
+	afterDelete := decode(request(http.MethodGet, "/api/applications?page_size=2&cursor="+cursor, ""))
+	if len(afterDelete.Items) != 1 || afterDelete.Items[0].Role != "Role 1" {
+		t.Fatalf("page two after deleting the cursor row = %+v, want Role 1", afterDelete)
 	}
 }
 
@@ -527,8 +670,9 @@ func TestApplicationsAtSameCompanyStayDistinct(t *testing.T) {
 	}
 }
 
-// TestApplicationListPageIsOwnerScoped makes sure pagination cannot leak rows
-// from another account, even when the other account has many records.
+// TestApplicationListPageIsOwnerScoped makes sure keyset pagination cannot leak
+// rows from another account: a cursor minted for one owner returns only that
+// owner's rows, and the same position under another owner returns only theirs.
 func TestApplicationListPageIsOwnerScoped(t *testing.T) {
 	now := time.Now()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -539,7 +683,7 @@ func TestApplicationListPageIsOwnerScoped(t *testing.T) {
 	tokenB := signTestRS256WithKey(t, key, now, map[string]any{"sub": "clerk-b"}, "kid")
 	verifier := clerk.NewStaticVerifier("https://clerk.example.com", map[string]*rsa.PublicKey{"kid": &key.PublicKey})
 	verifier.SetNow(func() time.Time { return now })
-	store := &testStore{records: make(map[string][]applications.Application)}
+	store := newTestStore()
 	handler := NewHandler(verifier, testMapper{bindings: map[string]string{"clerk-a": "owner-a", "clerk-b": "owner-b"}}, store)
 	request := func(token, path string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
@@ -548,26 +692,50 @@ func TestApplicationListPageIsOwnerScoped(t *testing.T) {
 		handler.ServeHTTP(w, r)
 		return w
 	}
-
-	for i := 0; i < 3; i++ {
-		body := fmt.Sprintf(`{"company":"Acme","role":"Engineer %d","status":"saved"}`, i)
+	post := func(token, role string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"company":"Acme","role":"%s","status":"saved"}`, role)
 		r := httptest.NewRequest(http.MethodPost, "/api/applications", bytes.NewBufferString(body))
-		r.Header.Set("Authorization", "Bearer "+tokenA)
+		r.Header.Set("Authorization", "Bearer "+token)
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, r)
 		if w.Code != http.StatusCreated {
-			t.Fatalf("seed create: %d %s", w.Code, w.Body.String())
+			t.Fatalf("seed create %s: %d %s", role, w.Code, w.Body.String())
 		}
 	}
-	var page struct {
-		Items []applications.Application `json:"items"`
-		Total int                        `json:"total"`
+
+	// B's row is older than A's rows, so a cursor from A lands after it: B
+	// still sees exactly one row, its own.
+	post(tokenB, "B Only")
+	for i := 0; i < 3; i++ {
+		post(tokenA, fmt.Sprintf("A Role %d", i))
 	}
-	if err := json.Unmarshal(request(tokenB, "/api/applications?page=1&page_size=2").Body.Bytes(), &page); err != nil {
+
+	type page struct {
+		Items      []applications.Application `json:"items"`
+		Total      int                        `json:"total"`
+		NextCursor *string                    `json:"next_cursor"`
+	}
+	var first page
+	if err := json.Unmarshal(request(tokenA, "/api/applications?page_size=2").Body.Bytes(), &first); err != nil || len(first.Items) != 2 || first.Total != 3 || first.NextCursor == nil {
+		t.Fatalf("owner A page: %v %+v", err, first)
+	}
+	cursor := *first.NextCursor
+
+	var other page
+	if err := json.Unmarshal(request(tokenB, "/api/applications?page_size=2&cursor="+cursor).Body.Bytes(), &other); err != nil {
 		t.Fatal(err)
 	}
-	if page.Total != 0 || len(page.Items) != 0 {
-		t.Fatalf("other account sees rows: %+v", page)
+	if other.Total != 1 || len(other.Items) != 1 || other.Items[0].Role != "B Only" {
+		t.Fatalf("owner B with owner A's cursor = %+v", other)
+	}
+
+	var rest page
+	if err := json.Unmarshal(request(tokenA, "/api/applications?page_size=2&cursor="+cursor).Body.Bytes(), &rest); err != nil {
+		t.Fatal(err)
+	}
+	if rest.Total != 3 || len(rest.Items) != 1 || rest.Items[0].Role != "A Role 0" {
+		t.Fatalf("owner A with its own cursor = %+v", rest)
 	}
 }
 
@@ -580,7 +748,7 @@ func TestApplicationHTTPRejectsMalformedAndOversizedRequests(t *testing.T) {
 	token := signTestRS256WithKey(t, key, now, map[string]any{"sub": "clerk-a"}, "kid")
 	verifier := clerk.NewStaticVerifier("https://clerk.example.com", map[string]*rsa.PublicKey{"kid": &key.PublicKey})
 	verifier.SetNow(func() time.Time { return now })
-	store := &testStore{records: make(map[string][]applications.Application)}
+	store := newTestStore()
 	handler := NewHandler(verifier, testMapper{bindings: map[string]string{"clerk-a": "owner-a"}}, store)
 	request := func(auth, body string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodPost, "/api/applications", bytes.NewBufferString(body))

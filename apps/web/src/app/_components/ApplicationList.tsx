@@ -12,10 +12,12 @@ function formatDate(value: string) {
   return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 }
 
-export function ApplicationList({ result, filters, page, loading, loadError, busyId, saving, editingId, onStatusChange, onEdit, onRemove, onPageChange, onClearFilters }: {
+export function ApplicationList({ result, filters, page, hasPrevious, hasNext, loading, loadError, busyId, saving, editingId, onStatusChange, onEdit, onRemove, onPrevious, onNext, onClearFilters }: {
   result: ApplicationPage;
   filters: ApplicationFilters;
   page: number;
+  hasPrevious: boolean;
+  hasNext: boolean;
   loading: boolean;
   loadError: boolean;
   busyId: string;
@@ -24,13 +26,12 @@ export function ApplicationList({ result, filters, page, loading, loadError, bus
   onStatusChange: (application: Application, status: Application["status"]) => void;
   onEdit: (application: Application) => void;
   onRemove: (application: Application) => void;
-  onPageChange: (page: number) => void;
+  onPrevious: () => void;
+  onNext: () => void;
   onClearFilters: () => void;
 }) {
   const applications = result.items;
   const hasFilters = filters.q !== "" || filters.status !== "" || filters.channel !== "";
-  const firstResult = result.total === 0 ? 0 : (page - 1) * result.pageSize + 1;
-  const lastResult = Math.min(page * result.pageSize, result.total);
 
   return (
     <section className="application-section" aria-labelledby="applications-title" aria-busy={loading}>
@@ -44,7 +45,7 @@ export function ApplicationList({ result, filters, page, loading, loadError, bus
             ? "Your applications could not be loaded."
             : result.total === 0
               ? hasFilters ? "No applications match these filters." : "No applications yet."
-              : `Showing ${firstResult}–${lastResult} of ${result.total}`}
+              : `Showing ${applications.length} on this page · ${result.total} total`}
       </p>
       {loading ? (
         <p className="loading">Loading applications…</p>
@@ -114,22 +115,22 @@ export function ApplicationList({ result, filters, page, loading, loadError, bus
           ))}
         </ul>
       )}
-      {!loading && !loadError && result.totalPages > 1 && (
+      {!loading && !loadError && (hasPrevious || hasNext) && (
         <nav className="pagination" aria-label="Application pages">
           <button
             className="button quiet"
             type="button"
-            onClick={() => onPageChange(page - 1)}
-            disabled={saving || page <= 1}
+            onClick={onPrevious}
+            disabled={saving || !hasPrevious}
           >
             Previous
           </button>
-          <span className="page-indicator">Page {page} of {result.totalPages}</span>
+          <span className="page-indicator">Page {page}</span>
           <button
             className="button quiet"
             type="button"
-            onClick={() => onPageChange(page + 1)}
-            disabled={saving || page >= result.totalPages}
+            onClick={onNext}
+            disabled={saving || !hasNext}
           >
             Next
           </button>

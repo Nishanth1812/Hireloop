@@ -1,10 +1,13 @@
 package applications
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"net/url"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPatchRejectsOptionalFieldsWithNUL(t *testing.T) {
@@ -107,25 +110,104 @@ func TestPatchTrimsManualFieldsAndClearsOptionalOnes(t *testing.T) {
 
 func TestParseQueryBoundsAndDefaults(t *testing.T) {
 	query, err := ParseQuery(url.Values{})
-	if err != nil || query.Page != 1 || query.PageSize != DefaultPageSize {
+	if err != nil || query.PageSize != DefaultPageSize || query.After != nil {
 		t.Fatalf("defaults = %+v, %v", query, err)
 	}
-	query, err = ParseQuery(url.Values{"q": {"  acme "}, "page": {"3"}, "page_size": {"10"}})
-	if err != nil || query.Search != "acme" || query.Page != 3 || query.PageSize != 10 {
+	query, err = ParseQuery(url.Values{"q": {"  acme "}, "page_size": {"10"}})
+	if err != nil || query.Search != "acme" || query.PageSize != 10 {
 		t.Fatalf("parsed query = %+v, %v", query, err)
 	}
 	for name, values := range map[string]url.Values{
-		"zero page":         {"page": {"0"}},
-		"negative page":     {"page": {"-1"}},
-		"fractional page":   {"page": {"1.5"}},
 		"zero page size":    {"page_size": {"0"}},
 		"oversized page":    {"page_size": {strconv.Itoa(MaxPageSize + 1)}},
+		"fractional page":   {"page_size": {"1.5"}},
 		"unknown status":    {"status": {"archived"}},
 		"unknown channel":   {"channel": {"remote"}},
-		"unknown parameter": {"cursor": {"abc"}},
+		"removed page":      {"page": {"2"}},
+		"unknown parameter": {"offset": {"2"}},
+		"malformed cursor":  {"cursor": {"abc"}},
+		"empty cursor":      {"cursor": {""}},
+		"overlong cursor":   {"cursor": {strings.Repeat("a", maxCursorLength+1)}},
 		"overlong search":   {"q": {strings.Repeat("x", maxSearchLength+1)}},
 	} {
 		if _, err := ParseQuery(values); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+}
+
+// TestParseQueryCursorRoundTripAndBinding covers the cursor contract: a token
+// round-trips its position, and it is bound to the normalized filters that
+// produced it so it cannot be silently applied to a different query.
+func TestParseQueryCursorRoundTripAndBinding(t *testing.T) {
+	createdAt := time.Date(2026, 11, 1, 10, 30, 0, 123456000, time.UTC)
+	id := "00000000-0000-0000-0000-000000000001"
+	base := Query{Search: "acme", Status: "applied", Channel: "campus", PageSize: 10}
+	cursor := base.encodeCursor(createdAt, id)
+
+	query, err := ParseQuery(url.Values{
+		"q": {"  acme  "}, "status": {"applied"}, "channel": {"campus"},
+		"page_size": {"10"}, "cursor": {cursor},
+	})
+	if err != nil {
+		t.Fatalf("valid cursor rejected: %v", err)
+	}
+	if query.After == nil || !query.After.CreatedAt.Equal(createdAt) || query.After.ID != id {
+		t.Fatalf("decoded cursor = %+v", query.After)
+	}
+
+	// A cursor minted for one filter set must not be accepted for another.
+	for name, values := range map[string]url.Values{
+		"different search":  {"q": {"globex"}, "cursor": {cursor}},
+		"different status":  {"status": {"saved"}, "cursor": {cursor}},
+		"different channel": {"channel": {"off-campus"}, "cursor": {cursor}},
+		"no filters":        {"cursor": {cursor}},
+	} {
+		if _, err := ParseQuery(values); err == nil {
+			t.Errorf("%s: expected the cursor to be rejected", name)
+		}
+	}
+
+	// The binding ignores insignificant differences: a trimmed search and an
+	// omitted empty filter still name the same query.
+	if _, err := ParseQuery(url.Values{"q": {" acme "}, "status": {"applied"}, "channel": {"campus"}, "cursor": {cursor}}); err != nil {
+		t.Fatalf("equivalent normalized filters rejected: %v", err)
+	}
+}
+
+// TestParseQueryRejectsMalformedCursors pins the boundary behavior: a cursor is
+// bounded, versioned, and strictly decoded, so a hand-crafted or corrupted
+// token fails as a bad query instead of reaching the database.
+func TestParseQueryRejectsMalformedCursors(t *testing.T) {
+	now := time.Date(2026, 11, 1, 10, 30, 0, 0, time.UTC)
+	id := "00000000-0000-0000-0000-000000000001"
+	validToken := func(mutate func(*cursorToken)) string {
+		token := cursorToken{
+			Version:   cursorVersion,
+			CreatedAt: now.Format(time.RFC3339Nano),
+			ID:        id,
+			Filters:   Query{}.cursorFilterHash(),
+		}
+		if mutate != nil {
+			mutate(&token)
+		}
+		payload, err := json.Marshal(token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return base64.RawURLEncoding.EncodeToString(payload)
+	}
+	for name, cursor := range map[string]string{
+		"not base64":       "!!!!",
+		"not json":         base64.RawURLEncoding.EncodeToString([]byte("not json")),
+		"unknown field":    base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"c":"2026-11-01T10:30:00Z","i":"` + id + `","f":"x","extra":true}`)),
+		"future version":   validToken(func(token *cursorToken) { token.Version = cursorVersion + 1 }),
+		"wrong filters":    validToken(func(token *cursorToken) { token.Filters = "something-else" }),
+		"malformed id":     validToken(func(token *cursorToken) { token.ID = "not-a-uuid" }),
+		"malformed time":   validToken(func(token *cursorToken) { token.CreatedAt = "yesterday" }),
+		"trailing garbage": validToken(nil) + "AAAA",
+	} {
+		if _, err := ParseQuery(url.Values{"cursor": {cursor}}); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
 	}
