@@ -3,6 +3,7 @@ package migrations
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -30,6 +31,84 @@ func TestEmbeddedInitialMigration(t *testing.T) {
 	data, err := io.ReadAll(reader)
 	if err != nil || !strings.Contains(string(data), "CREATE TABLE public.applications") || !strings.Contains(string(data), "ENABLE ROW LEVEL SECURITY") {
 		t.Fatalf("missing schema or RLS: %v", err)
+	}
+}
+
+// TestMigrationsAreContiguous makes sure a new migration can never be added
+// out of order or with a duplicated version, which golang-migrate would either
+// skip or apply unpredictably.
+func TestMigrationsAreContiguous(t *testing.T) {
+	source, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	version, err := source.First()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for want := uint(1); ; want++ {
+		if version != want {
+			t.Fatalf("migration version = %d, want %d", version, want)
+		}
+		if _, _, err := source.ReadUp(version); err != nil {
+			t.Fatalf("read migration %d: %v", version, err)
+		}
+		next, err := source.Next(version)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("next migration after %d: %v", version, err)
+		}
+		version = next
+	}
+}
+
+// TestManualFieldsMigrationIsAdditive pins the Phase 2 field migration: the new
+// columns are additive, preserve existing rows, and stay date-only for
+// applied_on so no time is invented.
+func TestManualFieldsMigrationIsAdditive(t *testing.T) {
+	source, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	reader, _, err := source.ReadUp(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	// Check the statements, not the comments: the rollback notes legitimately
+	// mention DROP COLUMN.
+	statements := make([]string, 0)
+	for _, line := range strings.Split(body, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" && !strings.HasPrefix(trimmed, "--") {
+			statements = append(statements, trimmed)
+		}
+	}
+	applied := strings.Join(statements, "\n")
+	for _, column := range []string{"url", "channel", "job_id", "applied_on", "notes"} {
+		if !strings.Contains(applied, "ADD COLUMN "+column) {
+			t.Errorf("migration 005 does not add column %q", column)
+		}
+	}
+	if !strings.Contains(applied, "ADD COLUMN applied_on date") {
+		t.Error("applied_on must be date-only, never a timestamp")
+	}
+	if strings.Contains(applied, "NOT NULL") {
+		t.Error("new columns must stay nullable so existing rows remain valid")
+	}
+	if strings.Contains(applied, "DROP COLUMN") || strings.Contains(applied, "DELETE FROM") {
+		t.Error("migration 005 must not remove or rewrite existing data")
+	}
+	if !strings.Contains(body, "Rollback:") {
+		t.Error("migration 005 must document how to reverse it")
 	}
 }
 
