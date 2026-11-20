@@ -15,21 +15,17 @@ import (
 )
 
 // These tests exercise the real Postgres store against the real embedded
-// migrations. They are opt-in: set DATABASE_URL (or HIRELOOP_TEST_DATABASE_URL)
-// to the configured development database to run them; otherwise they skip.
+// migrations. They are opt-in: set HIRELOOP_TEST_DATABASE_URL to a test database
+// to run them; otherwise they skip.
 //
 // Safety: every test writes only rows under a freshly generated random owner id
 // and removes exactly those rows in a cleanup. It never reads or writes another
-// owner's data and never creates or deletes auth users. Migrations are additive
-// and idempotent (the same ones the API applies at startup), so applying them is
-// safe and leaves existing data untouched.
+// owner's data and never creates or deletes auth users. Pending migrations are
+// applied, so the URL must point to a database intended for testing.
 
 func integrationDatabaseURL(t *testing.T) string {
 	t.Helper()
-	if url := os.Getenv("HIRELOOP_TEST_DATABASE_URL"); url != "" {
-		return url
-	}
-	return os.Getenv("DATABASE_URL")
+	return os.Getenv("HIRELOOP_TEST_DATABASE_URL")
 }
 
 func randomOwner(t *testing.T) string {
@@ -51,7 +47,7 @@ func openIntegrationStore(t *testing.T) (PostgresStore, *sql.DB, string) {
 	t.Helper()
 	databaseURL := integrationDatabaseURL(t)
 	if databaseURL == "" {
-		t.Skip("set DATABASE_URL or HIRELOOP_TEST_DATABASE_URL to run SQL-backed tests")
+		t.Skip("set HIRELOOP_TEST_DATABASE_URL to run SQL-backed tests")
 	}
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
