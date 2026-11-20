@@ -1,6 +1,8 @@
 package applications
 
 import (
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -48,6 +50,96 @@ func TestPatchRejectsNULWithoutRejectingUnicode(t *testing.T) {
 	input := PatchInput{Company: &company, Role: &role}
 	if !input.Valid() || company != "株式会社" || role != "Développeur" {
 		t.Fatal("valid international names must be accepted and trimmed")
+	}
+}
+
+func TestManualFieldValidation(t *testing.T) {
+	valid := Input{
+		Company: "Acme", Role: "Engineer", Status: "applied",
+		URL: "https://jobs.example.com/42", Channel: "campus",
+		JobID: "REQ-42", AppliedOn: "2026-11-02", Notes: "Placement cell notice.",
+	}
+	if !valid.Valid() || valid.Company != "Acme" || valid.Channel != "campus" {
+		t.Fatalf("valid manual fields rejected: %+v", valid)
+	}
+	for name, mutate := range map[string]func(*Input){
+		"non-http url":     func(i *Input) { i.URL = "javascript:alert(1)" },
+		"relative url":     func(i *Input) { i.URL = "/jobs/42" },
+		"hostless url":     func(i *Input) { i.URL = "https://" },
+		"overlong url":     func(i *Input) { i.URL = "https://example.com/" + strings.Repeat("x", 2048) },
+		"unknown channel":  func(i *Input) { i.Channel = "remote" },
+		"impossible date":  func(i *Input) { i.AppliedOn = "2026-02-30" },
+		"date with a time": func(i *Input) { i.AppliedOn = "2026-11-02T09:00:00Z" },
+		"unpadded date":    func(i *Input) { i.AppliedOn = "2026-11-2" },
+		"overlong job id":  func(i *Input) { i.JobID = strings.Repeat("x", 201) },
+		"overlong notes":   func(i *Input) { i.Notes = strings.Repeat("x", 2001) },
+		"NUL in notes":     func(i *Input) { i.Notes = "note\x00" },
+		"NUL in job id":    func(i *Input) { i.JobID = "REQ\x00" },
+		"NUL in url":       func(i *Input) { i.URL = "https://example.com/\x00" },
+	} {
+		input := valid
+		mutate(&input)
+		if input.Valid() {
+			t.Errorf("accepted invalid %s: %+v", name, input)
+		}
+	}
+}
+
+func TestPatchTrimsManualFieldsAndClearsOptionalOnes(t *testing.T) {
+	url, channel, jobID, appliedOn, notes := "  https://example.com/42  ", " campus ", " REQ-42 ", " 2026-11-02 ", "  notice  "
+	input := PatchInput{URL: &url, Channel: &channel, JobID: &jobID, AppliedOn: &appliedOn, Notes: &notes}
+	if !input.Valid() {
+		t.Fatalf("valid patch rejected: %+v", input)
+	}
+	if *input.URL != "https://example.com/42" || *input.Channel != "campus" || *input.JobID != "REQ-42" || *input.AppliedOn != "2026-11-02" || *input.Notes != "notice" {
+		t.Fatalf("patch fields not trimmed: %+v", input)
+	}
+	blank := "   "
+	for name, patch := range map[string]PatchInput{
+		"url": {URL: &blank}, "channel": {Channel: &blank}, "job id": {JobID: &blank},
+		"date": {AppliedOn: &blank}, "notes": {Notes: &blank},
+	} {
+		if !patch.Valid() {
+			t.Errorf("blank %s must be a valid clear", name)
+		}
+	}
+}
+
+func TestParseQueryBoundsAndDefaults(t *testing.T) {
+	query, err := ParseQuery(url.Values{})
+	if err != nil || query.Page != 1 || query.PageSize != DefaultPageSize {
+		t.Fatalf("defaults = %+v, %v", query, err)
+	}
+	query, err = ParseQuery(url.Values{"q": {"  acme "}, "page": {"3"}, "page_size": {"10"}})
+	if err != nil || query.Search != "acme" || query.Page != 3 || query.PageSize != 10 {
+		t.Fatalf("parsed query = %+v, %v", query, err)
+	}
+	for name, values := range map[string]url.Values{
+		"zero page":         {"page": {"0"}},
+		"negative page":     {"page": {"-1"}},
+		"fractional page":   {"page": {"1.5"}},
+		"zero page size":    {"page_size": {"0"}},
+		"oversized page":    {"page_size": {strconv.Itoa(MaxPageSize + 1)}},
+		"unknown status":    {"status": {"archived"}},
+		"unknown channel":   {"channel": {"remote"}},
+		"unknown parameter": {"cursor": {"abc"}},
+		"overlong search":   {"q": {strings.Repeat("x", maxSearchLength+1)}},
+	} {
+		if _, err := ParseQuery(values); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+}
+
+func TestLikePatternEscapesWildcards(t *testing.T) {
+	if got := likePattern("50%"); got != `%50\%%` {
+		t.Fatalf("likePattern(50%%) = %q", got)
+	}
+	if got := likePattern("a_b"); got != `%a\_b%` {
+		t.Fatalf("likePattern(a_b) = %q", got)
+	}
+	if got := likePattern(`back\slash`); got != `%back\\slash%` {
+		t.Fatalf("likePattern(back\\slash) = %q", got)
 	}
 }
 
