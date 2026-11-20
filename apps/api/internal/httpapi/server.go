@@ -17,6 +17,25 @@ type user struct {
 	Email string `json:"email"`
 }
 
+// applicationPage is the bounded list envelope. Items is one page; Total and
+// Counts describe every matching row so the UI never has to infer totals from a
+// page, and never claims more or fewer results than the query returned.
+type applicationPage struct {
+	Items      []applications.Application `json:"items"`
+	Page       int                        `json:"page"`
+	PageSize   int                        `json:"page_size"`
+	Total      int                        `json:"total"`
+	TotalPages int                        `json:"total_pages"`
+	Counts     applicationCounts          `json:"counts"`
+}
+
+// applicationCounts describe the current filters except status, so the
+// saved/applied summary stays truthful while a status filter is applied.
+type applicationCounts struct {
+	Saved   int `json:"saved"`
+	Applied int `json:"applied"`
+}
+
 func NewHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -113,16 +132,31 @@ func NewHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper,
 			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		items, err := store.List(r.Context(), u.ID)
+		query, err := applications.ParseQuery(r.URL.Query())
+		if err != nil {
+			http.Error(w, "invalid application query", http.StatusBadRequest)
+			return
+		}
+		result, err := store.List(r.Context(), u.ID, query)
 		if err != nil {
 			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if items == nil {
-			items = []applications.Application{}
+		if result.Items == nil {
+			result.Items = []applications.Application{}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(items)
+		_ = json.NewEncoder(w).Encode(applicationPage{
+			Items:      result.Items,
+			Page:       result.Page,
+			PageSize:   result.PageSize,
+			Total:      result.Total,
+			TotalPages: result.TotalPages,
+			Counts: applicationCounts{
+				Saved:   result.Counts.Saved,
+				Applied: result.Counts.Applied,
+			},
+		})
 	})
 	mux.HandleFunc("GET /api/applications/{id}", func(w http.ResponseWriter, r *http.Request) {
 		u, ok := authenticate(w, r)

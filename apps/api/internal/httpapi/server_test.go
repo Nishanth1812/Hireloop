@@ -32,8 +32,8 @@ func (s *isolationStore) Create(ctx context.Context, userID string, in applicati
 	s.create = userID
 	return applications.Application{ID: "app-1", Company: in.Company, Role: in.Role, Status: in.Status}, nil
 }
-func (s *isolationStore) List(ctx context.Context, userID string) ([]applications.Application, error) {
-	return nil, nil
+func (s *isolationStore) List(ctx context.Context, userID string, query applications.Query) (applications.ListResult, error) {
+	return applications.ListResult{}, nil
 }
 func (s *isolationStore) Get(ctx context.Context, userID, id string) (applications.Application, error) {
 	s.getUser = userID
