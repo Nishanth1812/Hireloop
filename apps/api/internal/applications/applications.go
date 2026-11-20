@@ -313,7 +313,7 @@ type Store interface {
 type PostgresStore struct{ DB *sql.DB }
 
 // applicationColumns is the read projection used by every returning query. New
-// columns read with COALESCE(..., ”) so a row written before migration 005
+// columns read with COALESCE(..., '') so a row written before migration 005
 // still decodes as "not recorded" instead of failing a scan.
 const applicationColumns = `id, company, role, status,
 	COALESCE(source, ''), COALESCE(address, ''), COALESCE(url, ''),
