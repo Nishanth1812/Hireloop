@@ -2,12 +2,15 @@
 
 import type { Application } from "@/lib/api";
 
-export function ApplicationList({ applications, loading, loadError, busyId, onStatusChange, onRemove }: {
+export function ApplicationList({ applications, loading, loadError, busyId, saving, editingId, onStatusChange, onEdit, onRemove }: {
   applications: Application[];
   loading: boolean;
   loadError: boolean;
   busyId: string;
+  saving?: boolean;
+  editingId: string;
   onStatusChange: (application: Application, status: Application["status"]) => void;
+  onEdit: (application: Application) => void;
   onRemove: (application: Application) => void;
 }) {
   return (
@@ -33,19 +36,31 @@ export function ApplicationList({ applications, loading, loadError, busyId, onSt
               <div className="application-copy">
                 <strong>{application.role}</strong>
                 <span>{application.company}</span>
+                {application.source && <span className="application-meta">via {application.source}</span>}
+                {application.address && <span className="application-meta">{application.address}</span>}
               </div>
               <label className="visually-hidden" htmlFor={`status-${application.id}`}>Status for {application.role} at {application.company}</label>
               <select
                 id={`status-${application.id}`}
                 className={`status-select ${application.status}`}
                 value={application.status}
-                disabled={busyId === application.id}
+                disabled={saving || busyId === application.id || editingId === application.id}
                 onChange={(event) => onStatusChange(application, event.target.value as Application["status"])}
               >
                 <option value="saved">Saved</option>
                 <option value="applied">Applied</option>
               </select>
-              <button className="button delete-button" disabled={busyId === application.id} onClick={() => onRemove(application)} aria-label={`Delete ${application.role} at ${application.company}`}>
+              <button
+                className="button edit-button"
+                id={`edit-button-${application.id}`}
+                disabled={saving || busyId === application.id}
+                aria-pressed={editingId === application.id}
+                onClick={() => onEdit(application)}
+                aria-label={`Edit ${application.role} at ${application.company}`}
+              >
+                Edit
+              </button>
+              <button className="button delete-button" disabled={saving || busyId === application.id || editingId === application.id} onClick={() => onRemove(application)} aria-label={`Delete ${application.role} at ${application.company}`}>
                 Delete
               </button>
             </li>

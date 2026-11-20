@@ -36,7 +36,7 @@ func (s *testStore) Create(_ context.Context, userID string, input applications.
 	if s.err != nil {
 		return applications.Application{}, s.err
 	}
-	a := applications.Application{ID: "00000000-0000-0000-0000-000000000001", Company: input.Company, Role: input.Role, Status: input.Status}
+	a := applications.Application{ID: "00000000-0000-0000-0000-000000000001", Company: input.Company, Role: input.Role, Status: input.Status, Source: input.Source, Address: input.Address}
 	s.records[userID] = append(s.records[userID], a)
 	return a, nil
 }
@@ -71,6 +71,12 @@ func (s *testStore) Patch(_ context.Context, userID, id string, input applicatio
 			}
 			if input.Status != nil {
 				s.records[userID][i].Status = *input.Status
+			}
+			if input.Source != nil {
+				s.records[userID][i].Source = *input.Source
+			}
+			if input.Address != nil {
+				s.records[userID][i].Address = *input.Address
 			}
 			return s.records[userID][i], nil
 		}
@@ -164,6 +170,56 @@ func TestApplicationsRequireClerkAndEnforceOwnerIsolation(t *testing.T) {
 	store.err = errors.New("private database error")
 	if w := request("GET", tokenA, "", "/api/applications"); w.Code != http.StatusServiceUnavailable || bytes.Contains(w.Body.Bytes(), []byte("private")) {
 		t.Fatalf("database failure: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestApplicationSourceAndAddressRoundTrip(t *testing.T) {
+	now := time.Now()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signTestRS256WithKey(t, key, now, map[string]any{"sub": "clerk-a"}, "kid")
+	verifier := clerk.NewStaticVerifier("https://clerk.example.com", map[string]*rsa.PublicKey{"kid": &key.PublicKey})
+	verifier.SetNow(func() time.Time { return now })
+	store := &testStore{records: make(map[string][]applications.Application)}
+	handler := NewHandler(verifier, testMapper{bindings: map[string]string{"clerk-a": "owner-a"}}, store)
+	request := func(method, body, path string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		r.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+
+	if w := request("POST", `{"company":"Acme","role":"Engineer","status":"applied","source":"Referral","address":"me@example.com"}`, "/api/applications"); w.Code != http.StatusCreated {
+		t.Fatalf("create with optional fields: %d %s", w.Code, w.Body.String())
+	}
+	var created applications.Application
+	w := request("GET", "", "/api/applications")
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d", w.Code)
+	}
+	var list []applications.Application
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil || len(list) != 1 {
+		t.Fatalf("list decode: %v %s", err, w.Body.String())
+	}
+	created = list[0]
+	if created.Source != "Referral" || created.Address != "me@example.com" {
+		t.Fatalf("stored optional fields = %q/%q", created.Source, created.Address)
+	}
+	const path = "/api/applications/00000000-0000-0000-0000-000000000001"
+	// Optional fields can be cleared with an explicit empty string.
+	if w := request("PATCH", `{"source":"","address":""}`, path); w.Code != http.StatusOK {
+		t.Fatalf("patch to clear: %d %s", w.Code, w.Body.String())
+	}
+	var updated applications.Application
+	if err := json.Unmarshal(request("GET", "", path).Body.Bytes(), &updated); err != nil || updated.Source != "" || updated.Address != "" {
+		t.Fatalf("cleared fields = %q/%q (%v)", updated.Source, updated.Address, err)
+	}
+	// Overlong optional input is rejected at the API boundary.
+	if w := request("PATCH", `{"source":"`+strings.Repeat("x", 201)+`"}`, path); w.Code != http.StatusBadRequest {
+		t.Fatalf("overlong source: %d, want 400", w.Code)
 	}
 }
 

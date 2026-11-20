@@ -1,6 +1,34 @@
 package applications
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestPatchRejectsOptionalFieldsWithNUL(t *testing.T) {
+	for _, value := range []string{"Referral\x00", "me\x00@example.com"} {
+		for _, field := range []string{"source", "address"} {
+			input := PatchInput{}
+			if field == "source" {
+				input.Source = &value
+			} else {
+				input.Address = &value
+			}
+			if input.Valid() {
+				t.Errorf("accepted NUL in %s", field)
+			}
+		}
+	}
+	blank := "   "
+	if input := (PatchInput{Source: &blank}); !input.Valid() || *input.Source != "" {
+		t.Fatal("blank source must be accepted and trimmed to empty")
+	}
+	overlong := strings.Repeat("x", 201)
+	addressInput := PatchInput{Address: &overlong}
+	if addressInput.Valid() {
+		t.Fatal("overlong address must be rejected")
+	}
+}
 
 func TestPatchRejectsNULWithoutRejectingUnicode(t *testing.T) {
 	for _, value := range []string{"Acme\x00", "\x00Engineer", "Eng\x00ineer"} {

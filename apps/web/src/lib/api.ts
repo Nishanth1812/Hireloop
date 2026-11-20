@@ -3,9 +3,12 @@ export type Application = {
   company: string;
   role: string;
   status: "saved" | "applied";
+  source: string;
+  address: string;
 };
 
-export type ApplicationInput = Pick<Application, "company" | "role" | "status">;
+export type ApplicationInput = Pick<Application, "company" | "role" | "status"> &
+  Partial<Pick<Application, "source" | "address">>;
 export type ApplicationPatch = Partial<ApplicationInput>;
 
 async function request<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {

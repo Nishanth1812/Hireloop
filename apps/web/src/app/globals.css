@@ -140,6 +140,11 @@ h3 { margin-bottom: 8px; font-size: 1rem; }
 .quiet:hover { background: color-mix(in srgb, var(--ink) 8%, var(--surface)); }
 .delete-button { min-height: 34px; padding: 5px 8px; color: var(--danger-ink); background: transparent; }
 .delete-button:hover:not(:disabled) { background: var(--soft-orange); }
+.edit-button { min-height: 34px; padding: 5px 10px; color: var(--ink); background: transparent; }
+.edit-button:hover:not(:disabled) { background: color-mix(in srgb, var(--ink) 8%, var(--surface)); }
+.edit-button[aria-pressed="true"] { border-color: var(--applied-border); background: var(--soft-green); }
+.application-meta { color: var(--muted); font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.application-form .optional { margin-left: 4px; color: var(--muted); font-weight: 500; font-size: 0.78rem; text-transform: none; letter-spacing: 0; }
 .capture-panel { padding: 24px; }
 .capture-panel h2 { margin-bottom: 7px; }
 .application-form { display: grid; gap: 9px; margin-top: 22px; }

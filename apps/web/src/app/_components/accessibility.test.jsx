@@ -17,6 +17,7 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const { createRoot } = await import("react-dom/client");
 const { ApplicationList } = await import("./ApplicationList");
 const { ApplicationCaptureForm } = await import("./ApplicationCaptureForm");
+const { ApplicationEditForm } = await import("./ApplicationEditForm");
 
 let root;
 let container;
@@ -51,7 +52,9 @@ function listProps(overrides = {}) {
     loading: false,
     loadError: false,
     busyId: "",
+    editingId: "",
     onStatusChange: noop,
+    onEdit: noop,
     onRemove: noop,
     ...overrides,
   };
@@ -97,6 +100,11 @@ test("each application row exposes a labelled status control and a named delete 
     assertFocusableWithName(remove);
     expect(remove.tagName).toBe("BUTTON");
     expect(remove.getAttribute("aria-label")).toMatch(/^Delete .+ at .+$/);
+
+    const edit = row.querySelector("button.edit-button");
+    assertFocusableWithName(edit);
+    expect(edit.tagName).toBe("BUTTON");
+    expect(edit.getAttribute("aria-label")).toMatch(/^Edit .+ at .+$/);
   }
 });
 
@@ -133,6 +141,19 @@ test("a row being updated disables only its own controls", async () => {
   expect(rows[1].querySelector("button.delete-button").disabled).toBe(false);
 });
 
+test("editing prevents conflicting row changes and saving locks row actions", async () => {
+  await render(<ApplicationList {...listProps({ editingId: "a1" })} />);
+  let rows = [...container.querySelectorAll(".application-row")];
+  expect(rows[0].querySelector("select").disabled).toBe(true);
+  expect(rows[0].querySelector(".delete-button").disabled).toBe(true);
+  expect(rows[1].querySelector("select").disabled).toBe(false);
+  await render(<ApplicationList {...listProps({ editingId: "a1", saving: true })} />);
+  rows = [...container.querySelectorAll(".application-row")];
+  for (const row of rows) {
+    for (const control of row.querySelectorAll("select, button")) expect(control.disabled).toBe(true);
+  }
+});
+
 test("capture form labels every field and marks company and role required", async () => {
   await render(<ApplicationCaptureForm saving={false} onSubmit={noop} />);
   const labelled = ["company", "role", "status"];
@@ -160,4 +181,44 @@ test("the submit button is a native button that reflects the saving state", asyn
   button = container.querySelector('button[type="submit"]');
   expect(button.disabled).toBe(true);
   expect(button.textContent).toBe("Adding…");
+});
+
+test("capture form labels the optional source and address fields", async () => {
+  await render(<ApplicationCaptureForm saving={false} onSubmit={noop} />);
+  for (const id of ["source", "address"]) {
+    const field = container.querySelector(`#${id}`);
+    expect(field).not.toBeNull();
+    assertFocusableWithName(field);
+    expect(field.hasAttribute("required")).toBe(false);
+    const label = container.querySelector(`label[for="${id}"]`);
+    expect(label).not.toBeNull();
+    expect(label.textContent.trim().length).toBeGreaterThan(0);
+  }
+});
+
+test("the edit form labels every field, pre-fills values, and offers save and cancel", async () => {
+  const application = {
+    id: "a1",
+    company: "Acme",
+    role: "Designer",
+    status: "applied",
+    source: "Referral",
+    address: "me@example.com",
+  };
+  await render(<ApplicationEditForm application={application} saving={false} onSave={noop} onCancel={noop} />);
+  for (const id of ["edit-company", "edit-role", "edit-status", "edit-source", "edit-address"]) {
+    const field = container.querySelector(`#${id}`);
+    expect(field).not.toBeNull();
+    assertFocusableWithName(field);
+    const label = container.querySelector(`label[for="${id}"]`);
+    expect(label).not.toBeNull();
+    expect(label.textContent.trim().length).toBeGreaterThan(0);
+  }
+  expect(container.querySelector("#edit-company").value).toBe("Acme");
+  expect(container.querySelector("#edit-source").value).toBe("Referral");
+  expect(container.querySelector("#edit-address").value).toBe("me@example.com");
+  const submit = container.querySelector('button[type="submit"]');
+  assertFocusableWithName(submit);
+  const cancel = [...container.querySelectorAll("button")].find((b) => b.textContent.trim() === "Cancel");
+  assertFocusableWithName(cancel);
 });

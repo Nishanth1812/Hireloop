@@ -57,6 +57,36 @@ test("create posts the validated application fields as JSON", async () => {
   }
 });
 
+test("create posts the optional source and address fields as JSON", async () => {
+  assert.ok(api, "application API client is missing");
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ id: "app-3", company: "Northstar", role: "Designer", status: "applied", source: "Referral", address: "me@example.com" }, { status: 201 });
+  };
+  try {
+    const result = await api.createApplication("access-token", {
+      company: "Northstar",
+      role: "Designer",
+      status: "applied",
+      source: "Referral",
+      address: "me@example.com",
+    });
+    assert.deepEqual(JSON.parse(request.options.body), {
+      company: "Northstar",
+      role: "Designer",
+      status: "applied",
+      source: "Referral",
+      address: "me@example.com",
+    });
+    assert.equal(result.source, "Referral");
+    assert.equal(result.address, "me@example.com");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("patch sends only the requested field to the encoded application URL", async () => {
   assert.ok(api, "application API client is missing");
   const originalFetch = globalThis.fetch;
