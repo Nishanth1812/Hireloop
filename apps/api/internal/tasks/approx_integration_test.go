@@ -138,13 +138,28 @@ func TestPostgresApproxReminderLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("switch to instant: %v", err)
 	}
-	for _, job := range approxJobsForTask(ctx, t, store, owner, created.ID) {
-		if job.ReminderTiming == reminders.TimingDayBeforeApprox || job.ReminderTiming == reminders.TimingMorningOfApprox {
-			t.Errorf("approximate job survived precision switch: %+v", job)
+	jobs = approxJobsForTask(ctx, t, store, owner, created.ID)
+	if len(jobs) != 4 {
+		t.Fatalf("jobs after precision switch = %+v, want preserved history plus two exact jobs", jobs)
+	}
+	exactCount := 0
+	for _, job := range jobs {
+		switch job.ReminderTiming {
+		case reminders.TimingDayBeforeApprox, reminders.TimingMorningOfApprox:
+			if job.DeliveryState != reminders.StateSuppressed {
+				t.Errorf("approximate job after precision switch = %+v, want suppressed history", job)
+			}
+		case reminders.Timing24hBefore, reminders.Timing2hBefore:
+			exactCount++
+			if job.TrueDeadline.IsZero() || job.DueDay != "" || job.DeliveryState != reminders.StateScheduled {
+				t.Errorf("exact job = %+v, want a scheduled true deadline and no due day", job)
+			}
+		default:
+			t.Errorf("unexpected reminder timing: %+v", job)
 		}
-		if job.TrueDeadline.IsZero() || job.DueDay != "" {
-			t.Errorf("exact job = %+v, want a true deadline and no due day", job)
-		}
+	}
+	if exactCount != 2 {
+		t.Errorf("exact job count = %d, want two", exactCount)
 	}
 
 	// Clearing the deadline suppresses everything.

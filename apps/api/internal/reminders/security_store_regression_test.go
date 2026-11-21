@@ -199,9 +199,9 @@ func TestSecurityLateEventsAreEvidenceOnlyAfterSuppressionAndReschedule(t *testi
 	}
 }
 
-// TestSecurityLateDeliveredAfterExhaustionDoesNotRevive covers the exhausted
-// case: the live mapping is present, but a terminal state cannot be weakened.
-func TestSecurityLateDeliveredAfterExhaustionDoesNotRevive(t *testing.T) {
+// TestSecurityLateDeliveredAfterExhaustionRecordsProviderEvidence proves a
+// late delivery confirmation updates an exhausted job without making it claimable.
+func TestSecurityLateDeliveredAfterExhaustionRecordsProviderEvidence(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -221,16 +221,16 @@ func TestSecurityLateDeliveredAfterExhaustionDoesNotRevive(t *testing.T) {
 	}
 	applied, err := store.RecordWebhookEvent(ctx, "sec-evt-late-exhausted", "sec-email-exhausted", "email.delivered",
 		Transition{State: StateDelivered, Note: "late delivered"})
-	if err != nil || applied {
+	if err != nil || !applied {
 		t.Fatalf("late delivered on exhausted job = %v, %v", applied, err)
 	}
 	job, err := store.Get(ctx, owner, jobID)
-	if err != nil || job.DeliveryState != StateExhausted {
-		t.Fatalf("exhausted job was revived: %+v, %v", job, err)
+	if err != nil || job.DeliveryState != StateDelivered {
+		t.Fatalf("late provider evidence = %+v, %v, want delivered", job, err)
 	}
 	resolution, _, _ := securityLedgerRow(ctx, t, db, "sec-evt-late-exhausted")
-	if resolution != "ignored" {
-		t.Fatalf("evidence resolution = %q, want ignored", resolution)
+	if resolution != "applied" {
+		t.Fatalf("evidence resolution = %q, want applied", resolution)
 	}
 }
 
