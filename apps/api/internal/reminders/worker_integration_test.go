@@ -749,3 +749,404 @@ func TestProviderMappingUniqueness(t *testing.T) {
 		t.Fatalf("mapping for new version failed: %v", err)
 	}
 }
+
+// TestRetentionCleanupMultipleQualifyingRows verifies cleanup handles
+// multiple qualifying rows in a single execution (DELETE RETURNING INTO fix).
+func TestRetentionCleanupMultipleQualifyingRows(t *testing.T) {
+	store, db, owner := openStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	past := time.Now().Add(-time.Minute)
+
+	// Create 10 terminal jobs with payloads, all >7 days old
+	jobIDs := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		taskID := seedInstantTask(ctx, t, db, owner, past)
+		if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+			t.Fatal(err)
+		}
+		jobID := jobIDForTask(ctx, t, db, taskID)
+		jobIDs[i] = jobID
+		if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET delivery_state = 'delivered', updated_at = now() - interval '8 days' WHERE id = $1`, jobID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 1, $2, 'Subject', 'Body')`, jobID, fmt.Sprintf("test%d@example.com", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Verify pre-cleanup: 10 payloads
+	var payloadCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id = ANY($1)`, jobIDs).Scan(&payloadCount); err != nil {
+		t.Fatal(err)
+	}
+	if payloadCount != 10 {
+		t.Fatalf("pre-cleanup payload count = %d, want 10", payloadCount)
+	}
+
+	// Run cleanup - should not fail with "multiple rows returned" error
+	var deletedPayloads, deletedEvents int
+	if err := db.QueryRowContext(ctx, `SELECT * FROM cleanup_reminder_retention()`).Scan(&deletedPayloads, &deletedEvents); err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
+
+	// Verify all 10 payloads deleted
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id = ANY($1)`, jobIDs).Scan(&payloadCount); err != nil {
+		t.Fatal(err)
+	}
+	if payloadCount != 0 {
+		t.Fatalf("post-cleanup payload count = %d, want 0", payloadCount)
+	}
+	if deletedPayloads != 10 {
+		t.Fatalf("deleted payloads returned = %d, want 10", deletedPayloads)
+	}
+}
+
+// TestRetentionCleanupRescheduledJobOldVersionPayload verifies that payloads
+// for superseded versions (rescheduled jobs) are cleaned up immediately,
+// regardless of job state.
+func TestRetentionCleanupRescheduledJobOldVersionPayload(t *testing.T) {
+	store, db, owner := openStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	past := time.Now().Add(-time.Minute)
+
+	// Job 1: rescheduled from v1 to v2, v1 payload should be cleaned
+	task1 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task1, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID1 := jobIDForTask(ctx, t, db, task1)
+	// Insert v1 payload (simulating first attempt)
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 1, 'v1@example.com', 'Subject v1', 'Body')`, jobID1); err != nil {
+		t.Fatal(err)
+	}
+	// Reschedule to v2
+	if err := store.Schedule(ctx, db, owner, task1, past.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// Insert v2 payload (current version)
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 2, 'v2@example.com', 'Subject v2', 'Body')`, jobID1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Job 2: non-rescheduled, v1 payload should be kept (current version)
+	task2 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task2, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID2 := jobIDForTask(ctx, t, db, task2)
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 1, 'current@example.com', 'Subject', 'Body')`, jobID2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify pre-cleanup: 3 payloads (v1 and v2 for job1, v1 for job2)
+	var payloadCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id IN ($1, $2)`, jobID1, jobID2).Scan(&payloadCount); err != nil {
+		t.Fatal(err)
+	}
+	if payloadCount != 3 {
+		t.Fatalf("pre-cleanup payload count = %d, want 3", payloadCount)
+	}
+
+	// Run cleanup
+	if _, err := db.ExecContext(ctx, `SELECT * FROM cleanup_reminder_retention()`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify: job1 v1 payload deleted (superseded), job1 v2 kept, job2 v1 kept
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id IN ($1, $2)`, jobID1, jobID2).Scan(&payloadCount); err != nil {
+		t.Fatal(err)
+	}
+	if payloadCount != 2 {
+		t.Fatalf("post-cleanup payload count = %d, want 2 (job1 v2, job2 v1)", payloadCount)
+	}
+	// Verify specific versions
+	var v1Count, v2Count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id = $1 AND delivery_version = 1`, jobID1).Scan(&v1Count); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id = $1 AND delivery_version = 2`, jobID1).Scan(&v2Count); err != nil {
+		t.Fatal(err)
+	}
+	if v1Count != 0 {
+		t.Fatalf("job1 v1 payload not cleaned: count = %d, want 0", v1Count)
+	}
+	if v2Count != 1 {
+		t.Fatalf("job1 v2 payload not kept: count = %d, want 1", v2Count)
+	}
+}
+
+// TestRetentionCleanupUncorrelatedPendingEvents verifies that pending events
+// with no job_id (arrived before provider mapping) are cleaned up after 7 days.
+func TestRetentionCleanupUncorrelatedPendingEvents(t *testing.T) {
+	store, db, owner := openStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	past := time.Now().Add(-time.Minute)
+
+	// Create a job and provider mapping
+	task1 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task1, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID1 := jobIDForTask(ctx, t, db, task1)
+	if err := store.SetProviderEmailID(ctx, jobID1, 1, "email-correlated"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Correlated pending event (has job_id) for terminal job - should be cleaned
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET delivery_state = 'delivered', updated_at = now() - interval '8 days' WHERE id = $1`, jobID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_email_events (provider_event_id, provider_email_id, job_id, event_type, target_state, delivery_version, resolution, received_at) VALUES ('evt-correlated-terminal', 'email-correlated', $1, 'email.delivered', 'delivered', 1, 'pending', now() - interval '8 days')`, jobID1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Uncorrelated pending event (no job_id, no provider_email_id mapping) - should be cleaned
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_email_events (provider_event_id, provider_email_id, job_id, event_type, target_state, delivery_version, resolution, received_at) VALUES ('evt-uncorrelated-old', 'email-unknown', NULL, 'email.delivered', 'delivered', 1, 'pending', now() - interval '8 days')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Uncorrelated pending event recent (<7 days) - should NOT be cleaned
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_email_events (provider_event_id, provider_email_id, job_id, event_type, target_state, delivery_version, resolution, received_at) VALUES ('evt-uncorrelated-recent', 'email-unknown-2', NULL, 'email.delivered', 'delivered', 1, 'pending', now() - interval '1 day')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Correlated pending event for non-terminal job - should NOT be cleaned
+	task2 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task2, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID2 := jobIDForTask(ctx, t, db, task2)
+	if err := store.SetProviderEmailID(ctx, jobID2, 1, "email-active"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_email_events (provider_event_id, provider_email_id, job_id, event_type, target_state, delivery_version, resolution, received_at) VALUES ('evt-correlated-active', 'email-active', $1, 'email.delivered', 'delivered', 1, 'pending', now() - interval '8 days')`, jobID2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify pre-cleanup: 4 pending events
+	var pendingCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_email_events WHERE resolution = 'pending'`).Scan(&pendingCount); err != nil {
+		t.Fatal(err)
+	}
+	if pendingCount != 4 {
+		t.Fatalf("pre-cleanup pending count = %d, want 4", pendingCount)
+	}
+
+	// Run cleanup
+	var deletedPayloads, deletedEvents int
+	if err := db.QueryRowContext(ctx, `SELECT * FROM cleanup_reminder_retention()`).Scan(&deletedPayloads, &deletedEvents); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify: 2 deleted (correlated terminal + uncorrelated old), 2 kept (uncorrelated recent + correlated active)
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_email_events WHERE resolution = 'pending'`).Scan(&pendingCount); err != nil {
+		t.Fatal(err)
+	}
+	if pendingCount != 2 {
+		t.Fatalf("post-cleanup pending count = %d, want 2", pendingCount)
+	}
+	if deletedEvents != 2 {
+		t.Fatalf("deleted events returned = %d, want 2", deletedEvents)
+	}
+
+	// Verify specific events kept
+	var keptRecent, keptActive int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_email_events WHERE provider_event_id = 'evt-uncorrelated-recent'`).Scan(&keptRecent); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_email_events WHERE provider_event_id = 'evt-correlated-active'`).Scan(&keptActive); err != nil {
+		t.Fatal(err)
+	}
+	if keptRecent != 1 || keptActive != 1 {
+		t.Fatalf("wrong events kept: recent=%d active=%d", keptRecent, keptActive)
+	}
+}
+
+// TestRetentionCleanupActivePayloadPreservation verifies that payloads for
+// active (non-terminal, current version) jobs are never cleaned up.
+func TestRetentionCleanupActivePayloadPreservation(t *testing.T) {
+	store, db, owner := openStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	past := time.Now().Add(-time.Minute)
+
+	// Scheduled job with payload (non-terminal, current version)
+	task1 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task1, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID1 := jobIDForTask(ctx, t, db, task1)
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 1, 'scheduled@example.com', 'Subject', 'Body')`, jobID1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Leased job with payload (non-terminal, current version)
+	task2 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task2, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID2 := jobIDForTask(ctx, t, db, task2)
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET delivery_state = 'leased', lease_token = 'tok', lease_until = now() + interval '1 hour' WHERE id = $1`, jobID2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 1, 'leased@example.com', 'Subject', 'Body')`, jobID2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Failed job with payload (non-terminal, retryable, current version)
+	task3 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task3, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID3 := jobIDForTask(ctx, t, db, task3)
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET delivery_state = 'failed', retry_at = now() + interval '1 hour' WHERE id = $1`, jobID3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 1, 'failed@example.com', 'Subject', 'Body')`, jobID3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Uncertain job with payload (non-terminal, retryable, current version)
+	task4 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task4, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID4 := jobIDForTask(ctx, t, db, task4)
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET delivery_state = 'uncertain', retry_at = now() + interval '1 hour' WHERE id = $1`, jobID4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 1, 'uncertain@example.com', 'Subject', 'Body')`, jobID4); err != nil {
+		t.Fatal(err)
+	}
+
+	// Accepted job with payload (non-terminal, current version)
+	task5 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task5, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID5 := jobIDForTask(ctx, t, db, task5)
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET delivery_state = 'accepted' WHERE id = $1`, jobID5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 1, 'accepted@example.com', 'Subject', 'Body')`, jobID5); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify pre-cleanup: 5 payloads
+	var payloadCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id IN ($1,$2,$3,$4,$5)`, jobID1, jobID2, jobID3, jobID4, jobID5).Scan(&payloadCount); err != nil {
+		t.Fatal(err)
+	}
+	if payloadCount != 5 {
+		t.Fatalf("pre-cleanup payload count = %d, want 5", payloadCount)
+	}
+
+	// Run cleanup
+	if _, err := db.ExecContext(ctx, `SELECT * FROM cleanup_reminder_retention()`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify all 5 payloads kept (none terminal, all current version)
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id IN ($1,$2,$3,$4,$5)`, jobID1, jobID2, jobID3, jobID4, jobID5).Scan(&payloadCount); err != nil {
+		t.Fatal(err)
+	}
+	if payloadCount != 5 {
+		t.Fatalf("post-cleanup payload count = %d, want 5 (all active payloads preserved)", payloadCount)
+	}
+}
+
+// TestWorkerNoSendCleanupRuns verifies that the worker runs retention cleanup
+// periodically even when sending is disabled (dispatcher is nil).
+func TestWorkerNoSendCleanupRuns(t *testing.T) {
+	store, db, owner := openStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	past := time.Now().Add(-time.Minute)
+
+	// Create a terminal job with payload >7 days old
+	task1 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task1, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID1 := jobIDForTask(ctx, t, db, task1)
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET delivery_state = 'delivered', updated_at = now() - interval '8 days' WHERE id = $1`, jobID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads (job_id, delivery_version, recipient, subject, text_body) VALUES ($1, 1, 'test@example.com', 'Subject', 'Body')`, jobID1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create worker with nil dispatcher (no-send mode) and fast cleanup interval
+	w := NewWorker(store, Config{
+		Dispatcher:      nil, // no-send mode
+		Scope:           []string{owner},
+		BatchSize:       5,
+		CleanupInterval: 100 * time.Millisecond, // fast for test
+		PollInterval:    100 * time.Millisecond,
+	})
+
+	// Verify pre-cleanup: payload exists
+	var payloadCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id = $1`, jobID1).Scan(&payloadCount); err != nil {
+		t.Fatal(err)
+	}
+	if payloadCount != 1 {
+		t.Fatalf("pre-cleanup payload count = %d, want 1", payloadCount)
+	}
+
+	// Run worker for a short time to trigger cleanup
+	runCtx, runCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer runCancel()
+	_ = w.Run(runCtx) // Ignore context cancellation error
+
+	// Verify payload cleaned up by worker's periodic cleanup
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_delivery_payloads WHERE job_id = $1`, jobID1).Scan(&payloadCount); err != nil {
+		t.Fatal(err)
+	}
+	if payloadCount != 0 {
+		t.Fatalf("post-worker-run payload count = %d, want 0 (cleanup should have run)", payloadCount)
+	}
+}
+
+// TestWorkerCleanupDoesNotBlockPolling verifies that cleanup errors don't
+// stop the worker's polling loop.
+func TestWorkerCleanupDoesNotBlockPolling(t *testing.T) {
+	store, db, owner := openStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	past := time.Now().Add(-time.Minute)
+
+	// Create a due job
+	task1 := seedInstantTask(ctx, t, db, owner, past)
+	if err := store.Schedule(ctx, db, owner, task1, past); err != nil {
+		t.Fatal(err)
+	}
+	jobID1 := jobIDForTask(ctx, t, db, task1)
+
+	// Worker with nil dispatcher (idle) but fast intervals
+	disp := &fakeDispatcher{outcome: OutcomeDelivered}
+	w := NewWorker(store, Config{
+		Dispatcher:      disp,
+		Scope:           []string{owner},
+		BatchSize:       5,
+		CleanupInterval: 50 * time.Millisecond,
+		PollInterval:    50 * time.Millisecond,
+	})
+
+	// Run worker briefly
+	runCtx, runCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer runCancel()
+	_ = w.Run(runCtx)
+
+	// Job should still be scheduled (no dispatcher = no dispatch)
+	job, err := store.Get(ctx, owner, jobID1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.DeliveryState != StateScheduled {
+		t.Fatalf("job state = %s, want scheduled (no dispatcher)", job.DeliveryState)
+	}
+}
