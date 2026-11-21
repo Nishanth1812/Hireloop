@@ -212,6 +212,80 @@ test("network failure returns a useful message", async () => {
   }
 });
 
+test("task client exposes the supported operations", () => {
+  assert.ok(api, "task API client is missing");
+  assert.equal(typeof api.listTasks, "function");
+  assert.equal(typeof api.createTask, "function");
+  assert.equal(typeof api.patchTask, "function");
+});
+
+test("listTasks sends the token and requests open actions by default", async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ items: [{ id: "t1", title: "Apply", due_precision: "date", due_date: "2026-11-12" }] });
+  };
+  try {
+    const result = await api.listTasks("access-token");
+    assert.equal(request.url, "/api/tasks");
+    assert.equal(request.options.headers.Authorization, "Bearer access-token");
+    assert.equal(result.items.length, 1);
+    await api.listTasks("access-token", true);
+    assert.equal(request.url, "/api/tasks?filter=all");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("createTask posts the full deadline shape as JSON", async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ id: "t2", title: "Interview" }, { status: 201 });
+  };
+  try {
+    const result = await api.createTask("access-token", {
+      application_id: "app/1",
+      title: "Interview",
+      due_precision: "instant",
+      due_local: "2026-11-12T18:00",
+      time_zone: "Asia/Kolkata",
+    });
+    assert.equal(request.url, "/api/tasks");
+    assert.equal(request.options.method, "POST");
+    assert.equal(request.options.headers["Content-Type"], "application/json");
+    assert.deepEqual(JSON.parse(request.options.body), {
+      application_id: "app/1",
+      title: "Interview",
+      due_precision: "instant",
+      due_local: "2026-11-12T18:00",
+      time_zone: "Asia/Kolkata",
+    });
+    assert.equal(result.id, "t2");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("patchTask sends only the status for completion and encodes the id", async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ id: "t/1", status: "done" });
+  };
+  try {
+    await api.patchTask("access-token", "t/1", { status: "done" });
+    assert.equal(request.url, "/api/tasks/t%2F1");
+    assert.equal(request.options.method, "PATCH");
+    assert.deepEqual(JSON.parse(request.options.body), { status: "done" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("delete accepts the API's empty success response", async () => {
   assert.ok(api, "application API client is missing");
   const originalFetch = globalThis.fetch;

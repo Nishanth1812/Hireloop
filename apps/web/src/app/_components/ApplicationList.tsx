@@ -12,7 +12,7 @@ function formatDate(value: string) {
   return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 }
 
-export function ApplicationList({ result, filters, page, hasPrevious, hasNext, loading, loadError, busyId, saving, editingId, onStatusChange, onEdit, onRemove, onPrevious, onNext, onClearFilters }: {
+export function ApplicationList({ result, filters, page, hasPrevious, hasNext, loading, loadError, busyId, saving, editingId, onStatusChange, onEdit, onRemove, onAddTask, onPrevious, onNext, onClearFilters }: {
   result: ApplicationPage;
   filters: ApplicationFilters;
   page: number;
@@ -26,6 +26,7 @@ export function ApplicationList({ result, filters, page, hasPrevious, hasNext, l
   onStatusChange: (application: Application, status: Application["status"]) => void;
   onEdit: (application: Application) => void;
   onRemove: (application: Application) => void;
+  onAddTask: (application: Application) => void;
   onPrevious: () => void;
   onNext: () => void;
   onClearFilters: () => void;
@@ -98,6 +99,14 @@ export function ApplicationList({ result, filters, page, hasPrevious, hasNext, l
                 <option value="saved">Saved</option>
                 <option value="applied">Applied</option>
               </select>
+              <button
+                className="button task-button"
+                disabled={saving || busyId === application.id || editingId === application.id}
+                onClick={() => onAddTask(application)}
+                aria-label={`Add a task for ${application.role} at ${application.company}`}
+              >
+                Add task
+              </button>
               <button
                 className="button edit-button"
                 id={`edit-button-${application.id}`}

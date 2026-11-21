@@ -19,6 +19,8 @@ const { ApplicationList } = await import("./ApplicationList");
 const { ApplicationCaptureForm } = await import("./ApplicationCaptureForm");
 const { ApplicationEditForm } = await import("./ApplicationEditForm");
 const { ApplicationFilterBar } = await import("./ApplicationFilterBar");
+const { TaskForm } = await import("./TaskForm");
+const { TodayPanel } = await import("./TodayPanel");
 
 let root;
 let container;
@@ -307,6 +309,138 @@ test("the submit button is a native button that reflects the saving state", asyn
   button = container.querySelector('button[type="submit"]');
   expect(button.disabled).toBe(true);
   expect(button.textContent).toBe("Adding…");
+});
+
+const taskApplication = { id: "a1", company: "Acme", role: "Engineer", status: "saved" };
+
+const dateTask = {
+  id: "t1", application_id: "a1", title: "Submit form", status: "open",
+  due_precision: "date", due_date: "2026-11-12", due_local: "", due_at: "", time_zone: "",
+  created_at: "2026-11-01T09:00:00Z",
+};
+
+function taskFormProps(overrides = {}) {
+  return {
+    application: taskApplication,
+    task: null,
+    applications: [taskApplication],
+    saving: false,
+    onSave: noop,
+    onCancel: noop,
+    ...overrides,
+  };
+}
+
+function todayProps(overrides = {}) {
+  return {
+    tasks: [dateTask],
+    applications: [taskApplication],
+    loading: false,
+    loadError: false,
+    showAll: false,
+    busyId: "",
+    onToggleFinished: noop,
+    onEdit: noop,
+    onComplete: noop,
+    onCancel: noop,
+    ...overrides,
+  };
+}
+
+test("task form labels every base control and starts with no deadline", async () => {
+  await render(<TaskForm {...taskFormProps()} />);
+  for (const id of ["task-application", "task-title-input", "task-precision"]) {
+    const field = container.querySelector(`#${id}`);
+    expect(field).not.toBeNull();
+    assertFocusableWithName(field);
+    const label = container.querySelector(`label[for="${id}"]`);
+    expect(label).not.toBeNull();
+    expect(label.textContent.trim().length).toBeGreaterThan(0);
+  }
+  expect(container.querySelector("#task-title-input").hasAttribute("required")).toBe(true);
+  expect(container.querySelector("#task-precision").value).toBe("none");
+  // No date, time or zone control exists until a deadline precision is chosen.
+  expect(container.querySelector("#task-due-date")).toBeNull();
+  expect(container.querySelector("#task-due-local")).toBeNull();
+  expect(container.querySelector("#task-time-zone")).toBeNull();
+  const submit = container.querySelector('button[type="submit"]');
+  assertFocusableWithName(submit);
+  const cancel = [...container.querySelectorAll("button")].find((b) => b.textContent.trim() === "Cancel");
+  assertFocusableWithName(cancel);
+});
+
+test("date-only and exact deadline controls are distinct and labelled", async () => {
+  await render(<TaskForm key="date-task" {...taskFormProps({ task: { ...dateTask, due_precision: "date" } })} />);
+  const date = container.querySelector("#task-due-date");
+  expect(date).not.toBeNull();
+  expect(date.getAttribute("type")).toBe("date");
+  assertFocusableWithName(date);
+  const dateLabel = container.querySelector('label[for="task-due-date"]');
+  expect(dateLabel).not.toBeNull();
+  expect(dateLabel.textContent.trim()).toMatch(/due date/i);
+  expect(container.querySelector("#task-time-zone")).toBeNull();
+  expect(container.textContent).toMatch(/never implies a time/i);
+
+  await render(<TaskForm key="instant-task" {...taskFormProps({ task: {
+    ...dateTask, id: "t2", due_precision: "instant", due_local: "2026-11-12T18:00", time_zone: "Asia/Kolkata",
+  } })} />);
+  const local = container.querySelector("#task-due-local");
+  expect(local).not.toBeNull();
+  expect(local.getAttribute("type")).toBe("datetime-local");
+  assertFocusableWithName(local);
+  const zone = container.querySelector("#task-time-zone");
+  assertFocusableWithName(zone);
+  expect(zone.value).toBe("Asia/Kolkata");
+  expect(zone.hasAttribute("required")).toBe(true);
+  expect([...zone.options].some((option) => option.value === "")).toBe(true);
+  expect(container.querySelector("#task-due-date")).toBeNull();
+});
+
+test("Today cards name every action control and state the date-only precision", async () => {
+  await render(<TodayPanel {...todayProps()} />);
+  const section = container.querySelector(".today-panel");
+  expect(section.getAttribute("aria-labelledby")).toBe("today-title");
+  const row = container.querySelector(".task-row");
+  expect(row).not.toBeNull();
+  expect(row.textContent).toContain("Submit form");
+  expect(row.textContent).toContain("12 Nov 2026");
+  expect(row.textContent).toMatch(/cutoff time unspecified/i);
+  for (const label of [/Edit task Submit form/, /Mark Submit form complete/, /Cancel Submit form/]) {
+    const button = [...row.querySelectorAll("button")].find((b) => label.test(b.getAttribute("aria-label") || ""));
+    expect(button).not.toBeNull();
+    assertFocusableWithName(button);
+  }
+  const toggle = [...section.querySelectorAll("button")].find((b) => /Show finished/.test(b.textContent));
+  assertFocusableWithName(toggle);
+  expect(toggle.getAttribute("aria-pressed")).toBe("false");
+});
+
+test("Today announces loading, empty and failed states and shows finished only on request", async () => {
+  await render(<TodayPanel {...todayProps({ loading: true, tasks: [] })} />);
+  expect(container.querySelector(".today-panel").getAttribute("aria-busy")).toBe("true");
+  expect(container.querySelector('[role="status"]').textContent).toMatch(/Loading actions/);
+
+  await render(<TodayPanel {...todayProps({ tasks: [], loadError: true })} />);
+  expect(container.querySelector('[role="status"]').textContent).toMatch(/could not be loaded/i);
+
+  await render(<TodayPanel {...todayProps({ tasks: [] })} />);
+  expect(container.querySelector('[role="status"]').textContent).toMatch(/Nothing open/);
+  expect(container.querySelectorAll(".task-row").length).toBe(0);
+
+  const finished = { ...dateTask, id: "t2", title: "Done task", status: "done" };
+  await render(<TodayPanel {...todayProps({ tasks: [finished] })} />);
+  expect(container.querySelectorAll(".task-row").length).toBe(0);
+  await render(<TodayPanel {...todayProps({ tasks: [finished], showAll: true })} />);
+  expect(container.querySelectorAll(".task-row").length).toBe(1);
+  expect(container.textContent).toMatch(/Status: done/i);
+});
+
+test("a busy task disables only its own action buttons", async () => {
+  const other = { ...dateTask, id: "t2", title: "Other" };
+  await render(<TodayPanel {...todayProps({ tasks: [dateTask, other], busyId: "t1" })} />);
+  const rows = [...container.querySelectorAll(".task-row")];
+  for (const button of rows[0].querySelectorAll("button")) expect(button.disabled).toBe(true);
+  for (const button of rows[1].querySelectorAll("button")) expect(button.disabled).toBe(false);
 });
 
 test("the edit form labels every field, pre-fills values, and offers save and cancel", async () => {

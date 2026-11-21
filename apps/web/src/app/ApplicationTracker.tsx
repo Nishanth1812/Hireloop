@@ -5,13 +5,19 @@ import type { FormEvent } from "react";
 import { useSession } from "@clerk/nextjs";
 import {
   createApplication,
+  createTask,
   deleteApplication,
   listApplications,
+  listTasks,
   patchApplication,
+  patchTask,
   toChannel,
 } from "@/lib/api";
-import type { Application, ApplicationFilters, ApplicationPage, ApplicationPatch } from "@/lib/api";
+import type {
+  Application, ApplicationFilters, ApplicationPage, ApplicationPatch, Task, TaskInput, TaskPatch, TaskStatus,
+} from "@/lib/api";
 import { ApplicationDashboard } from "./_components/ApplicationDashboard";
+import type { TaskDraft } from "./_components/ApplicationDashboard";
 import { SignInPanel } from "./_components/SignInPanel";
 
 const noFilters: ApplicationFilters = { q: "", status: "", channel: "" };
@@ -57,6 +63,15 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   // current page instead would unmount the form and drop unsaved input whenever
   // a page or filter change (or a background reload) pushed the row off it.
   const [editing, setEditing] = useState<Application | null>(null);
+  // Tasks reload on their own key: writing a task must not refetch the whole
+  // application list, and paging applications must not disturb the Today feed.
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [taskLoading, setTaskLoading] = useState(session !== null);
+  const [taskLoadError, setTaskLoadError] = useState(false);
+  const [tasksShowAll, setTasksShowAll] = useState(false);
+  const [taskReloadKey, setTaskReloadKey] = useState(0);
+  const [taskBusyId, setTaskBusyId] = useState("");
+  const [taskDraft, setTaskDraft] = useState<TaskDraft | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -106,6 +121,35 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
       cancelled = true;
     };
   }, [session, filters, cursor, pageIndex, reloadKey]);
+
+  useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+    void (async () => {
+      setTaskLoading(true);
+      setTaskLoadError(false);
+      try {
+        const token = await session.getToken();
+        if (cancelled) return;
+        if (!token) throw new Error("Your session is unavailable. Please sign in again.");
+        const next = await listTasks(token, tasksShowAll);
+        if (cancelled) return;
+        setTasks(next.items);
+      } catch (caught: unknown) {
+        if (!cancelled) {
+          // Never leave a previous account's actions on screen after a failure.
+          setTasks([]);
+          setTaskLoadError(true);
+          setError(messageFrom(caught));
+        }
+      } finally {
+        if (!cancelled) setTaskLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session, tasksShowAll, taskReloadKey]);
 
   function reload() {
     setReloadKey((key) => key + 1);
@@ -288,6 +332,93 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     }
   }
 
+  function openTaskForm(application: Application, task: Task | null = null) {
+    setTaskDraft({ application, task });
+    setEditing(null);
+    setError("");
+    setNotice("");
+  }
+
+  // A task can point at an application on another page; keep its id intact
+  // even when the full record is not in the current page of the list.
+  function applicationForTask(task: Task, supplied?: Application): Application {
+    if (supplied) return supplied;
+    const found = result.items.find((item) => item.id === task.application_id);
+    return found ?? {
+      id: task.application_id, company: "", role: "Linked application", status: "saved",
+      source: "", address: "", url: "", channel: "", job_id: "", applied_on: "", notes: "",
+    };
+  }
+
+  async function saveTask(event: FormEvent<HTMLFormElement>, id?: string) {
+    event.preventDefault();
+    if (!session || !taskDraft) return;
+    const data = new FormData(event.currentTarget);
+    const title = String(data.get("title") ?? "").trim();
+    if (!title) {
+      setError("Give this task a short title.");
+      return;
+    }
+    const precision = String(data.get("due_precision") ?? "none") as Task["due_precision"];
+    const fields: TaskPatch = { title, due_precision: precision };
+    if (precision === "date") {
+      fields.due_date = String(data.get("due_date") ?? "").trim();
+    }
+    if (precision === "instant") {
+      fields.due_local = String(data.get("due_local") ?? "").trim();
+      fields.time_zone = String(data.get("time_zone") ?? "").trim();
+      if (!fields.time_zone) {
+        // A wall time with no zone is not an instant; ask instead of guessing.
+        setError("Choose the time zone for this deadline.");
+        return;
+      }
+    }
+    setSaving(true);
+    setError("");
+    setNotice("");
+    try {
+      const token = await sessionToken();
+      if (id) {
+        await patchTask(token, id, fields);
+      } else {
+        const input: TaskInput = {
+          application_id: taskDraft.application.id,
+          title,
+          due_precision: precision,
+          ...(precision === "date" ? { due_date: fields.due_date } : {}),
+          ...(precision === "instant" ? { due_local: fields.due_local, time_zone: fields.time_zone } : {}),
+        };
+        await createTask(token, input);
+      }
+      setTaskDraft(null);
+      setTaskReloadKey((key) => key + 1);
+      setNotice(id ? "Task updated." : "Task added to Today.");
+    } catch (caught) {
+      setError(messageFrom(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function changeTaskStatus(task: Task, status: TaskStatus) {
+    if (!session) return;
+    setTaskBusyId(task.id);
+    setError("");
+    setNotice("");
+    try {
+      const token = await sessionToken();
+      await patchTask(token, task.id, { status });
+      // A fresh read proves the new state persisted and removes the action
+      // from the open Today view instead of trusting a local mutation.
+      setTaskReloadKey((key) => key + 1);
+      setNotice(status === "done" ? `Completed “${task.title}”.` : `Cancelled “${task.title}”.`);
+    } catch (caught) {
+      setError(messageFrom(caught));
+    } finally {
+      setTaskBusyId("");
+    }
+  }
+
   if (!session) {
     return <SignInPanel />;
   }
@@ -306,17 +437,30 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     saving={saving}
     busyId={busyId}
     editingApplication={editingApplication}
+    tasks={tasks}
+    taskLoading={taskLoading}
+    taskLoadError={taskLoadError}
+    tasksShowAll={tasksShowAll}
+    taskBusyId={taskBusyId}
+    taskDraft={taskDraft}
     error={error}
     notice={notice}
     onCreate={addApplication}
     onStatusChange={(application, status) => void changeStatus(application, status)}
-    onEdit={(application) => { setEditing(application); setError(""); setNotice(""); }}
+    onEdit={(application) => { setTaskDraft(null); setEditing(application); setError(""); setNotice(""); }}
     onCancelEdit={() => setEditing(null)}
     onSaveEdit={(event, id) => void saveEdit(event, id)}
     onRemove={(application) => void removeApplication(application)}
+    onAddTask={openTaskForm}
     onApplyFilters={applyFilters}
     onClearFilters={() => applyFilters(noFilters)}
     onPrevious={goPrevious}
     onNext={goNext}
+    onToggleFinished={() => setTasksShowAll((value) => !value)}
+    onEditTask={(task, application) => openTaskForm(applicationForTask(task, application), task)}
+    onSaveTask={(event, id) => void saveTask(event, id)}
+    onCancelTaskEdit={() => setTaskDraft(null)}
+    onCompleteTask={(task) => void changeTaskStatus(task, "done")}
+    onCancelTask={(task) => void changeTaskStatus(task, "cancelled")}
   />;
 }
