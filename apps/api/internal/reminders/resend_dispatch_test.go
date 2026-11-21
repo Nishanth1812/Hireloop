@@ -243,3 +243,39 @@ func TestResendDispatcherNilIsPermanent(t *testing.T) {
 		t.Fatalf("outcome = %q, want %q", outcome, OutcomePermanent)
 	}
 }
+
+// TestProviderMappingUniquePerJobVersion documents that the in-memory
+// dispatchStore does not enforce the unique (job_id, delivery_version)
+// constraint - that is enforced by the database via migration 011. The
+// database will reject a second provider_email_id for the same job/version.
+func TestProviderMappingUniquePerJobVersion(t *testing.T) {
+	store := newDispatchStore("owner-1")
+	sender := &captureSender{queue: []captureSenderEntry{{result: resend.Result{Status: resend.StatusAccepted, MessageID: "email-1"}}}}
+	dispatcher := NewResendDispatcher(store, sender, "hireloop@example.com",
+		func(_ context.Context, _ string) (string, error) { return "student@example.com", nil })
+
+	// First send for version 1
+	if out := dispatcher.Send(context.Background(), securityNotification(1, "Title")); out != OutcomeAccepted {
+		t.Fatalf("first send = %q, want accepted", out)
+	}
+	if store.jobs["job-1"].ProviderEmailID != "email-1" || store.jobs["job-1"].ProviderVersion != 1 {
+		t.Fatalf("first mapping = %q@%d, want email-1@1", store.jobs["job-1"].ProviderEmailID, store.jobs["job-1"].ProviderVersion)
+	}
+
+	// Simulate a second send for the same version with a different email id
+	// (this would happen if Resend returned a different email id for the same
+	// idempotency key, which shouldn't happen in practice). The in-memory
+	// store allows this (no unique constraint on job_id+version), but the
+	// real database enforces it via migration 011's unique index.
+	sender.queue = []captureSenderEntry{{result: resend.Result{Status: resend.StatusAccepted, MessageID: "email-2"}}}
+	if out := dispatcher.Send(context.Background(), securityNotification(1, "Title")); out != OutcomeAccepted {
+		t.Fatalf("second send = %q, want accepted", out)
+	}
+	// In-memory store updates to the new email id; database would reject.
+	if store.jobs["job-1"].ProviderEmailID != "email-2" {
+		t.Fatalf("in-memory store email id = %q, want email-2 (database would differ)", store.jobs["job-1"].ProviderEmailID)
+	}
+	// The history table in the in-memory store is not checked here; the
+	// integration test TestProviderMappingUniqueness verifies the database
+	// constraint.
+}

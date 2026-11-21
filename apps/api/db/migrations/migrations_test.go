@@ -293,6 +293,44 @@ func TestResendCorrelationMigrationIsAdditive(t *testing.T) {
 	}
 }
 
+// TestReminderRetentionCleanupMigrationIsAdditive pins the Phase 4 retention
+// cleanup schema: a unique index on provider-emails (job_id, delivery_version)
+// and a cleanup function. No data is dropped or rewritten by the migration
+// itself (the function contains DELETEs for scheduled cleanup, which is its
+// purpose).
+func TestReminderRetentionCleanupMigrationIsAdditive(t *testing.T) {
+	applied := migrationStatements(t, 11)
+	for _, fragment := range []string{
+		"CREATE UNIQUE INDEX reminder_provider_emails_job_version_idx",
+		"CREATE OR REPLACE FUNCTION public.cleanup_reminder_retention",
+		"RETURNS TABLE(deleted_payloads int, deleted_pending_events int)",
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 011 is missing %q", fragment)
+		}
+	}
+	// The migration creates a cleanup function that contains DELETE statements
+	// for its operational purpose. The migration itself must not contain
+	// top-level DROP TABLE or DELETE FROM that would execute immediately.
+	raw := rawMigration(t, 11)
+	for _, forbidden := range []string{
+		"DROP TABLE",
+		"DROP COLUMN",
+	} {
+		if strings.Contains(raw, forbidden) {
+			t.Errorf("migration 011 must not contain top-level %q", forbidden)
+		}
+	}
+	// Top-level DELETE FROM (outside function body) would be a data rewrite.
+	// We allow DELETE inside the function body (which starts with $$).
+	if idx := strings.Index(raw, "DELETE FROM"); idx >= 0 && idx < strings.Index(raw, "$$") {
+		t.Error("migration 011 must not contain top-level DELETE FROM")
+	}
+	if !strings.Contains(raw, "Rollback:") {
+		t.Error("migration 011 must document how to reverse it")
+	}
+}
+
 func TestApplyIsIdempotentAgainstConfiguredDatabase(t *testing.T) {
 	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
 	if databaseURL == "" {
