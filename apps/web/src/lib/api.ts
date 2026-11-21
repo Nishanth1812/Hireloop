@@ -105,3 +105,57 @@ export function patchApplication(token: string, id: string, input: ApplicationPa
 export function deleteApplication(token: string, id: string): Promise<void> {
   return request(`/api/applications/${encodeURIComponent(id)}`, token, { method: "DELETE" });
 }
+
+export type TaskStatus = "open" | "done" | "cancelled";
+export type TaskPrecision = "none" | "date" | "instant";
+
+// A task keeps its deadline precision on the wire. Date-only deadlines have a
+// due_date and no time or zone; exact deadlines have a UTC due_at plus the
+// original IANA time_zone and the wall time (due_local) that produced it.
+export type Task = {
+  id: string;
+  application_id: string;
+  title: string;
+  status: TaskStatus;
+  due_precision: TaskPrecision;
+  due_date: string;
+  due_local: string;
+  due_at: string;
+  time_zone: string;
+  created_at: string;
+};
+
+export type TaskInput = {
+  application_id: string;
+  title: string;
+  due_precision: TaskPrecision;
+  due_date?: string;
+  due_local?: string;
+  time_zone?: string;
+};
+
+export type TaskPatch = Partial<Pick<Task, "title" | "status" | "due_precision" | "due_date" | "due_local" | "time_zone">>;
+
+export type TaskPage = { items: Task[] };
+
+// Tasks are a small personal queue, so the list is not paginated. showAll
+// includes finished tasks; the default view is open actions only.
+export function listTasks(token: string, showAll = false): Promise<TaskPage> {
+  return request(`/api/tasks${showAll ? "?filter=all" : ""}`, token);
+}
+
+export function createTask(token: string, input: TaskInput): Promise<Task> {
+  return request("/api/tasks", token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function patchTask(token: string, id: string, input: TaskPatch): Promise<Task> {
+  return request(`/api/tasks/${encodeURIComponent(id)}`, token, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}

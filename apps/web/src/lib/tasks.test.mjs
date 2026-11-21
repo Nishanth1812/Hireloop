@@ -1,0 +1,75 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+const tasks = await import("./tasks.ts").catch(() => null);
+
+const task = (overrides = {}) => ({
+  id: "t1",
+  application_id: "a1",
+  title: "Submit assessment",
+  status: "open",
+  due_precision: "date",
+  due_date: "2026-11-12",
+  due_local: "",
+  due_at: "",
+  time_zone: "",
+  created_at: "2026-11-01T09:00:00Z",
+  ...overrides,
+});
+
+test("date-only deadlines show a day and say the cutoff time is unspecified", () => {
+  assert.ok(tasks, "task display helpers are missing");
+  const result = tasks.deadlineText(task());
+  assert.equal(result.when, "12 Nov 2026");
+  assert.match(result.detail, /cutoff time unspecified/i);
+  // No invented time or zone anywhere in the rendered text.
+  assert.doesNotMatch(result.when, /\d{1,2}:\d{2}/);
+  assert.doesNotMatch(result.detail, /Asia\/|UTC|GMT/);
+});
+
+test("date-only formatting never shifts the day with the machine's timezone", () => {
+  assert.equal(tasks.formatDateOnly("2026-01-01"), "1 Jan 2026");
+  assert.equal(tasks.formatDateOnly("2026-12-31"), "31 Dec 2026");
+  assert.equal(tasks.formatDateOnly(""), "");
+});
+
+test("exact deadlines render the stored instant in its original zone", () => {
+  const instant = task({
+    due_precision: "instant",
+    due_at: "2026-11-12T12:30:00Z",
+    due_local: "2026-11-12T18:00",
+    time_zone: "Asia/Kolkata",
+  });
+  const result = tasks.deadlineText(instant);
+  assert.equal(result.when, "12 Nov 2026, 18:00");
+  assert.match(result.detail, /Asia\/Kolkata/);
+  assert.match(result.detail, /5:30/);
+});
+
+test("exact deadlines respect the zone across a daylight-saving boundary", () => {
+  // The same UTC instant before and after the New York fall-back has two
+  // different local clock times; each is shown with its own offset.
+  const before = tasks.formatInstant("2026-11-01T05:30:00Z", "America/New_York");
+  const after = tasks.formatInstant("2026-11-01T06:30:00Z", "America/New_York");
+  assert.equal(before.when, "1 Nov 2026, 01:30");
+  assert.equal(after.when, "1 Nov 2026, 01:30");
+  assert.match(before.zoneLabel, /UTC-4/);
+  assert.match(after.zoneLabel, /UTC-5/);
+});
+
+test("a task with no deadline says so instead of inventing a date", () => {
+  const result = tasks.deadlineText(task({ due_precision: "none", due_date: "", due_at: "", time_zone: "" }));
+  assert.equal(result.when, "No deadline");
+  assert.match(result.detail, /no cutoff date/i);
+});
+
+test("an invalid instant is reported rather than shown as a wrong time", () => {
+  const result = tasks.deadlineText(task({ due_precision: "instant", due_at: "not-a-date", time_zone: "UTC" }));
+  assert.match(result.when, /needs attention/i);
+});
+
+test("an edited task's zone stays available in the choice list", () => {
+  assert.ok(tasks.TIME_ZONE_CHOICES.includes("Asia/Kolkata"));
+  assert.deepEqual(tasks.zoneChoices("Pacific/Fiji").slice(0, 1), ["Pacific/Fiji"]);
+  assert.deepEqual(tasks.zoneChoices("UTC"), tasks.TIME_ZONE_CHOICES);
+});

@@ -17,7 +17,7 @@ mock.module("@clerk/nextjs", () => ({
 mock.module("./_components/ApplicationDashboard", () => ({
   ApplicationDashboard: (props) => {
     dashboardProps = props;
-    const { email, result, filters, page, error, loading, loadError } = props;
+    const { email, result, filters, page, error, loading, loadError, tasks } = props;
     return <div>
       <span>{email}</span>
       <span>{loading ? "Loading" : "Ready"}</span>
@@ -26,6 +26,7 @@ mock.module("./_components/ApplicationDashboard", () => ({
       {loadError && <p data-testid="load-error">Load failed</p>}
       {error && <p role="alert">{error}</p>}
       {result.items.map((item) => <p key={item.id}>{item.company}</p>)}
+      <div data-testid="today">{tasks.map((task) => <p key={task.id}>{task.title}</p>)}</div>
     </div>;
   },
 }));
@@ -54,6 +55,16 @@ function page(overrides = {}) {
 function response(company) {
   const items = company ? [{ id: company, company, role: "Engineer", status: "saved" }] : [];
   return Response.json(page({ items, total: items.length, counts: { saved: items.length, applied: 0 } }));
+}
+function taskResponse(items = []) {
+  return Response.json({ items });
+}
+function openTask(overrides = {}) {
+  return {
+    id: "task-1", application_id: "app-1", title: "Submit assessment", status: "open",
+    due_precision: "date", due_date: "2026-11-12", due_local: "", due_at: "", time_zone: "",
+    created_at: "2026-11-01T09:00:00Z", ...overrides,
+  };
 }
 async function render() {
   await act(async () => { root.render(<ApplicationTracker />); });
@@ -126,7 +137,8 @@ test("a successful create clears a stale load error so the new record is visible
 
   expect(container.querySelector('[data-testid="load-error"]') === null).toBe(true);
   // The new record is confirmed by the follow-up list request, not assumed.
-  expect(calls).toBe(3);
+  // The separate Today request also runs on this account's initial render.
+  expect(calls).toBe(4);
 });
 
 test("next requests the page after the current cursor", async () => {
@@ -335,9 +347,12 @@ test("a token resolving after sign-out cannot trigger an application request", a
 
 test("switching accounts immediately hides the previous account's records", async () => {
   let completeB;
-  globalThis.fetch = async (_url, options) => options.headers.Authorization === "Bearer a"
-    ? response("Account A company")
-    : new Promise((resolve) => { completeB = resolve; });
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/tasks") return taskResponse();
+    return options.headers.Authorization === "Bearer a"
+      ? response("Account A company")
+      : new Promise((resolve) => { completeB = resolve; });
+  };
   session = account("a");
   await render();
   expect(container.textContent).toContain("Account A company");
@@ -348,11 +363,126 @@ test("switching accounts immediately hides the previous account's records", asyn
   expect(container.textContent).toContain("Account B company");
 });
 
+test("creating a task posts the deadline shape and reloads Today", async () => {
+  const requests = [];
+  let posted = false;
+  const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved", url: "", source: "", channel: "", job_id: "", applied_on: "", address: "", notes: "" };
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, method: options.method, body: options.body });
+    if (options.method === "POST") {
+      posted = true;
+      return Response.json(openTask(), { status: 201 });
+    }
+    if (url === "/api/tasks") return taskResponse(posted ? [openTask()] : []);
+    return Response.json(page({ items: [app], total: 1, counts: { saved: 1, applied: 0 } }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onAddTask(app); });
+  expect(dashboardProps.taskDraft.application.id).toBe("app-1");
+
+  await act(async () => {
+    await dashboardProps.onSaveTask({
+      preventDefault() {},
+      currentTarget: formWith({ application_id: "app-1", title: "Submit assessment", due_precision: "date", due_date: "2026-11-12" }),
+    });
+  });
+
+  const post = requests.find((request) => request.method === "POST");
+  expect(post.url).toBe("/api/tasks");
+  expect(JSON.parse(post.body)).toEqual({
+    application_id: "app-1", title: "Submit assessment", due_precision: "date", due_date: "2026-11-12",
+  });
+  expect(requests.filter((request) => request.url === "/api/tasks").length).toBeGreaterThan(1);
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
+  expect(dashboardProps.taskDraft).toBeNull();
+});
+
+test("an exact deadline without a zone is rejected before any request", async () => {
+  const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved" };
+  let posts = 0;
+  globalThis.fetch = async (url, options) => {
+    if (options.method === "POST") posts++;
+    if (url === "/api/tasks") return taskResponse();
+    return Response.json(page({ items: [app], total: 1, counts: { saved: 1, applied: 0 } }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onAddTask(app); });
+  await act(async () => {
+    await dashboardProps.onSaveTask({
+      preventDefault() {},
+      currentTarget: formWith({ application_id: "app-1", title: "Interview", due_precision: "instant", due_local: "2026-11-12T18:00", time_zone: "" }),
+    });
+  });
+  expect(posts).toBe(0);
+  expect(container.querySelector('[role="alert"]').textContent).toMatch(/time zone/i);
+  expect(dashboardProps.taskDraft).not.toBeNull();
+});
+
+test("completing and cancelling tasks remove them from open Today and persist after reload", async () => {
+  const requests = [];
+  const task = openTask();
+  const cancelled = openTask({ id: "task-2", title: "Reply to recruiter" });
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, method: options.method, body: options.body, token: options.headers.Authorization });
+    if (options.method === "PATCH") {
+      const patch = JSON.parse(options.body);
+      return Response.json({ ...task, ...cancelled, id: patch.id ?? task.id, status: patch.status });
+    }
+    if (url === "/api/tasks?filter=all") {
+      return taskResponse([{ ...task, status: "done" }, { ...cancelled, status: "cancelled" }]);
+    }
+    if (url === "/api/tasks") return taskResponse([task, cancelled]);
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Reply to recruiter");
+
+  await act(async () => { await dashboardProps.onCompleteTask(task); });
+  await act(async () => { await dashboardProps.onCancelTask(cancelled); });
+  const patches = requests.filter((request) => request.method === "PATCH");
+  expect(patches.map((request) => JSON.parse(request.body))).toEqual([
+    { status: "done" }, { status: "cancelled" },
+  ]);
+  // The open view is whatever the API returns after each write; it is not
+  // edited locally, so a completed action cannot linger because of a bug here.
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
+
+  await act(async () => { dashboardProps.onToggleFinished(); });
+  const all = requests.find((request) => request.url === "/api/tasks?filter=all");
+  expect(all).toBeDefined();
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
+});
+
+test("a delayed task response from a previous account cannot leak into the next one", async () => {
+  let completeA;
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/tasks" && options.headers.Authorization === "Bearer a") {
+      return new Promise((resolve) => { completeA = resolve; });
+    }
+    if (url === "/api/tasks") return taskResponse([openTask({ id: "task-b", title: "Account B task" })]);
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  session = account("b");
+  await render();
+  await act(async () => { completeA(taskResponse([openTask({ id: "task-a", title: "Account A secret task" })])); });
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Account B task");
+  expect(container.querySelector('[data-testid="today"]').textContent).not.toContain("Account A secret task");
+});
+
 test("a previous account's delayed response cannot overwrite the next account", async () => {
   let completeA;
-  globalThis.fetch = async (_url, options) => options.headers.Authorization === "Bearer a"
-    ? new Promise((resolve) => { completeA = resolve; })
-    : response("Account B company");
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/tasks") return taskResponse();
+    return options.headers.Authorization === "Bearer a"
+      ? new Promise((resolve) => { completeA = resolve; })
+      : response("Account B company");
+  };
   session = account("a");
   await render();
   session = account("b");

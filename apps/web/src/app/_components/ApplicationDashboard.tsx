@@ -4,12 +4,16 @@ import { useEffect, useRef } from "react";
 import type { FormEvent } from "react";
 import Link from "next/link";
 import { SignOutButton } from "@clerk/nextjs";
-import type { Application, ApplicationFilters, ApplicationPage } from "@/lib/api";
+import type { Application, ApplicationFilters, ApplicationPage, Task } from "@/lib/api";
 import { ApplicationCaptureForm } from "./ApplicationCaptureForm";
 import { ApplicationEditForm } from "./ApplicationEditForm";
 import { ApplicationFilterBar } from "./ApplicationFilterBar";
 import { ApplicationList } from "./ApplicationList";
+import { TaskForm } from "./TaskForm";
+import { TodayPanel } from "./TodayPanel";
 import { ThemeControl } from "./ThemeControl";
+
+export type TaskDraft = { application: Application; task: Task | null };
 
 type Props = {
   email: string;
@@ -23,6 +27,12 @@ type Props = {
   saving: boolean;
   busyId: string;
   editingApplication: Application | null;
+  tasks: Task[];
+  taskLoading: boolean;
+  taskLoadError: boolean;
+  tasksShowAll: boolean;
+  taskBusyId: string;
+  taskDraft: TaskDraft | null;
   error: string;
   notice: string;
   onCreate: (event: FormEvent<HTMLFormElement>) => void;
@@ -31,15 +41,24 @@ type Props = {
   onCancelEdit: () => void;
   onSaveEdit: (event: FormEvent<HTMLFormElement>, id: string) => void;
   onRemove: (application: Application) => void;
+  onAddTask: (application: Application) => void;
   onApplyFilters: (filters: ApplicationFilters) => void;
   onClearFilters: () => void;
   onPrevious: () => void;
   onNext: () => void;
+  onToggleFinished: () => void;
+  onEditTask: (task: Task, application?: Application) => void;
+  onSaveTask: (event: FormEvent<HTMLFormElement>, id?: string) => void;
+  onCancelTaskEdit: () => void;
+  onCompleteTask: (task: Task) => void;
+  onCancelTask: (task: Task) => void;
 };
 
 export function ApplicationDashboard({
-  email, result, filters, page, hasPrevious, hasNext, loading, loadError, saving, busyId, editingApplication, error, notice,
-  onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onApplyFilters, onClearFilters, onPrevious, onNext,
+  email, result, filters, page, hasPrevious, hasNext, loading, loadError, saving, busyId, editingApplication,
+  tasks, taskLoading, taskLoadError, tasksShowAll, taskBusyId, taskDraft, error, notice,
+  onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onAddTask, onApplyFilters, onClearFilters,
+  onPrevious, onNext, onToggleFinished, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask,
 }: Props) {
   // Counts come from the API for every matching row, never from the current
   // page, so the summary stays honest while paging or filtering.
@@ -83,6 +102,19 @@ export function ApplicationDashboard({
       {error && <p className="message error-message" role="alert">{error}</p>}
       {notice && <p className="message success-message" role="status">{notice}</p>}
 
+      <TodayPanel
+        tasks={tasks}
+        applications={result.items}
+        loading={taskLoading}
+        loadError={taskLoadError}
+        showAll={tasksShowAll}
+        busyId={taskBusyId}
+        onToggleFinished={onToggleFinished}
+        onEdit={onEditTask}
+        onComplete={onCompleteTask}
+        onCancel={onCancelTask}
+      />
+
       <div className="workspace">
         <div className="list-column">
           <ApplicationFilterBar
@@ -105,18 +137,29 @@ export function ApplicationDashboard({
             onStatusChange={onStatusChange}
             onEdit={onEdit}
             onRemove={onRemove}
+            onAddTask={onAddTask}
             onPrevious={onPrevious}
             onNext={onNext}
             onClearFilters={onClearFilters}
           />
         </div>
-        <ApplicationCaptureForm saving={saving} hidden={!!editingApplication} onSubmit={onCreate} />
+        <ApplicationCaptureForm saving={saving} hidden={!!editingApplication || !!taskDraft} onSubmit={onCreate} />
         {editingApplication && (
           <ApplicationEditForm
             application={editingApplication}
             saving={saving}
             onSave={onSaveEdit}
             onCancel={onCancelEdit}
+          />
+        )}
+        {taskDraft && (
+          <TaskForm
+            application={taskDraft.application}
+            task={taskDraft.task}
+            applications={result.items}
+            saving={saving}
+            onSave={onSaveTask}
+            onCancel={onCancelTaskEdit}
           />
         )}
       </div>
