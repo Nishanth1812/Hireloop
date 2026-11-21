@@ -420,6 +420,52 @@ test("an exact deadline without a zone is rejected before any request", async ()
   expect(dashboardProps.taskDraft).not.toBeNull();
 });
 
+test("creating a task uses the selected application", async () => {
+  const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved" };
+  let body;
+  globalThis.fetch = async (url, options) => {
+    if (options.method === "POST") { body = JSON.parse(options.body); return Response.json(openTask(), { status: 201 }); }
+    if (url === "/api/tasks") return taskResponse();
+    return Response.json(page({ items: [app], total: 1 }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onAddTask(app); });
+  await act(async () => { await dashboardProps.onSaveTask({ preventDefault() {}, currentTarget: formWith({ application_id: "app-2", title: "Apply", due_precision: "none" }) }); });
+  expect(body.application_id).toBe("app-2");
+});
+
+test("a date deadline without a date is rejected before saving", async () => {
+  const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved" };
+  let writes = 0;
+  globalThis.fetch = async (url, options) => {
+    if (options.method === "POST" || options.method === "PATCH") writes++;
+    return url === "/api/tasks" ? taskResponse() : Response.json(page({ items: [app], total: 1 }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onAddTask(app); });
+  await act(async () => { await dashboardProps.onSaveTask({ preventDefault() {}, currentTarget: formWith({ application_id: "app-1", title: "Apply", due_precision: "date", due_date: "" }) }); });
+  expect(writes).toBe(0);
+  expect(container.querySelector('[role="alert"]').textContent).toMatch(/choose a date/i);
+});
+
+test("deleting an application reloads its tasks", async () => {
+  const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved" };
+  let deleted = false;
+  browser.confirm = () => true;
+  globalThis.fetch = async (url, options) => {
+    if (options.method === "DELETE") { deleted = true; return new Response(null, { status: 204 }); }
+    if (url === "/api/tasks") return taskResponse(deleted ? [] : [openTask()]);
+    return Response.json(page({ items: deleted ? [] : [app], total: deleted ? 0 : 1 }));
+  };
+  session = account("a");
+  await render();
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
+  await act(async () => { await dashboardProps.onRemove(app); });
+  expect(container.querySelector('[data-testid="today"]').textContent).not.toContain("Submit assessment");
+});
+
 test("completing and cancelling tasks remove them from open Today and persist after reload", async () => {
   const requests = [];
   const task = openTask();

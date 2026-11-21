@@ -159,6 +159,15 @@ func (h taskHarness) request(token, method, body, path string) *httptest.Respons
 
 func taskPath(id string) string { return "/api/tasks/" + id }
 
+func TestTaskInvalidMergedStateReturnsBadRequest(t *testing.T) {
+	h := newTaskHarness(t)
+	h.store.err = tasks.ErrInvalid
+	w := h.request(h.token, http.MethodPatch, `{"due_precision":"date","due_date":""}`, taskPath(taskAppID))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid merged task: got %d, want 400", w.Code)
+	}
+}
+
 func TestTaskRoutesRequireAuthAndEnforceOwnerIsolation(t *testing.T) {
 	h := newTaskHarness(t)
 	for _, token := range []string{"", "invalid"} {

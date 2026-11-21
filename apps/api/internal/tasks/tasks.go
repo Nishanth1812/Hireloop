@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -19,6 +18,9 @@ import (
 // ErrNotFound means the task does not exist for this owner. The HTTP layer
 // turns it into a 404 without revealing whether another owner holds the id.
 var ErrNotFound = errors.New("task not found")
+
+// ErrInvalid indicates a task whose merged fields fail validation.
+var ErrInvalid = errors.New("invalid task")
 
 const (
 	maxTitleLength    = 200
@@ -301,7 +303,7 @@ type PostgresStore struct{ DB *sql.DB }
 func (s PostgresStore) Create(ctx context.Context, userID string, in Input) (Task, error) {
 	precision, deadline, ok := in.resolve()
 	if !ok {
-		return Task{}, fmt.Errorf("invalid task")
+		return Task{}, ErrInvalid
 	}
 	// The INSERT selects only when the linked application belongs to this
 	// owner, so a guessed application id cannot attach a task to another
@@ -383,11 +385,11 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 	switch target {
 	case PrecisionNone:
 		if input.DueDate != nil || input.DueLocal != nil || input.TimeZone != nil {
-			return Task{}, fmt.Errorf("invalid task")
+			return Task{}, ErrInvalid
 		}
 	case PrecisionDate:
 		if input.DueLocal != nil || input.TimeZone != nil {
-			return Task{}, fmt.Errorf("invalid task")
+			return Task{}, ErrInvalid
 		}
 		merged.DueDate = current.DueDate
 		if input.DueDate != nil {
@@ -395,7 +397,7 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 		}
 	case PrecisionInstant:
 		if input.DueDate != nil {
-			return Task{}, fmt.Errorf("invalid task")
+			return Task{}, ErrInvalid
 		}
 		merged.DueLocal, merged.TimeZone = current.DueLocal, current.TimeZone
 		if input.DueLocal != nil {
@@ -405,7 +407,7 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 			merged.TimeZone = *input.TimeZone
 		}
 	default:
-		return Task{}, fmt.Errorf("invalid task")
+		return Task{}, ErrInvalid
 	}
 	merged.Title = current.Title
 	if input.Title != nil {
@@ -417,7 +419,7 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 	}
 	precision, deadline, ok := merged.resolve()
 	if !ok || !validStatus(strings.TrimSpace(status)) {
-		return Task{}, fmt.Errorf("invalid task")
+		return Task{}, ErrInvalid
 	}
 
 	updated, err := scanTask(tx.QueryRowContext(ctx, `UPDATE tasks SET

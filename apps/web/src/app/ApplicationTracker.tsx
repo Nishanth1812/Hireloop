@@ -321,6 +321,7 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     try {
       const token = await sessionToken();
       await deleteApplication(token, application.id);
+      setTaskReloadKey((key) => key + 1);
       // Reload the same keyset position. If that was the last row on a later
       // page, the load effect steps back instead of showing a dead page.
       reload();
@@ -363,6 +364,10 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     const fields: TaskPatch = { title, due_precision: precision };
     if (precision === "date") {
       fields.due_date = String(data.get("due_date") ?? "").trim();
+      if (!fields.due_date) {
+        setError("Choose a date for this deadline.");
+        return;
+      }
     }
     if (precision === "instant") {
       fields.due_local = String(data.get("due_local") ?? "").trim();
@@ -370,6 +375,10 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
       if (!fields.time_zone) {
         // A wall time with no zone is not an instant; ask instead of guessing.
         setError("Choose the time zone for this deadline.");
+        return;
+      }
+      if (!fields.due_local) {
+        setError("Choose a date and time for this deadline.");
         return;
       }
     }
@@ -382,7 +391,7 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         await patchTask(token, id, fields);
       } else {
         const input: TaskInput = {
-          application_id: taskDraft.application.id,
+          application_id: String(data.get("application_id") ?? ""),
           title,
           due_precision: precision,
           ...(precision === "date" ? { due_date: fields.due_date } : {}),
