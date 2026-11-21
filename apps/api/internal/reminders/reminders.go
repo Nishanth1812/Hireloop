@@ -65,6 +65,10 @@ import (
 	"time"
 
 	"hireloop/api/internal/resend"
+
+	// The browser-zone offset used by approximate reminders must resolve on
+	// hosts (including Windows) with no system tzdata installed.
+	_ "time/tzdata"
 )
 
 // Delivery states.
@@ -158,10 +162,23 @@ type ReminderTiming string
 const (
 	Timing24hBefore ReminderTiming = "24h_before"
 	Timing2hBefore  ReminderTiming = "2h_before"
+	// Approximate reminders for a date-only deadline. They are nudges at a
+	// chosen local hour, not assertions about a cutoff the user never gave.
+	TimingDayBeforeApprox ReminderTiming = "day_before_approx"
+	TimingMorningOfApprox ReminderTiming = "morning_of_approx"
 	// TimingAtDeadline is the legacy single-job behavior: the reminder
-// fires at the exact deadline. Kept for forward-compatible migration
-// of existing jobs; new scheduling never creates this timing.
-TimingAtDeadline ReminderTiming = "at_deadline"
+	// fires at the exact deadline. Kept for forward-compatible migration
+	// of existing jobs; new scheduling never creates this timing.
+	TimingAtDeadline ReminderTiming = "at_deadline"
+)
+
+// Local hours chosen for the two approximate date-only reminders. They are
+// deliberately ordinary working hours: a day-before nudge in the evening and
+// a morning-of nudge before the day gets busy. They are documented product
+// choices, not a cutoff inferred from the task's date.
+const (
+	ApproxDayBeforeLocalHour = 18
+	ApproxMorningLocalHour   = 9
 )
 
 // Suppression reasons recorded on a job when it must not fire.
@@ -187,18 +204,23 @@ type Executor interface {
 // Job is the stored entity. The job id is the stable notification identity
 // the provider sees on every dispatch.
 type Job struct {
-	ID             string
-	UserID         string
-	TaskID         string
+	ID     string
+	UserID string
+	TaskID string
 	// DueAt is the reminder time (when this advance reminder should fire).
 	// For 24h_before: true_deadline - 24h. For 2h_before: true_deadline - 2h.
 	// For legacy at_deadline: equals true_deadline.
-	DueAt          time.Time
+	DueAt time.Time
 	// TrueDeadline is the task's actual instant deadline. Used for the
 	// dispatch guard (never send past deadline) and rendered in the email.
-	TrueDeadline   time.Time
+	TrueDeadline time.Time
 	// ReminderTiming identifies which advance reminder this job is.
 	ReminderTiming ReminderTiming
+	// DueDay and ReminderZone are set only for approximate date-only
+	// reminders. They drive a calendar-day dispatch guard and the email label;
+	// TrueDeadline stays zero because no exact cutoff was ever stored.
+	DueDay         string
+	ReminderZone   string
 	DeliveryState  string
 	SuppressReason string
 	LeaseToken     string
@@ -236,20 +258,34 @@ type Transition struct {
 // Store reads and writes reminder_jobs and user_notification_settings.
 type Store struct{ DB *sql.DB }
 
-// Schedule activates or reactivates the two advance reminder jobs for a
-// task: one at 24h before the true deadline, one at 2h before. Date-only
-// deadlines never get a job (no time is invented). Only future-eligible
-// slots are scheduled: if the true deadline is less than 24h away, only the
-// 2h reminder is scheduled (if still in the future); if less than 2h away,
-// no advance reminders are scheduled. Every reactivation bumps
-// delivery_version and clears the provider mapping and callback bookkeeping,
-// so the next dispatch uses a fresh per-version idempotency key and old
-// provider events for previous versions cannot overwrite the reactivated job.
-func (s *Store) Schedule(ctx context.Context, w Executor, userID, taskID string, trueDeadline time.Time) error {
-	now := time.Now()
-	// Suppress any existing jobs for this task first (handles reschedule,
-	// completion, etc.). The unique index on (task_id, reminder_timing)
-	// allows us to upsert each timing independently.
+// JobSpec is one reminder to activate for a task. Exact-instant specs carry a
+// TrueDeadline and no DueDay/Zone; approximate specs carry a DueDay and Zone
+// and leave TrueDeadline zero, because no exact cutoff was ever stored.
+type JobSpec struct {
+	Timing       ReminderTiming
+	DueAt        time.Time
+	TrueDeadline time.Time
+	DueDay       string
+	Zone         string
+}
+
+// ApproxSlot is a computed approximate reminder for a date-only deadline.
+type ApproxSlot struct {
+	Timing ReminderTiming
+	DueAt  time.Time
+	DueDay string
+	Zone   string
+}
+
+// Reschedule replaces every unsent job for a task with specs. Existing jobs
+// are suppressed first (handling reschedules, precision changes and
+// precision switches); each spec is then inserted or reactivated by timing.
+// Every reactivation bumps delivery_version and clears the provider mapping
+// and callback bookkeeping, so the next dispatch uses a fresh per-version
+// idempotency key and old provider events for previous versions cannot
+// overwrite the reactivated job. Terminal jobs are left alone by the
+// suppression and become a new logical send if their timing is reactivated.
+func (s *Store) Reschedule(ctx context.Context, w Executor, userID, taskID string, specs []JobSpec) error {
 	_, err := w.ExecContext(ctx, `UPDATE reminder_jobs
 		SET delivery_state = '`+StateSuppressed+`', suppress_reason = '`+SuppressRescheduled+`',
 			lease_token = NULL, lease_until = NULL, retry_at = NULL,
@@ -259,44 +295,76 @@ func (s *Store) Schedule(ctx context.Context, w Executor, userID, taskID string,
 	if err != nil {
 		return err
 	}
-
-	// Schedule 24h before reminder if eligible.
-	if d24 := trueDeadline.Add(-24 * time.Hour); d24.After(now) {
-		if err := s.scheduleOne(ctx, w, userID, taskID, trueDeadline, d24, Timing24hBefore); err != nil {
-			return err
-		}
-	}
-	// Schedule 2h before reminder if eligible.
-	if d2 := trueDeadline.Add(-2 * time.Hour); d2.After(now) {
-		if err := s.scheduleOne(ctx, w, userID, taskID, trueDeadline, d2, Timing2hBefore); err != nil {
+	for _, spec := range specs {
+		if err := s.scheduleOne(ctx, w, userID, taskID, spec); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// scheduleOne inserts or reactivates a single advance reminder job.
-// It reactivates any existing job for this task/timing/owner when Schedule
-// is called, because Schedule is only invoked when the deadline genuinely
-// changed (or on initial create). The delivery_version bump and provider
-// mapping clear ensure a fresh idempotency key. Terminal states are not
-// excluded: a delivered/exhausted/permanent_failed job from an old deadline
-// becomes a new logical send for the new deadline. Suppressed jobs from the
-// initial suppression in Schedule (reason='rescheduled') are also reactivated.
-func (s *Store) scheduleOne(ctx context.Context, w Executor, userID, taskID string, trueDeadline, dueAt time.Time, timing ReminderTiming) error {
-	res, err := w.ExecContext(ctx, `INSERT INTO reminder_jobs (user_id, task_id, due_at, true_deadline, reminder_timing, delivery_version)
-		VALUES ($1, $2, $3, $4, $5, 1)
+// Schedule activates or reactivates the two advance reminder jobs for an
+// exact-instant deadline: one at 24h and one at 2h before it. Only future
+// slots are scheduled. Date-only deadlines never get a job here; callers use
+// ScheduleApprox for those.
+func (s *Store) Schedule(ctx context.Context, w Executor, userID, taskID string, trueDeadline time.Time) error {
+	now := time.Now()
+	specs := []JobSpec{}
+	if d24 := trueDeadline.Add(-24 * time.Hour); d24.After(now) {
+		specs = append(specs, JobSpec{Timing: Timing24hBefore, DueAt: d24, TrueDeadline: trueDeadline})
+	}
+	if d2 := trueDeadline.Add(-2 * time.Hour); d2.After(now) {
+		specs = append(specs, JobSpec{Timing: Timing2hBefore, DueAt: d2, TrueDeadline: trueDeadline})
+	}
+	return s.Reschedule(ctx, w, userID, taskID, specs)
+}
+
+// ScheduleApprox activates or reactivates the approximate day-before and
+// morning-of jobs computed for a date-only deadline. Passing no slots
+// suppresses any previous jobs, which is how a cleared or changed deadline
+// retires stale reminders.
+func (s *Store) ScheduleApprox(ctx context.Context, w Executor, userID, taskID string, slots []ApproxSlot) error {
+	specs := make([]JobSpec, 0, len(slots))
+	for _, slot := range slots {
+		specs = append(specs, JobSpec{
+			Timing: slot.Timing, DueAt: slot.DueAt,
+			DueDay: slot.DueDay, Zone: slot.Zone,
+		})
+	}
+	return s.Reschedule(ctx, w, userID, taskID, specs)
+}
+
+// scheduleOne inserts or reactivates a single reminder job. The delivery
+// version bump and provider mapping clear ensure a fresh idempotency key.
+// Terminal states are not excluded: a delivered/exhausted/permanent_failed
+// job from an old deadline becomes a new logical send for the new deadline.
+func (s *Store) scheduleOne(ctx context.Context, w Executor, userID, taskID string, spec JobSpec) error {
+	var trueDeadline, dueDay, zone any
+	if !spec.TrueDeadline.IsZero() {
+		trueDeadline = spec.TrueDeadline
+	}
+	if spec.DueDay != "" {
+		dueDay = spec.DueDay
+	}
+	if spec.Zone != "" {
+		zone = spec.Zone
+	}
+	res, err := w.ExecContext(ctx, `INSERT INTO reminder_jobs
+		(user_id, task_id, due_at, true_deadline, reminder_timing, due_day, reminder_zone, delivery_version)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
 		ON CONFLICT (task_id, reminder_timing) DO UPDATE SET
 			delivery_state = '`+StateScheduled+`',
 			due_at = $3,
 			true_deadline = $4,
+			due_day = $6,
+			reminder_zone = $7,
 			delivery_version = reminder_jobs.delivery_version + 1,
 			lease_token = NULL, lease_until = NULL,
 			retry_count = 0, retry_at = NULL, callback_key = NULL,
 			delivery_note = NULL, suppress_reason = NULL,
 			provider_email_id = NULL, provider_version = NULL,
 			updated_at = now()
-		WHERE reminder_jobs.user_id = $6`, userID, taskID, dueAt, trueDeadline, timing, userID)
+		WHERE reminder_jobs.user_id = $8`, userID, taskID, spec.DueAt, trueDeadline, spec.Timing, dueDay, zone, userID)
 	if err != nil {
 		return err
 	}
@@ -308,6 +376,62 @@ func (s *Store) scheduleOne(ctx context.Context, w Executor, userID, taskID stri
 		return errors.New("reminders: task id belongs to another owner")
 	}
 	return nil
+}
+
+// DateApproxSlots computes the two approximate reminders for a date-only
+// deadline in the browser zone captured at creation. Both use calendar-day
+// arithmetic, not a 24-hour offset, so they stay on the intended local day
+// across DST changes. A slot whose instant is not in the future is omitted:
+// past deadlines never get a reminder. An unusable day or zone yields no
+// slots rather than an invented time.
+func DateApproxSlots(dueDay, zone string, now time.Time) []ApproxSlot {
+	day, err := time.Parse("2006-01-02", dueDay)
+	if err != nil || day.Format("2006-01-02") != dueDay || !validApproxZone(zone) {
+		return nil
+	}
+	loc, err := time.LoadLocation(zone)
+	if err != nil {
+		return nil
+	}
+	candidates := []struct {
+		timing ReminderTiming
+		day    time.Time
+		hour   int
+	}{
+		{TimingDayBeforeApprox, day.AddDate(0, 0, -1), ApproxDayBeforeLocalHour},
+		{TimingMorningOfApprox, day, ApproxMorningLocalHour},
+	}
+	slots := []ApproxSlot{}
+	for _, candidate := range candidates {
+		at := approxLocalInstant(candidate.day, candidate.hour, loc)
+		if !at.After(now) {
+			continue
+		}
+		slots = append(slots, ApproxSlot{
+			Timing: candidate.timing, DueAt: at, DueDay: dueDay, Zone: zone,
+		})
+	}
+	return slots
+}
+
+// approxLocalInstant resolves a local hour on a calendar day to one instant.
+// It uses the zone's offset at local noon, so a DST transition earlier that
+// day cannot make two offsets produce two different reminders. The result is
+// an approximate nudge, not an exact wall-time promise; callers label it as
+// such and never store it as the task's cutoff.
+func approxLocalInstant(day time.Time, hour int, loc *time.Location) time.Time {
+	noon := time.Date(day.Year(), day.Month(), day.Day(), 12, 0, 0, 0, loc)
+	_, offset := noon.Zone()
+	naive := time.Date(day.Year(), day.Month(), day.Day(), hour, 0, 0, 0, time.UTC)
+	return naive.Add(-time.Duration(offset) * time.Second).UTC()
+}
+
+func validApproxZone(zone string) bool {
+	if zone == "" || len(zone) > 64 || strings.ContainsRune(zone, 0) || zone == "Local" {
+		return false
+	}
+	_, err := time.LoadLocation(zone)
+	return err == nil
 }
 
 // Suppress marks a job for a task as suppressed with the given reason, but
@@ -344,11 +468,13 @@ func (s *Store) Get(ctx context.Context, userID, id string) (Job, error) {
 	var leaseUntil, retryAt sql.NullTime
 	var providerVersion sql.NullInt64
 	var reminderTiming, trueDeadline sql.NullString
-	err := s.DB.QueryRowContext(ctx, `SELECT id, user_id, task_id, due_at, true_deadline, reminder_timing, delivery_state,
+	err := s.DB.QueryRowContext(ctx, `SELECT id, user_id, task_id, due_at, true_deadline, reminder_timing,
+			COALESCE(to_char(due_day, 'YYYY-MM-DD'), ''), COALESCE(reminder_zone, ''), delivery_state,
 			suppress_reason, lease_token, lease_until, retry_count, retry_at, callback_key,
 			delivery_note, delivery_version, provider_email_id, provider_version, updated_at
 		FROM reminder_jobs WHERE user_id = $1 AND id = $2`, userID, id).
-		Scan(&job.ID, &job.UserID, &job.TaskID, &job.DueAt, &trueDeadline, &reminderTiming, &job.DeliveryState,
+		Scan(&job.ID, &job.UserID, &job.TaskID, &job.DueAt, &trueDeadline, &reminderTiming,
+			&job.DueDay, &job.ReminderZone, &job.DeliveryState,
 			&suppress, &leaseToken, &leaseUntil, &job.RetryCount, &retryAt,
 			&callbackKey, &note, &job.DeliveryVersion, &providerEmailID,
 			&providerVersion, &job.UpdatedAt)

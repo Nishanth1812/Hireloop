@@ -9,10 +9,43 @@ import (
 	"hireloop/api/internal/resend"
 )
 
-// buildReminderText constructs the email body for an advance reminder.
-// It shows the true deadline and indicates which advance reminder this is.
-// Date-only deadlines are not supported for reminders (no instant = no job).
-func buildReminderText(title string, trueDeadline time.Time, timing ReminderTiming) string {
+// approximateLabel returns the human label for an approximate date-only
+// reminder and whether this timing is approximate.
+func approximateLabel(timing ReminderTiming) (string, bool) {
+	switch timing {
+	case TimingDayBeforeApprox:
+		return "day-before", true
+	case TimingMorningOfApprox:
+		return "morning-of", true
+	}
+	return "", false
+}
+
+// buildReminderSubject labels approximate reminders in the subject line so a
+// recipient can tell a nudge from an exact-deadline warning before opening it.
+func buildReminderSubject(title string, timing ReminderTiming) string {
+	if _, ok := approximateLabel(timing); ok {
+		return "Hireloop approximate reminder: " + title
+	}
+	return "Hireloop reminder: " + title
+}
+
+// buildReminderText constructs the email body for one reminder. Exact jobs
+// show the stored instant and their advance interval. Approximate jobs show
+// only the date the user gave and say plainly that the local-hour nudge is
+// approximate and not a guaranteed cutoff; no cutoff time is invented.
+func buildReminderText(title string, trueDeadline time.Time, timing ReminderTiming, dueDay, zone string) string {
+	if label, ok := approximateLabel(timing); ok {
+		hour := ApproxMorningLocalHour
+		if timing == TimingDayBeforeApprox {
+			hour = ApproxDayBeforeLocalHour
+		}
+		if zone == "" {
+			zone = "your local zone"
+		}
+		return fmt.Sprintf("Hireloop approximate reminder: %s\nDeadline: %s (date only — cutoff time was not specified)\nThis is an approximate %s reminder around %02d:00 %s. It is not a guaranteed cutoff.\n",
+			title, dueDay, label, hour, zone)
+	}
 	var timingLine string
 	switch timing {
 	case Timing24hBefore:
@@ -97,8 +130,8 @@ func (d *ResendDispatcher) Send(ctx context.Context, n Notification) Outcome {
 		}
 		p = Payload{
 			Recipient: to,
-			Subject:   "Hireloop reminder: " + n.Title,
-			Text:      buildReminderText(n.Title, n.TrueDeadline, n.ReminderTiming),
+			Subject:   buildReminderSubject(n.Title, n.ReminderTiming),
+			Text:      buildReminderText(n.Title, n.TrueDeadline, n.ReminderTiming, n.DueDay, n.ReminderZone),
 		}
 		p, err = d.store.SaveDeliveryPayload(ctx, job.ID, job.DeliveryVersion, p)
 		if err != nil {

@@ -83,8 +83,8 @@ func TestBuildReminderText(t *testing.T) {
 	trueDeadline := time.Date(2026, 11, 21, 9, 30, 0, 0, time.UTC)
 
 	tests := []struct {
-		timing      ReminderTiming
-		wantTiming  string
+		timing     ReminderTiming
+		wantTiming string
 	}{
 		{Timing24hBefore, "This reminder fires 24 hours before your deadline."},
 		{Timing2hBefore, "This reminder fires 2 hours before your deadline."},
@@ -92,7 +92,7 @@ func TestBuildReminderText(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		text := buildReminderText(title, trueDeadline, tc.timing)
+		text := buildReminderText(title, trueDeadline, tc.timing, "", "")
 		wantDue := "Due: 2026-11-21T09:30:00Z"
 		wantTitle := "Hireloop reminder: Interview"
 		if !contains(text, wantTitle) {
@@ -231,13 +231,9 @@ func TestDeadlineGuardUnit(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// Simulate the deadline guard logic from dispatchOne (unified for all timings)
-			var suppress bool
-			if !tc.trueDeadline.IsZero() && tc.now.After(tc.trueDeadline) {
-				suppress = true
-			}
-			if suppress != tc.expectSuppress {
-				t.Errorf("%s: suppress=%v, want %v (%s)", tc.name, suppress, tc.expectSuppress, tc.description)
+			job := Job{DueAt: tc.dueAt, TrueDeadline: tc.trueDeadline, ReminderTiming: tc.timing}
+			if got := deadlinePassed(job, tc.now); got != tc.expectSuppress {
+				t.Errorf("%s: suppress=%v, want %v (%s)", tc.name, got, tc.expectSuppress, tc.description)
 			}
 		})
 	}

@@ -201,14 +201,11 @@ func (w *Worker) dispatchOne(ctx context.Context, job Job) error {
 			State: StateSuppressed, Reason: SuppressDisabled, Note: "reminders disabled",
 		})
 	}
-	// Deadline guard: never send a reminder past the true deadline.
-	// This handles retries, worker downtime, and any delay between
-	// claim and dispatch. The true deadline is stored on the job.
-	// Legacy at_deadline jobs have due_at == true_deadline; they are
-	// claimed at or after the deadline, so the same guard applies:
-	// suppress if strictly past the true deadline.
+	// Deadline guard: never send a reminder past its deadline. Exact jobs
+	// compare against the stored instant; approximate jobs compare the local
+	// calendar day, because their date-only task has no true cutoff instant.
 	now := w.now()
-	if !current.TrueDeadline.IsZero() && now.After(current.TrueDeadline) {
+	if deadlinePassed(current, now) {
 		return w.store.RecordDelivery(ctx, current.ID, current.LeaseToken, Transition{
 			State: StateSuppressed, Reason: SuppressDeadlinePassed, Note: "deadline passed before dispatch",
 		})
@@ -219,6 +216,8 @@ func (w *Worker) dispatchOne(ctx context.Context, job Job) error {
 		TaskID:         current.TaskID,
 		DueAt:          current.DueAt,
 		TrueDeadline:   current.TrueDeadline,
+		DueDay:         current.DueDay,
+		ReminderZone:   current.ReminderZone,
 		ReminderTiming: current.ReminderTiming,
 		Title:          title,
 		Version:        current.DeliveryVersion,
@@ -272,6 +271,30 @@ func (w *Worker) retryTransition(job Job, now time.Time, state, note string) Tra
 		at := now.Add(w.backoff(attempts))
 		return Transition{State: state, RetryCount: attempts, RetryAt: &at, Note: note}
 	}
+}
+
+// deadlinePassed reports whether a claimed job is now past the deadline it
+// reminds about. Exact jobs use their stored instant (legacy at_deadline jobs
+// have due_at == true_deadline). Approximate jobs have no true instant, so
+// they use the captured zone to compare calendar days: a reminder on the due
+// day is still eligible, one on a later local day is not. A missing or
+// unusable day/zone fails closed and suppresses rather than sending a
+// reminder whose deadline cannot be verified.
+func deadlinePassed(job Job, now time.Time) bool {
+	if job.DueDay != "" {
+		day, err := time.Parse("2006-01-02", job.DueDay)
+		if err != nil || day.Format("2006-01-02") != job.DueDay || !validApproxZone(job.ReminderZone) {
+			return true
+		}
+		loc, err := time.LoadLocation(job.ReminderZone)
+		if err != nil {
+			return true
+		}
+		local := now.In(loc)
+		localDay := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.UTC)
+		return localDay.After(day)
+	}
+	return !job.TrueDeadline.IsZero() && now.After(job.TrueDeadline)
 }
 
 // backoff doubles the base delay per attempt, capped at BackoffMax.

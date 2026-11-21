@@ -41,9 +41,11 @@ type Notification struct {
 	ID             string
 	UserID         string
 	TaskID         string
-	DueAt          time.Time        // The reminder time (when this advance reminder fires)
-	TrueDeadline   time.Time        // The task's actual deadline (for email rendering and dispatch guard)
-	ReminderTiming ReminderTiming   // Which advance reminder this is (24h_before, 2h_before, at_deadline)
+	DueAt          time.Time      // The reminder time (when this advance reminder fires)
+	TrueDeadline   time.Time      // Exact task deadline; zero for approximate reminders
+	DueDay         string         // Date-only task deadline; empty for exact reminders
+	ReminderZone   string         // Browser zone used for approximate local hours
+	ReminderTiming ReminderTiming // Which advance reminder this is
 	Title          string
 	Version        int
 }
