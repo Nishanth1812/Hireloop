@@ -492,6 +492,13 @@ func TestPostgresKeysetDoesNotOfferAnEmptyNextPage(t *testing.T) {
 func TestPostgresKeysetStaysOwnerScopedAndFiltered(t *testing.T) {
 	store, db, ownerA := openIntegrationStore(t)
 	ownerB := randomOwner(t)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		if _, err := db.ExecContext(cleanupCtx, `DELETE FROM applications WHERE user_id = $1`, ownerB); err != nil {
+			t.Errorf("cleanup rows for second test owner: %v", err)
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
