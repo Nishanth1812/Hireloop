@@ -45,3 +45,14 @@ type Notification struct {
 	Title  string
 	Version int
 }
+
+// Payload is the complete outbound message for one (job, version). It is
+// persisted on the first attempt and reused byte-for-byte on every retry so a
+// Resend idempotency key is never reused with a different body. Recipient is
+// the verified primary email resolved at the first attempt; no user-entered
+// application address is ever part of it.
+type Payload struct {
+	Recipient string
+	Subject   string
+	Text      string
+}

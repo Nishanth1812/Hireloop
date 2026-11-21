@@ -146,7 +146,7 @@ func (w *Worker) dispatchOne(ctx context.Context, job Job) error {
 	// task deletion, so the worker re-checks here and marks the job
 	// suppressed instead of dispatching a reminder for a deleted account.
 	var title string
-	err = w.store.DB.QueryRowContext(ctx, `SELECT title FROM tasks WHERE id = $1`, current.TaskID).Scan(&title)
+	err = w.store.DB.QueryRowContext(ctx, `SELECT title FROM tasks WHERE id = $1 AND user_id = $2`, current.TaskID, current.UserID).Scan(&title)
 	if errors.Is(err, sql.ErrNoRows) {
 		return w.store.RecordDelivery(ctx, current.ID, current.LeaseToken, Transition{
 			State: StateSuppressed, Reason: SuppressDeleted, Note: "task deleted",

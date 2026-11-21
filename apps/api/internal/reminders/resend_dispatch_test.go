@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -14,8 +15,31 @@ import (
 // dispatchStore implements the two store methods the Resend dispatcher uses
 // (Get and SetProviderEmailID), in memory, without a database.
 type dispatchStore struct {
-	mu   sync.Mutex
-	jobs map[string]Job
+	mu       sync.Mutex
+	jobs     map[string]Job
+	payloads map[string]Payload
+}
+
+func payloadKey(jobID string, version int) string {
+	return fmt.Sprintf("%s:v%d", jobID, version)
+}
+
+func (s *dispatchStore) GetDeliveryPayload(_ context.Context, jobID string, version int) (Payload, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.payloads[payloadKey(jobID, version)]
+	return p, ok, nil
+}
+
+func (s *dispatchStore) SaveDeliveryPayload(_ context.Context, jobID string, version int, p Payload) (Payload, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := payloadKey(jobID, version)
+	if existing, ok := s.payloads[k]; ok {
+		return existing, nil
+	}
+	s.payloads[k] = p
+	return p, nil
 }
 
 func (s *dispatchStore) Get(_ context.Context, userID, id string) (Job, error) {
@@ -76,9 +100,12 @@ func (s *captureSender) calls() int {
 }
 
 func newDispatchStore(owner string) *dispatchStore {
-	return &dispatchStore{jobs: map[string]Job{
-		"job-1": {ID: "job-1", UserID: owner, TaskID: "task-1", DueAt: time.Date(2026, 11, 21, 9, 30, 0, 0, time.UTC), DeliveryVersion: 1},
-	}}
+	return &dispatchStore{
+		payloads: map[string]Payload{},
+		jobs: map[string]Job{
+			"job-1": {ID: "job-1", UserID: owner, TaskID: "task-1", DueAt: time.Date(2026, 11, 21, 9, 30, 0, 0, time.UTC), DeliveryVersion: 1},
+		},
+	}
 }
 
 func TestResendDispatcherAcceptsAndPersistsProviderEmailID(t *testing.T) {

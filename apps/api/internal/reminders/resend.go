@@ -14,13 +14,17 @@ import (
 type dispatcherStore interface {
 	Get(ctx context.Context, userID, id string) (Job, error)
 	SetProviderEmailID(ctx context.Context, jobID string, version int, emailID string) error
+	GetDeliveryPayload(ctx context.Context, jobID string, version int) (Payload, bool, error)
+	SaveDeliveryPayload(ctx context.Context, jobID string, version int, p Payload) (Payload, error)
 }
 
 // ResendDispatcher implements Dispatcher over the existing resend adapter
-// (apps/api/internal/resend). The verified primary email is resolved at send
-// time through an OwnerEmailResolver (Clerk Backend API in production); the
-// provider email id Resend returns is persisted through the store so
-// provider callbacks and the webhook route can correlate events by email id.
+// (apps/api/internal/resend). The verified primary email is resolved on the
+// first attempt of a version through an OwnerEmailResolver (Clerk Backend API
+// in production), persisted with the full message, and reused byte-for-byte
+// on retries. The provider email id Resend returns is persisted through the
+// store so provider callbacks and the webhook route can correlate events by
+// email id.
 type ResendDispatcher struct {
 	store   dispatcherStore
 	sender  resendSend
@@ -49,32 +53,50 @@ func (d *ResendDispatcher) Send(ctx context.Context, n Notification) Outcome {
 		// under the stale version would reuse an old idempotency key.
 		return OutcomeFailed
 	}
-	to, err := d.resolve(ctx, job.UserID)
+	// The first attempt of a version fixes the complete payload: the verified
+	// primary email is resolved once and the message is persisted. Every retry
+	// reuses those exact bytes, so a changed task title or a changed Clerk
+	// recipient cannot turn a same-key retry into an idempotency conflict.
+	p, ok, err := d.store.GetDeliveryPayload(ctx, job.ID, job.DeliveryVersion)
 	if err != nil {
-		if errors.Is(err, ErrNoVerifiedEmail) {
-			return OutcomePermanent
-		}
 		return OutcomeFailed
+	}
+	if !ok {
+		to, err := d.resolve(ctx, job.UserID)
+		if err != nil {
+			if errors.Is(err, ErrNoVerifiedEmail) {
+				return OutcomePermanent
+			}
+			return OutcomeFailed
+		}
+		p = Payload{
+			Recipient: to,
+			Subject:   "Hireloop reminder: " + n.Title,
+			Text:      "Hireloop reminder: " + n.Title + "\nDue: " + n.DueAt.UTC().Format(time.RFC3339) + "\n",
+		}
+		p, err = d.store.SaveDeliveryPayload(ctx, job.ID, job.DeliveryVersion, p)
+		if err != nil {
+			return OutcomeFailed
+		}
 	}
 	// The id is per version: a reschedule bumps the version, so the
 	// rescheduled job's dispatches use new keys while retries of this
 	// dispatch keep this one.
 	key := fmt.Sprintf("job:%s:v%d", job.ID, job.DeliveryVersion)
-	// The payload is built from the versioned job fields so it is
-	// byte-stable across retries of the same version.
 	msg := resend.Message{
 		From:    d.from,
-		To:      []string{to},
-		Subject: "Hireloop reminder: " + n.Title,
-		Text:    "Hireloop reminder: " + n.Title + "\nDue: " + n.DueAt.UTC().Format(time.RFC3339) + "\n",
+		To:      []string{p.Recipient},
+		Subject: p.Subject,
+		Text:    p.Text,
 	}
 	result, _ := d.sender.Send(ctx, key, msg)
 	if result.Status == resend.StatusAccepted {
-		// The provider accepted the send; persist the email id so provider
-		// events correlate to this job and version. The write is guarded by
-		// the lease and version, so the acceptance of a stale dispatch can
-		// never overwrite the mapping of a newer version.
-		_ = d.store.SetProviderEmailID(ctx, job.ID, job.DeliveryVersion, result.MessageID)
+		// The mapping write also reconciles webhooks that arrived early. Do
+		// not swallow its error: retry under the same key so Resend returns
+		// the same email id and the mapping (and reconciliation) is retried.
+		if err := d.store.SetProviderEmailID(ctx, job.ID, job.DeliveryVersion, result.MessageID); err != nil {
+			return OutcomeFailed
+		}
 		return OutcomeAccepted
 	}
 	switch result.Status {

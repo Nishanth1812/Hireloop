@@ -38,9 +38,15 @@
 // for same-version retries while a rescheduled job gets a fresh key and a
 // fresh provider email id.
 //
-// Event dedup: reminder_email_events persists every verified provider event
-// by its svix-id (the provider's replay identity); the unique
-// provider_event_id is the persistent dedup, robust across reschedules.
+// Event dedup and recovery (migration 010): reminder_email_events persists
+// every verified provider event by its svix-id (the provider's replay
+// identity); the unique provider_event_id is the persistent dedup, robust
+// across reschedules. The ledger row and the job transition commit in one
+// transaction, so a crash cannot lose an event by making its retry look like
+// a replay. An event that beats the provider-email write is kept pending and
+// reconciled when that write lands; a late event for a suppressed/rescheduled
+// job is recorded as evidence through reminder_provider_emails and never
+// revives the job.
 //
 // Retry and duplicate policy (documented, not assumed): a failed or uncertain
 // dispatch is retried with exponential backoff while the failure count is at
@@ -122,6 +128,29 @@ func transitionAllowed(current, target string) bool {
 	return stateRank(target) > stateRank(current)
 }
 
+// stateRankSQL mirrors stateRank for guarded SQL updates. permanent_failed is
+// included: leaving it out would make its CASE value -1 and allow an
+// equal-rank transition to overwrite a terminal permanent failure.
+const stateRankSQL = `CASE delivery_state
+	WHEN 'scheduled' THEN 0 WHEN 'leased' THEN 1 WHEN 'accepted' THEN 2
+	WHEN 'failed' THEN 3 WHEN 'uncertain' THEN 4 WHEN 'delivered' THEN 5
+	WHEN 'exhausted' THEN 6 WHEN 'suppressed' THEN 7
+	WHEN 'permanent_failed' THEN 8 ELSE -1 END`
+
+// providerRetryBackoff is the bounded delay used when a provider event
+// schedules a retry. It uses the documented worker defaults (30s, doubling,
+// capped at 5m) so a webhook can never shorten the retry window.
+func providerRetryBackoff(attempt int) time.Duration {
+	d := 30 * time.Second
+	for shift := 1; shift < attempt && d < 5*time.Minute; shift++ {
+		d *= 2
+	}
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
+
 // Suppression reasons recorded on a job when it must not fire.
 const (
 	SuppressCompleted   = "completed"
@@ -175,6 +204,11 @@ type Transition struct {
 	Note       string
 	RetryCount int
 	RetryAt    *time.Time
+	// ScheduleRetry asks the store to compute a bounded backoff from the
+	// job's existing retry count instead of replacing retry bookkeeping with
+	// zero/nil. Provider 'email.failed' events use it so a webhook cannot
+	// reset retries and put the worker into a hot dispatch loop.
+	ScheduleRetry bool
 }
 
 // Store reads and writes reminder_jobs and user_notification_settings.
@@ -188,7 +222,7 @@ type Store struct{ DB *sql.DB }
 // dispatch uses a fresh per-version idempotency key and old provider events
 // for previous versions cannot overwrite the reactivated job.
 func (s *Store) Schedule(ctx context.Context, w Executor, userID, taskID string, dueAt time.Time) error {
-	_, err := w.ExecContext(ctx, `INSERT INTO reminder_jobs (user_id, task_id, due_at, delivery_version)
+	res, err := w.ExecContext(ctx, `INSERT INTO reminder_jobs (user_id, task_id, due_at, delivery_version)
 		VALUES ($1, $2, $3, 1)
 		ON CONFLICT (task_id) DO UPDATE SET
 			delivery_state = '`+StateScheduled+`',
@@ -198,8 +232,21 @@ func (s *Store) Schedule(ctx context.Context, w Executor, userID, taskID string,
 			retry_count = 0, retry_at = NULL, callback_key = NULL,
 			delivery_note = NULL, suppress_reason = NULL,
 			provider_email_id = NULL, provider_version = NULL,
-			updated_at = now()`, userID, taskID, dueAt)
-	return err
+			updated_at = now()
+		WHERE reminder_jobs.user_id = $4`, userID, taskID, dueAt, userID)
+	if err != nil {
+		return err
+	}
+	// A task id already owned by someone else is a cross-owner conflict:
+	// never reactivate or take over that owner's job.
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errors.New("reminders: task id belongs to another owner")
+	}
+	return nil
 }
 
 // Suppress marks a job for a task as suppressed with the given reason, but
@@ -327,15 +374,91 @@ func (s *Store) RecordDelivery(ctx context.Context, jobID, token string, tr Tran
 }
 
 // SetProviderEmailID persists the provider email id the worker received from
-// the provider for the job's current version. The write is guarded by the
-// lease and the delivery version, so the acceptance of a stale dispatch can
-// never overwrite the mapping of a newer version.
+// the provider for the job's current version. The live mapping is guarded by
+// the version and by a still-claimable state, so a stale dispatch cannot
+// overwrite a newer one. In
+// the same transaction it records a durable email-history entry and reconciles
+// webhooks that arrived before this mapping existed. A failure rolls the whole
+// write back and is returned to the caller: the worker retries the send under
+// the same idempotency key instead of silently losing the mapping or an event.
 func (s *Store) SetProviderEmailID(ctx context.Context, jobID string, version int, emailID string) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE reminder_jobs
+	if strings.TrimSpace(emailID) == "" {
+		return errors.New("reminders: provider email id required")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// One statement both guards the live write and returns the owner for the
+	// durable history entry. No row means a stale version or state.
+	var userID string
+	err = tx.QueryRowContext(ctx, `UPDATE reminder_jobs
 		SET provider_email_id = $2, provider_version = $3
-		WHERE id = $1 AND delivery_version = $4 AND delivery_state = 'leased'`,
-		jobID, emailID, version, version)
-	return err
+		WHERE id = $1 AND delivery_version = $4 AND delivery_state IN ('scheduled','leased')
+		RETURNING user_id`, jobID, emailID, version, version).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reminders: provider mapping rejected: job %s is not claimable at version %d", jobID, version)
+	}
+	if err != nil {
+		return err
+	}
+	// A provider email id belongs to exactly one send. If an existing row
+	// points at another job, the write fails and the caller retries.
+	var mappedJobID string
+	err = tx.QueryRowContext(ctx, `INSERT INTO reminder_provider_emails
+		(provider_email_id, job_id, user_id, delivery_version)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (provider_email_id) DO UPDATE SET job_id = EXCLUDED.job_id
+		WHERE reminder_provider_emails.job_id = EXCLUDED.job_id
+		RETURNING job_id`, emailID, jobID, userID, version).Scan(&mappedJobID)
+	if err != nil {
+		return err
+	}
+	if err := reconcilePendingEvents(ctx, tx, emailID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// GetDeliveryPayload returns the immutable first-attempt payload for a
+// (job, version), if one was persisted.
+func (s *Store) GetDeliveryPayload(ctx context.Context, jobID string, version int) (Payload, bool, error) {
+	var p Payload
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT recipient, subject, text_body FROM reminder_delivery_payloads
+		 WHERE job_id = $1 AND delivery_version = $2`, jobID, version).
+		Scan(&p.Recipient, &p.Subject, &p.Text)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Payload{}, false, nil
+	}
+	if err != nil {
+		return Payload{}, false, err
+	}
+	return p, true, nil
+}
+
+// SaveDeliveryPayload persists p as the first-attempt payload of a
+// (job, version). Concurrent attempts race on the primary key: the first
+// insert wins and every caller receives the winning row, so retries can never
+// send a different body under the same idempotency key.
+func (s *Store) SaveDeliveryPayload(ctx context.Context, jobID string, version int, p Payload) (Payload, error) {
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO reminder_delivery_payloads
+		(job_id, delivery_version, recipient, subject, text_body)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (job_id, delivery_version) DO NOTHING`,
+		jobID, version, p.Recipient, p.Subject, p.Text)
+	if err != nil {
+		return Payload{}, err
+	}
+	winner, ok, err := s.GetDeliveryPayload(ctx, jobID, version)
+	if err != nil {
+		return Payload{}, err
+	}
+	if !ok {
+		return Payload{}, errors.New("reminders: delivery payload disappeared after insert")
+	}
+	return winner, nil
 }
 
 // GetByProviderEmail returns the job whose current provider email id matches
@@ -355,19 +478,6 @@ func (s *Store) GetByProviderEmail(ctx context.Context, emailID string) (Job, er
 	return job, err
 }
 
-// jobByProviderEmail is the read half of RecordWebhookEvent/RecordCallback
-// correlation: it reports whether a job currently maps to the email id.
-func (s *Store) jobByProviderEmail(ctx context.Context, emailID string) (Job, bool, error) {
-	job, err := s.GetByProviderEmail(ctx, emailID)
-	if errors.Is(err, ErrNotFound) {
-		return Job{}, false, nil
-	}
-	if err != nil {
-		return Job{}, false, err
-	}
-	return job, true, nil
-}
-
 // RecordCallback applies an asynchronous provider callback to a job and
 // reports whether it was applied. The callback must carry the job's current
 // provider email id: when the job was reactivated or suppressed after the
@@ -377,45 +487,68 @@ func (s *Store) jobByProviderEmail(ctx context.Context, emailID string) (Job, bo
 // evidence); repeated or reordered callbacks with equal or weaker targets
 // are ignored.
 func (s *Store) RecordCallback(ctx context.Context, jobID, eventEmailID string, tr Transition) (bool, error) {
-	target := stateRank(tr.State)
-	if target < 0 || strings.TrimSpace(tr.State) == "" {
-		return false, errors.New("callback transition state required")
-	}
-	var state string
-	var providerEmailID sql.NullString
-	err := s.DB.QueryRowContext(ctx,
-		`SELECT delivery_state, provider_email_id FROM reminder_jobs WHERE id = $1`, jobID).
-		Scan(&state, &providerEmailID)
+	return applyCallback(ctx, s.DB, jobID, eventEmailID, tr)
+}
+
+// callbackState is the read half of the guarded callback write.
+type callbackState struct {
+	state           string
+	retryCount      int
+	providerEmailID sql.NullString
+}
+
+// applyCallback applies tr only when the event's email id is still the job's
+// current mapping and the target strictly strengthens the recorded evidence.
+// ScheduleRetry transitions derive a bounded backoff from the job's existing
+// retry count; they never reset it to zero or clear retry_at into a hot loop.
+func applyCallback(ctx context.Context, q Executor, jobID, eventEmailID string, tr Transition) (bool, error) {
+	var current callbackState
+	err := q.QueryRowContext(ctx,
+		`SELECT delivery_state, retry_count, provider_email_id FROM reminder_jobs WHERE id = $1`, jobID).
+		Scan(&current.state, &current.retryCount, &current.providerEmailID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if providerEmailID.String != eventEmailID {
+	return applyCallbackWithState(ctx, q, jobID, eventEmailID, tr, current)
+}
+
+// applyCallbackWithState is the write half of applyCallback; the webhook path
+// passes the state it already read while correlating the event, avoiding a
+// second round trip inside the transaction.
+func applyCallbackWithState(ctx context.Context, q Executor, jobID, eventEmailID string, tr Transition, current callbackState) (bool, error) {
+	target := stateRank(tr.State)
+	if target < 0 || strings.TrimSpace(tr.State) == "" {
+		return false, errors.New("callback transition state required")
+	}
+	if current.providerEmailID.String != eventEmailID {
 		return false, nil
 	}
-	if !transitionAllowed(state, tr.State) {
+	if !transitionAllowed(current.state, tr.State) {
 		return false, nil
 	}
-	var suppress, retryAt any
-	if tr.Reason != "" {
-		suppress = tr.Reason
-	}
-	if tr.RetryAt != nil {
+	retryCount := tr.RetryCount
+	var retryAt any
+	if tr.ScheduleRetry {
+		retryCount = current.retryCount + 1
+		at := time.Now().Add(providerRetryBackoff(retryCount))
+		retryAt = at
+	} else if tr.RetryAt != nil {
 		retryAt = *tr.RetryAt
 	}
-	res, err := s.DB.ExecContext(ctx, `UPDATE reminder_jobs
+	var reason any
+	if tr.Reason != "" {
+		reason = tr.Reason
+	}
+	res, err := q.ExecContext(ctx, `UPDATE reminder_jobs
 		SET delivery_state = $2, delivery_note = $3, retry_count = $4, retry_at = $5,
 			suppress_reason = $6, callback_key = $7, lease_token = NULL, lease_until = NULL,
 			updated_at = now()
-		WHERE id = $1 AND provider_email_id IS NOT DISTINCT FROM $8
-			AND CASE delivery_state
-				WHEN 'scheduled' THEN 0 WHEN 'leased' THEN 1 WHEN 'accepted' THEN 2
-				WHEN 'failed' THEN 3 WHEN 'uncertain' THEN 4 WHEN 'delivered' THEN 5
-				WHEN 'exhausted' THEN 6 WHEN 'suppressed' THEN 7
-				WHEN 'permanent_failed' THEN 8 ELSE -1 END < $9`,
-		jobID, tr.State, tr.Note, tr.RetryCount, retryAt, suppress, eventEmailID, eventEmailID, target)
+		WHERE id = $1 AND COALESCE(provider_email_id, '') = $8
+			AND `+stateRankSQL+` < $9`,
+		jobID, tr.State, tr.Note, retryCount, retryAt, reason, eventEmailID, eventEmailID, target)
 	if err != nil {
 		return false, err
 	}
@@ -424,42 +557,199 @@ func (s *Store) RecordCallback(ctx context.Context, jobID, eventEmailID string, 
 }
 
 // RecordWebhookEvent persists a verified provider event and applies its
-// transition to the correlated job; it reports whether the transition was
-// applied. The event id is the provider's replay identity: the ledger
-// insert is the persistent dedup, so an exact replay affects no row and is
-// ignored. The event correlates by provider email id: when the job was
-// reactivated or suppressed after the event was first seen, the email id is
-// gone, so old callbacks cannot overwrite the rescheduled job. When applied,
-// the transition must be strictly stronger than the job's current state
-// (monotonic evidence).
+// transition to the correlated job in ONE transaction; it reports whether the
+// transition was applied. The svix-id is the provider's replay identity: the
+// ledger insert is the persistent dedup, and an exact replay is a no-op.
+//
+// The insert and the job update commit together, so a crash or a failed update
+// rolls the ledger insert back and a retry can reprocess the event instead of
+// losing it. An event that arrives before the provider mapping is recorded
+// stays pending in the ledger and is reconciled by SetProviderEmailID; an
+// event for a suppressed or rescheduled job is recorded as evidence through
+// the durable email history and never revives that job.
 func (s *Store) RecordWebhookEvent(ctx context.Context, eventID, eventEmailID, eventType string, tr Transition) (bool, error) {
-	if strings.TrimSpace(eventID) == "" || strings.TrimSpace(eventEmailID) == "" {
-		return false, errors.New("webhook event requires an id and email id")
+	if strings.TrimSpace(eventID) == "" || strings.TrimSpace(eventEmailID) == "" || strings.TrimSpace(tr.State) == "" {
+		return false, errors.New("webhook event requires an id, an email id and a transition state")
 	}
-	job, found, err := s.jobByProviderEmail(ctx, eventEmailID)
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	res, err := s.DB.ExecContext(ctx, `INSERT INTO reminder_email_events
-		(provider_event_id, provider_email_id, job_id, event_type, received_at)
-		VALUES ($1, $2, (SELECT id FROM reminder_jobs WHERE provider_email_id = $2), $3, now())
+	defer tx.Rollback()
+	applied, err := processWebhookEvent(ctx, tx, eventID, eventEmailID, eventType, tr)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+// eventContext is the correlation result for an email id: the job and version
+// that sent it, whether that mapping is still live, and the state needed to
+// apply a callback without a second read.
+type eventContext struct {
+	jobID   string
+	version int
+	live    bool
+	state   callbackState
+}
+
+// resolveEvent finds the job an email id belongs to. The live mapping is
+// preferred; when it was cleared by suppression or rescheduling, the durable
+// history still identifies the job and version that actually sent the email,
+// so late evidence can be attributed without reviving the job.
+func resolveEvent(ctx context.Context, q Executor, emailID string) (eventContext, error) {
+	var ec eventContext
+	var version sql.NullInt64
+	err := q.QueryRowContext(ctx,
+		`SELECT id, COALESCE(provider_version, delivery_version), delivery_state, retry_count, provider_email_id
+		 FROM reminder_jobs WHERE provider_email_id = $1`, emailID).
+		Scan(&ec.jobID, &version, &ec.state.state, &ec.state.retryCount, &ec.state.providerEmailID)
+	if err == nil {
+		ec.version = int(version.Int64)
+		ec.live = true
+		return ec, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return eventContext{}, err
+	}
+	var historyJobID string
+	var historyVersion int
+	err = q.QueryRowContext(ctx,
+		`SELECT job_id, delivery_version FROM reminder_provider_emails WHERE provider_email_id = $1`, emailID).
+		Scan(&historyJobID, &historyVersion)
+	if err == nil {
+		return eventContext{jobID: historyJobID, version: historyVersion}, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return eventContext{}, nil
+	}
+	return eventContext{}, err
+}
+
+// processWebhookEvent inserts the durable dedup row and resolves it in one
+// transaction. A replay that was already resolved is a no-op; a replay that is
+// still pending is retried, because the mapping may have appeared since it was
+// recorded. Any error leaves the insert uncommitted for a future retry.
+func processWebhookEvent(ctx context.Context, tx *sql.Tx, eventID, emailID, eventType string, tr Transition) (bool, error) {
+	ec, err := resolveEvent(ctx, tx, emailID)
+	if err != nil {
+		return false, err
+	}
+	var jobValue, versionValue any
+	if ec.jobID != "" {
+		jobValue = ec.jobID
+	}
+	if ec.version > 0 {
+		versionValue = ec.version
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO reminder_email_events
+		(provider_event_id, provider_email_id, job_id, event_type, target_state, delivery_version, resolution, received_at)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending', now())
 		ON CONFLICT (provider_event_id) DO NOTHING`,
-		eventID, eventEmailID, eventType)
+		eventID, emailID, jobValue, eventType, tr.State, versionValue)
 	if err != nil {
 		return false, err
 	}
 	rows, err := res.RowsAffected()
-	if err != nil || rows == 0 {
-		// The provider event id was already seen: a replay; ignore it.
+	if err != nil {
 		return false, err
 	}
-	if !found {
-		// First-seen event, but no job maps to this email id (the job was
-		// never sent to, suppressed earlier, or the send raced the
-		// provider email id persist).
+	if rows == 0 {
+		var resolution string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT resolution FROM reminder_email_events WHERE provider_event_id = $1`, eventID).Scan(&resolution); err != nil {
+			return false, err
+		}
+		if resolution != "pending" {
+			return false, nil
+		}
+	}
+	return resolveWebhookEvent(ctx, tx, eventID, emailID, tr, ec)
+}
+
+// resolveWebhookEvent applies an event when the live mapping still points at
+// its job and the transition strengthens the recorded evidence. A history-only
+// mapping records honest evidence with its original job/version but never
+// reactivates a suppressed or rescheduled job. With no mapping at all the
+// event remains pending for reconciliation.
+func resolveWebhookEvent(ctx context.Context, q Executor, eventID, emailID string, tr Transition, ec eventContext) (bool, error) {
+	if ec.jobID == "" {
 		return false, nil
 	}
-	return s.RecordCallback(ctx, job.ID, eventEmailID, tr)
+	applied := false
+	if ec.live {
+		var err error
+		applied, err = applyCallbackWithState(ctx, q, ec.jobID, emailID, tr, ec.state)
+		if err != nil {
+			return false, err
+		}
+	}
+	resolution := "ignored"
+	if applied {
+		resolution = "applied"
+	}
+	_, err := q.ExecContext(ctx, `UPDATE reminder_email_events
+		SET job_id = $2, delivery_version = $3, resolution = $4, resolved_at = now()
+		WHERE provider_event_id = $1 AND resolution = 'pending'`,
+		eventID, ec.jobID, ec.version, resolution)
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+// reconcilePendingEvents applies webhooks that arrived before SetProviderEmailID
+// persisted the mapping. It runs inside the mapping transaction, so a failure
+// rolls back both writes and the next send attempt retries the whole batch.
+func reconcilePendingEvents(ctx context.Context, tx *sql.Tx, emailID string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT provider_event_id, target_state
+		FROM reminder_email_events
+		WHERE provider_email_id = $1 AND resolution = 'pending'`, emailID)
+	if err != nil {
+		return err
+	}
+	type pending struct{ id, state string }
+	items := []pending{}
+	for rows.Next() {
+		var p pending
+		var state sql.NullString
+		if err := rows.Scan(&p.id, &state); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if !state.Valid {
+			// A ledger row written before recovery metadata existed has no
+			// transition to replay; it is historical evidence only.
+			continue
+		}
+		p.state = state.String
+		items = append(items, p)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	for _, p := range items {
+		tr := Transition{State: p.state, Note: "reconciled from a webhook that arrived before the provider mapping"}
+		if p.state == StateFailed {
+			tr.ScheduleRetry = true
+		}
+		ec, err := resolveEvent(ctx, tx, emailID)
+		if err != nil {
+			return err
+		}
+		if ec.jobID == "" {
+			continue
+		}
+		if _, err := resolveWebhookEvent(ctx, tx, p.id, emailID, tr, ec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // TransitionForEvent maps a verified Resend event type to the transition the
@@ -474,7 +764,7 @@ func TransitionForEvent(eventType resend.EventType) (Transition, bool) {
 	case resend.EventDeliverySlow:
 		return Transition{State: StateUncertain, Note: "provider reported a delayed delivery"}, true
 	case resend.EventFailed:
-		return Transition{State: StateFailed, Note: "provider reported a send failure"}, true
+		return Transition{State: StateFailed, Note: "provider reported a send failure", ScheduleRetry: true}, true
 	case resend.EventBounced:
 		return Transition{State: StatePermanentFailed, Note: "provider reported a permanent failure: recipient bounce"}, true
 	case resend.EventComplained:
