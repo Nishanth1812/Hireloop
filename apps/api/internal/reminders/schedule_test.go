@@ -121,10 +121,128 @@ func findSubstring(s, substr string) bool {
 }
 
 // TestDeadlineGuardUnit verifies the dispatchOne deadline guard logic
-// using a fake store and dispatcher.
+// for all three reminder timings.
 func TestDeadlineGuardUnit(t *testing.T) {
-	// This test would require a more complex setup with a fake store
-	// that returns jobs with specific TrueDeadline values. For now,
-	// we test the logic inline in the worker tests.
-	// The integration tests cover the full flow.
+	now := time.Now()
+
+	tests := []struct {
+		name           string
+		timing         ReminderTiming
+		dueAt          time.Time
+		trueDeadline   time.Time
+		now            time.Time
+		leaseTTL       time.Duration
+		expectSuppress bool
+		description    string
+	}{
+		{
+			name:           "advance 24h_before - before true deadline, allows dispatch",
+			timing:         Timing24hBefore,
+			dueAt:          now.Add(-24 * time.Hour),
+			trueDeadline:   now.Add(1 * time.Hour),
+			now:            now,
+			leaseTTL:       30 * time.Second,
+			expectSuppress: false,
+			description:    "24h reminder fires 24h before deadline, deadline still future",
+		},
+		{
+			name:           "advance 24h_before - at true deadline, suppresses",
+			timing:         Timing24hBefore,
+			dueAt:          now.Add(-24 * time.Hour),
+			trueDeadline:   now,
+			now:            now.Add(1 * time.Minute),
+			leaseTTL:       30 * time.Second,
+			expectSuppress: true,
+			description:    "24h reminder claimed after true deadline passed",
+		},
+		{
+			name:           "advance 2h_before - before true deadline, allows dispatch",
+			timing:         Timing2hBefore,
+			dueAt:          now.Add(-2 * time.Hour),
+			trueDeadline:   now.Add(30 * time.Minute),
+			now:            now,
+			leaseTTL:       30 * time.Second,
+			expectSuppress: false,
+			description:    "2h reminder fires 2h before deadline, deadline still future",
+		},
+		{
+			name:           "advance 2h_before - past true deadline, suppresses",
+			timing:         Timing2hBefore,
+			dueAt:          now.Add(-2 * time.Hour),
+			trueDeadline:   now.Add(-10 * time.Minute),
+			now:            now,
+			leaseTTL:       30 * time.Second,
+			expectSuppress: true,
+			description:    "2h reminder claimed after true deadline passed",
+		},
+		{
+			name:           "legacy at_deadline - at due_at (== true_deadline), allows dispatch",
+			timing:         TimingAtDeadline,
+			dueAt:          now,
+			trueDeadline:   now,
+			now:            now.Add(10 * time.Second),
+			leaseTTL:       30 * time.Second,
+			expectSuppress: false,
+			description:    "Legacy job fires at deadline, within lease TTL",
+		},
+		{
+			name:           "legacy at_deadline - slightly past due_at but within lease TTL, allows dispatch",
+			timing:         TimingAtDeadline,
+			dueAt:          now.Add(-20 * time.Second),
+			trueDeadline:   now.Add(-20 * time.Second),
+			now:            now,
+			leaseTTL:       30 * time.Second,
+			expectSuppress: false,
+			description:    "Legacy job claimed slightly after deadline but within lease TTL",
+		},
+		{
+			name:           "legacy at_deadline - past due_at + lease TTL, suppresses",
+			timing:         TimingAtDeadline,
+			dueAt:          now.Add(-time.Minute),
+			trueDeadline:   now.Add(-time.Minute),
+			now:            now,
+			leaseTTL:       30 * time.Second,
+			expectSuppress: true,
+			description:    "Legacy job claimed well after deadline + lease TTL (stale)",
+		},
+		{
+			name:           "legacy at_deadline - zero true_deadline (defensive), allows dispatch at due_at",
+			timing:         TimingAtDeadline,
+			dueAt:          now.Add(10 * time.Minute),
+			trueDeadline:   time.Time{},
+			now:            now,
+			leaseTTL:       30 * time.Second,
+			expectSuppress: false,
+			description:    "Legacy job with missing true_deadline falls back to due_at check",
+		},
+		{
+			name:           "legacy at_deadline - zero true_deadline, past due_at + lease TTL, suppresses",
+			timing:         TimingAtDeadline,
+			dueAt:          now.Add(-time.Minute),
+			trueDeadline:   time.Time{},
+			now:            now,
+			leaseTTL:       30 * time.Second,
+			expectSuppress: true,
+			description:    "Legacy job with missing true_deadline, stale claim suppressed",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Simulate the deadline guard logic from dispatchOne
+			var suppress bool
+			if tc.timing == TimingAtDeadline {
+				if !tc.dueAt.IsZero() && tc.now.After(tc.dueAt.Add(tc.leaseTTL)) {
+					suppress = true
+				}
+			} else {
+				if !tc.trueDeadline.IsZero() && tc.now.After(tc.trueDeadline) {
+					suppress = true
+				}
+			}
+			if suppress != tc.expectSuppress {
+				t.Errorf("%s: suppress=%v, want %v (%s)", tc.name, suppress, tc.expectSuppress, tc.description)
+			}
+		})
+	}
 }

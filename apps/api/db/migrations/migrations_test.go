@@ -376,20 +376,23 @@ func TestAdvanceReminderTimingMigrationIsAdditive(t *testing.T) {
 		"ADD COLUMN reminder_timing",
 		"ADD COLUMN true_deadline",
 		"CHECK (reminder_timing IN ('24h_before', '2h_before', 'at_deadline'))",
-		"DROP INDEX public.reminder_jobs_task_idx",
-		"CREATE UNIQUE INDEX reminder_jobs_task_timing_idx",
+		"DROP INDEX IF EXISTS public.reminder_jobs_task_idx",
+		"CREATE UNIQUE INDEX IF NOT EXISTS reminder_jobs_task_timing_idx",
 		"deadline_passed",
+		"reminder_jobs_true_deadline_check",
 	} {
 		if !strings.Contains(applied, fragment) {
 			t.Errorf("migration 013 is missing %q", fragment)
 		}
 	}
 	// The migration adds columns and indexes; no top-level DROP TABLE or DELETE FROM data.
-	// ALTER COLUMN SET NOT NULL is allowed for the new true_deadline column.
+	// ALTER COLUMN SET NOT NULL is NOT used (true_deadline stays nullable with CHECK).
 	// DROP COLUMN appears only in the rollback comment, not in executable SQL.
 	raw := rawMigration(t, 13)
 	for _, forbidden := range []string{
 		"DROP TABLE",
+		"ALTER COLUMN",
+		"SET NOT NULL",
 	} {
 		if strings.Contains(raw, forbidden) {
 			t.Errorf("migration 013 must not contain top-level %q", forbidden)
@@ -407,19 +410,38 @@ func TestAdvanceReminderTimingMigrationIsAdditive(t *testing.T) {
 			t.Error("migration 013 must not contain executable DROP COLUMN")
 		}
 	}
-	// ALTER COLUMN is only allowed for SET NOT NULL.
-	if idx := strings.Index(raw, "ALTER COLUMN"); idx >= 0 {
-		// Check that it's followed by SET NOT NULL.
-		after := raw[idx+len("ALTER COLUMN"):]
-		if !strings.HasPrefix(strings.TrimSpace(after), "true_deadline SET NOT NULL") {
-			t.Error("migration 013 must not contain ALTER COLUMN except for true_deadline SET NOT NULL")
-		}
-	}
 	if idx := strings.Index(raw, "DELETE FROM"); idx >= 0 && idx < strings.Index(raw, "$$") {
 		t.Error("migration 013 must not contain top-level DELETE FROM")
 	}
 	if !strings.Contains(raw, "Rollback:") {
 		t.Error("migration 013 must document how to reverse it")
+	}
+}
+
+// TestTasksUserAppIndexMigrationIsAdditive pins migration 014: adds a
+// composite index on tasks(user_id, application_id) for SuppressByApplication.
+func TestTasksUserAppIndexMigrationIsAdditive(t *testing.T) {
+	applied := migrationStatements(t, 14)
+	for _, fragment := range []string{
+		"CREATE INDEX IF NOT EXISTS tasks_user_app_idx",
+		"ON public.tasks (user_id, application_id)",
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 014 is missing %q", fragment)
+		}
+	}
+	raw := rawMigration(t, 14)
+	for _, forbidden := range []string{
+		"DROP TABLE",
+		"DROP COLUMN",
+		"DELETE FROM",
+	} {
+		if strings.Contains(raw, forbidden) {
+			t.Errorf("migration 014 must not contain top-level %q", forbidden)
+		}
+	}
+	if !strings.Contains(raw, "Rollback:") {
+		t.Error("migration 014 must document how to reverse it")
 	}
 }
 

@@ -204,11 +204,25 @@ func (w *Worker) dispatchOne(ctx context.Context, job Job) error {
 	// Deadline guard: never send a reminder past the true deadline.
 	// This handles retries, worker downtime, and any delay between
 	// claim and dispatch. The true deadline is stored on the job.
+	// Legacy at_deadline jobs fire AT the deadline (due_at == true_deadline),
+	// so we allow dispatch at or after due_at but still suppress if
+	// significantly past (e.g., beyond lease TTL) to avoid stale sends.
 	now := w.now()
-	if !current.TrueDeadline.IsZero() && now.After(current.TrueDeadline) {
-		return w.store.RecordDelivery(ctx, current.ID, current.LeaseToken, Transition{
-			State: StateSuppressed, Reason: SuppressDeadlinePassed, Note: "deadline passed before dispatch",
-		})
+	if current.ReminderTiming == TimingAtDeadline {
+		// Legacy job: due_at == true_deadline. Allow dispatch at/after due_at.
+		// But suppress if we're more than lease TTL past due_at (stale claim).
+		if !current.DueAt.IsZero() && now.After(current.DueAt.Add(w.cfg.LeaseTTL)) {
+			return w.store.RecordDelivery(ctx, current.ID, current.LeaseToken, Transition{
+				State: StateSuppressed, Reason: SuppressDeadlinePassed, Note: "deadline passed before dispatch",
+			})
+		}
+	} else {
+		// Advance reminders (24h_before, 2h_before): never send past true_deadline.
+		if !current.TrueDeadline.IsZero() && now.After(current.TrueDeadline) {
+			return w.store.RecordDelivery(ctx, current.ID, current.LeaseToken, Transition{
+				State: StateSuppressed, Reason: SuppressDeadlinePassed, Note: "deadline passed before dispatch",
+			})
+		}
 	}
 	outcome := w.dispatcher.Send(ctx, Notification{
 		ID:             current.ID,
