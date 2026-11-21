@@ -350,6 +350,7 @@ function todayProps(overrides = {}) {
     onEdit: noop,
     onComplete: noop,
     onCancel: noop,
+    onExport: noop,
     ...overrides,
   };
 }
@@ -420,6 +421,30 @@ test("Today cards name every action control and state the date-only precision", 
   const toggle = [...section.querySelectorAll("button")].find((b) => /Show finished/.test(b.textContent));
   assertFocusableWithName(toggle);
   expect(toggle.getAttribute("aria-pressed")).toBe("false");
+});
+
+test("Today cards show the in-app reminder and a focusable calendar export control", async () => {
+  const exported = [];
+  await render(<TodayPanel {...todayProps({ onExport: (task) => exported.push(task) })} />);
+  const row = container.querySelector(".task-row");
+  expect(row.textContent).toContain("Reminder: 12 Nov 2026");
+  for (const label of [/Edit task Submit form/, /Mark Submit form complete/, /Cancel Submit form/]) {
+    const button = [...row.querySelectorAll("button")].find((b) => label.test(b.getAttribute("aria-label") || ""));
+    expect(button).not.toBeNull();
+    assertFocusableWithName(button);
+  }
+  const exportButton = [...row.querySelectorAll("button")]
+    .find((b) => (b.getAttribute("aria-label") || "").trim() === "Export Submit form calendar entry");
+  expect(exportButton).not.toBeNull();
+  assertFocusableWithName(exportButton);
+  await act(async () => exportButton.click());
+  expect(exported).toEqual([dateTask]);
+
+  // Finished rows carry no reminder, but keep their export control.
+  await render(<TodayPanel {...todayProps({ tasks: [{ ...dateTask, id: "t2", title: "Done task", status: "done" }], showAll: true })} />);
+  const finishedRow = container.querySelector(".task-row");
+  expect(finishedRow.textContent).not.toContain("Reminder:");
+  expect([...finishedRow.querySelectorAll("button")].some((b) => /Export Done task calendar entry/.test(b.getAttribute("aria-label") || ""))).toBe(true);
 });
 
 test("Today announces loading, empty and failed states and shows finished only on request", async () => {

@@ -11,6 +11,7 @@ import {
   listTasks,
   patchApplication,
   patchTask,
+  taskIcsUrl,
   toChannel,
 } from "@/lib/api";
 import type {
@@ -483,6 +484,26 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     }
   }
 
+  // Per-task calendar export: fetch the owner-scoped .ics from the API and
+  // save it as a file. The export is built by the API from the stored
+  // deadline, so no time or zone is invented on the client.
+  async function exportTaskIcs(task: Task) {
+    const token = await sessionToken();
+    try {
+      const response = await fetch(taskIcsUrl(task.id), { headers: { Authorization: `Bearer ${token}` } });
+      if (!response.ok) throw new Error("The task calendar entry could not be exported.");
+      const blob = new Blob([await response.text()], { type: "text/calendar; charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `task-${task.id}.ics`;
+      anchor.click();
+      void setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (caught) {
+      setError(messageFrom(caught));
+    }
+  }
+
   if (!session) {
     return <SignInPanel />;
   }
@@ -531,5 +552,6 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     onCancelTaskEdit={() => setTaskDraft(null)}
     onCompleteTask={(task) => void changeTaskStatus(task, "done")}
     onCancelTask={(task) => void changeTaskStatus(task, "cancelled")}
+    onExport={(task) => void exportTaskIcs(task)}
   />;
 }

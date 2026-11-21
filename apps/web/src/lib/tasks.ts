@@ -49,6 +49,18 @@ export function deadlineText(task: Task): { when: string; detail: string } {
   return { when: "No deadline", detail: "No cutoff date was recorded." };
 }
 
+// A task's in-app reminder is derived from its stored deadline, so it exists
+// only while the task is open: completing or cancelling a task suppresses its
+// reminder, and a rescheduled deadline moves the reminder with it. Nothing is
+// claimed beyond the deadline itself — a date-only deadline keeps saying the
+// cutoff time is unspecified, and a task without a readable deadline has none.
+export function reminderText(task: Task): string | null {
+  if (task.status !== "open") return null;
+  const deadline = deadlineText(task);
+  if (deadline.when === "No deadline" || deadline.when === "Deadline needs attention") return null;
+  return `Reminder: ${deadline.when}`;
+}
+
 // A short, explicit list keeps the form small. An existing task's zone is
 // prepended so editing never silently changes it to one of these choices.
 export const TIME_ZONE_CHOICES = [

@@ -20,6 +20,12 @@ test("application client exposes the supported API operations", () => {
   assert.equal(typeof api.deleteApplication, "function");
 });
 
+test("taskIcsUrl builds the owner-scoped export path", () => {
+  assert.ok(api, "application API client is missing");
+  assert.equal(typeof api.taskIcsUrl, "function");
+  assert.equal(api.taskIcsUrl("task 1"), "/api/tasks/task%201/ics");
+});
+
 test("list sends the session token and reads the keyset envelope", async () => {
   assert.ok(api, "application API client is missing");
   const originalFetch = globalThis.fetch;

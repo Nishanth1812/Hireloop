@@ -172,3 +172,9 @@ export function patchTask(token: string, id: string, input: TaskPatch): Promise<
     body: JSON.stringify(input),
   });
 }
+
+// taskIcsUrl is the URL serving a task's .ics calendar export. The API route
+// is owner-scoped and returns the calendar as text/calendar.
+export function taskIcsUrl(id: string): string {
+  return `/api/tasks/${encodeURIComponent(id)}/ics`;
+}

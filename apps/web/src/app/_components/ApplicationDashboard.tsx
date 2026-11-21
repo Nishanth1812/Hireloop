@@ -57,13 +57,14 @@ type Props = {
   onCancelTaskEdit: () => void;
   onCompleteTask: (task: Task) => void;
   onCancelTask: (task: Task) => void;
+  onExport: (task: Task) => void;
 };
 
 export function ApplicationDashboard({
   email, result, filters, page, hasPrevious, hasNext, loading, loadError, saving, busyId, editingApplication,
   taskPage, taskPageIndex, taskHasPrevious, taskHasNext, taskLoading, taskLoadError, tasksShowAll, taskBusyId, taskDraft, error, notice,
   onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onAddTask, onApplyFilters, onClearFilters,
-  onPrevious, onNext, onToggleFinished, onTaskPrevious, onTaskNext, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask,
+  onPrevious, onNext, onToggleFinished, onTaskPrevious, onTaskNext, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask, onExport,
 }: Props) {
   // Counts come from the API for every matching row, never from the current
   // page, so the summary stays honest while paging or filtering.
@@ -124,6 +125,7 @@ export function ApplicationDashboard({
         onEdit={onEditTask}
         onComplete={onCompleteTask}
         onCancel={onCancelTask}
+        onExport={onExport}
       />
 
       <div className="workspace">

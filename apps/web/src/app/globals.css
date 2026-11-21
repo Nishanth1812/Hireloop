@@ -180,6 +180,9 @@ h3 { margin-bottom: 8px; font-size: 1rem; }
 .task-copy > span { color: var(--muted); font-size: 0.82rem; }
 .task-copy .task-deadline { color: var(--ink); font-weight: 700; }
 .task-copy .task-detail { font-size: 0.78rem; }
+.task-copy .task-reminder { color: var(--muted); font-size: 0.78rem; font-style: italic; }
+.task-copy .task-export-button { margin-top: 4px; min-height: 0; padding: 2px 8px; font-size: 0.72rem; color: var(--ink); background: transparent; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.task-copy .task-export-button:hover:not(:disabled) { border-color: var(--muted); }
 .task-copy .task-status { color: var(--success-ink); text-transform: capitalize; }
 .task-row.cancelled .task-status { color: var(--error-ink); }
 .task-actions { display: flex; flex-wrap: wrap; gap: 6px; flex: 0 0 auto; }

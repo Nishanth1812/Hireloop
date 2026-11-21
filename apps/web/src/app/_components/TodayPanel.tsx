@@ -1,17 +1,19 @@
 "use client";
 
 import type { Application, Task } from "@/lib/api";
-import { deadlineText } from "@/lib/tasks";
+import { deadlineText, reminderText } from "@/lib/tasks";
 
-function TaskCard({ task, application, busy, onEdit, onComplete, onCancel }: {
+function TaskCard({ task, application, busy, onEdit, onComplete, onCancel, onExport }: {
   task: Task;
   application?: Application;
   busy: boolean;
   onEdit: (task: Task, application?: Application) => void;
   onComplete: (task: Task) => void;
   onCancel: (task: Task) => void;
+  onExport: (task: Task) => void;
 }) {
   const deadline = deadlineText(task);
+  const reminder = reminderText(task);
   return (
     <li className={`task-row ${task.status}`}>
       <div className="task-copy">
@@ -19,6 +21,9 @@ function TaskCard({ task, application, busy, onEdit, onComplete, onCancel }: {
         <span>{application ? `${application.role} at ${application.company}` : "Linked application"}</span>
         <span className="task-deadline">{deadline.when}</span>
         <span className="task-detail">{deadline.detail}</span>
+        {reminder && <span className="task-reminder">{reminder}</span>}
+        <button className="task-export-button" type="button" disabled={busy}
+          onClick={() => onExport(task)} aria-label={`Export ${task.title} calendar entry`}>Export ICS</button>
         {task.status !== "open" && <span className="task-status">Status: {task.status}</span>}
       </div>
       {task.status === "open" && (
@@ -35,7 +40,7 @@ function TaskCard({ task, application, busy, onEdit, onComplete, onCancel }: {
   );
 }
 
-export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasNext, loading, loadError, showAll, busyId, onToggleFinished, onPrevious, onNext, onEdit, onComplete, onCancel }: {
+export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasNext, loading, loadError, showAll, busyId, onToggleFinished, onPrevious, onNext, onEdit, onComplete, onCancel, onExport }: {
   tasks: Task[];
   applications: Application[];
   total: number;
@@ -52,6 +57,7 @@ export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasN
   onEdit: (task: Task, application?: Application) => void;
   onComplete: (task: Task) => void;
   onCancel: (task: Task) => void;
+  onExport: (task: Task) => void;
 }) {
   const open = tasks.filter((task) => task.status === "open");
   const finished = tasks.filter((task) => task.status !== "open");
@@ -86,7 +92,7 @@ export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasN
         <ul className="task-list">
           {open.map((task) => (
             <TaskCard key={task.id} task={task} application={applicationsByID.get(task.application_id)}
-              busy={busyId === task.id} onEdit={onEdit} onComplete={onComplete} onCancel={onCancel} />
+              busy={busyId === task.id} onEdit={onEdit} onComplete={onComplete} onCancel={onCancel} onExport={onExport} />
           ))}
         </ul>
       )}
@@ -99,7 +105,7 @@ export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasN
             <ul className="task-list">
               {finished.map((task) => (
                 <TaskCard key={task.id} task={task} application={applicationsByID.get(task.application_id)}
-                  busy={busyId === task.id} onEdit={onEdit} onComplete={onComplete} onCancel={onCancel} />
+                  busy={busyId === task.id} onEdit={onEdit} onComplete={onComplete} onCancel={onCancel} onExport={onExport} />
               ))}
             </ul>
           )}
