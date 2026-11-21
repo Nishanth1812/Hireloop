@@ -193,7 +193,7 @@ func newTaskHarness(t *testing.T) taskHarness {
 	store := newFakeTaskStore()
 	handler := NewHandlerWithTasks(verifier, testMapper{bindings: map[string]string{
 		"clerk-a": "owner-a", "clerk-b": "owner-b",
-	}}, nil, store)
+	}}, nil, store, nil)
 	return taskHarness{store: store, handler: handler, token: tokenA, tokenB: tokenB}
 }
 
@@ -543,7 +543,7 @@ func TestTaskRoutesUnavailableWithoutStore(t *testing.T) {
 	token := signTestRS256WithKey(t, key, now, map[string]any{"sub": "clerk-a"}, "kid")
 	verifier := clerk.NewStaticVerifier("https://clerk.example.com", map[string]*rsa.PublicKey{"kid": &key.PublicKey})
 	verifier.SetNow(func() time.Time { return now })
-	handler := NewHandlerWithTasks(verifier, testMapper{bindings: map[string]string{"clerk-a": "owner-a"}}, nil, nil)
+	handler := NewHandlerWithTasks(verifier, testMapper{bindings: map[string]string{"clerk-a": "owner-a"}}, nil, nil, nil)
 	for _, tc := range []struct{ method, body, path string }{
 		{http.MethodGet, "", "/api/tasks"},
 		{http.MethodPost, fmt.Sprintf(`{"application_id":%q,"title":"x"}`, taskAppID), "/api/tasks"},

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +13,13 @@ import (
 	"hireloop/api/internal/identities"
 	"hireloop/api/internal/tasks"
 )
+
+// notificationSettingsStore is the notification-controls surface the HTTP
+// layer uses; *reminders.Store implements it.
+type notificationSettingsStore interface {
+	RemindersEnabled(ctx context.Context, userID string) (bool, error)
+	SetRemindersEnabled(ctx context.Context, userID string, enabled bool) error
+}
 
 type user struct {
 	ID    string `json:"id"`
@@ -40,10 +48,10 @@ type applicationCounts struct {
 // NewHandler keeps the applications-only handler used by existing callers and
 // tests. Production wires task routes through NewHandlerWithTasks.
 func NewHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store) http.Handler {
-	return NewHandlerWithTasks(clerkVerifier, identityMapper, store, nil)
+	return NewHandlerWithTasks(clerkVerifier, identityMapper, store, nil, nil)
 }
 
-func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store, taskStore tasks.Store) http.Handler {
+func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store, taskStore tasks.Store, reminderStore notificationSettingsStore) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -409,6 +417,59 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 		w.Header().Set("Content-Type", "text/calendar; charset=utf-8")
 		w.Header().Set("Content-Disposition", "attachment; filename=task-"+id+".ics")
 		_, _ = w.Write([]byte(export))
+	})
+	// Notification controls. The owner always comes from the verified
+	// session; the preference is per-owner and defaults to enabled.
+	notificationSettings := func(w http.ResponseWriter, enabled bool) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			RemindersEnabled bool `json:"reminders_enabled"`
+		}{RemindersEnabled: enabled})
+	}
+	mux.HandleFunc("GET /api/notification-settings", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		if reminderStore == nil {
+			http.Error(w, "notification settings unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		enabled, err := reminderStore.RemindersEnabled(r.Context(), u.ID)
+		if err != nil {
+			http.Error(w, "notification settings unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		notificationSettings(w, enabled)
+	})
+	mux.HandleFunc("PATCH /api/notification-settings", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		var input struct {
+			RemindersEnabled *bool `json:"reminders_enabled"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&input) != nil || decoder.Decode(&struct{}{}) != io.EOF || input.RemindersEnabled == nil {
+			http.Error(w, "invalid notification settings", http.StatusBadRequest)
+			return
+		}
+		if reminderStore == nil {
+			http.Error(w, "notification settings unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if err := reminderStore.SetRemindersEnabled(r.Context(), u.ID, *input.RemindersEnabled); err != nil {
+			http.Error(w, "notification settings unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		enabled, err := reminderStore.RemindersEnabled(r.Context(), u.ID)
+		if err != nil {
+			http.Error(w, "notification settings unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		notificationSettings(w, enabled)
 	})
 	return mux
 }

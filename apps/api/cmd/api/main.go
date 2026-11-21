@@ -13,6 +13,7 @@ import (
 	"hireloop/api/internal/clerk"
 	"hireloop/api/internal/httpapi"
 	"hireloop/api/internal/identities"
+	"hireloop/api/internal/reminders"
 	"hireloop/api/internal/tasks"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -21,6 +22,7 @@ import (
 func main() {
 	var store applications.Store
 	var taskStore tasks.Store
+	var reminderStore *reminders.Store
 	var db *sql.DB
 	if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" {
 		var err error
@@ -29,8 +31,9 @@ func main() {
 			log.Fatal("database initialization or migration failed; check database configuration and migration state")
 		}
 		defer db.Close()
-		store = applications.PostgresStore{DB: db}
-		taskStore = tasks.PostgresStore{DB: db}
+		reminderStore = &reminders.Store{DB: db}
+		store = applications.PostgresStore{DB: db, Jobs: reminderStore}
+		taskStore = tasks.PostgresStore{DB: db, Jobs: reminderStore}
 	}
 
 	// Clerk authentication (migration target). Supabase remains the database.
@@ -73,7 +76,7 @@ func main() {
 	}
 	server := &http.Server{
 		Addr:              address,
-		Handler:           httpapi.NewHandlerWithTasks(clerkVerifier, identityMapper, store, taskStore),
+		Handler:           httpapi.NewHandlerWithTasks(clerkVerifier, identityMapper, store, taskStore, reminderStore),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("Hireloop API listening on http://%s", server.Addr)
