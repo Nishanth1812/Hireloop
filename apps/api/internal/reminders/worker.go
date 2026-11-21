@@ -12,6 +12,10 @@ import (
 // Polling is the deployment unit: one worker claims a batch of due jobs with
 // leases; the same worker recovers jobs whose lease expired when a previous
 // worker stopped.
+//
+// The worker also runs periodic retention cleanup (cleanup_reminder_retention)
+// regardless of whether a dispatcher is configured, so PII payloads and stale
+// pending events are bounded even in no-send deployments.
 type Worker struct {
 	store      *Store
 	dispatcher Dispatcher
@@ -44,6 +48,10 @@ type Config struct {
 	Scope []string
 	// Now is the clock; tests override it. Defaults to time.Now.
 	Now func() time.Time
+	// CleanupInterval runs retention cleanup periodically (default 1h).
+	// Set to 0 to disable. Runs even when Dispatcher is nil so PII retention
+	// bounds are enforced in no-send deployments.
+	CleanupInterval time.Duration
 }
 
 func NewWorker(store *Store, cfg Config) *Worker {
@@ -85,25 +93,50 @@ func (c *Config) normalize() {
 	if c.BatchSize <= 0 {
 		c.BatchSize = 25
 	}
+	if c.CleanupInterval <= 0 {
+		c.CleanupInterval = time.Hour
+	}
 }
 
 // Run polls until ctx is canceled; it returns nil on cancellation.
 func (w *Worker) Run(ctx context.Context) error {
-	ticker := time.NewTicker(w.cfg.PollInterval)
-	defer ticker.Stop()
+	pollTicker := time.NewTicker(w.cfg.PollInterval)
+	defer pollTicker.Stop()
+
+	cleanupTicker := time.NewTicker(w.cfg.CleanupInterval)
+	defer cleanupTicker.Stop()
+
+	// Run cleanup once at startup
+	if err := w.runCleanup(ctx); err != nil {
+		return err
+	}
+
 	for {
-		if _, err := w.poll(ctx, w.cfg.BatchSize); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return err
-		}
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-pollTicker.C:
+			if _, err := w.poll(ctx, w.cfg.BatchSize); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+		case <-cleanupTicker.C:
+			if err := w.runCleanup(ctx); err != nil {
+				return err
+			}
 		}
 	}
+}
+
+// runCleanup executes the retention cleanup function. It runs regardless of
+// whether a dispatcher is configured, so PII retention bounds are enforced
+// even in no-send deployments.
+func (w *Worker) runCleanup(ctx context.Context) error {
+	var deletedPayloads, deletedEvents int
+	err := w.store.DB.QueryRowContext(ctx, `SELECT * FROM cleanup_reminder_retention()`).Scan(&deletedPayloads, &deletedEvents)
+	return err
 }
 
 // poll claims due jobs (within Config.Scope when set) and dispatches each one.

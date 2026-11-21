@@ -5,6 +5,10 @@
 // scheduled instead of being leased or exhausted) unless sending is
 // explicitly enabled and fully configured: RESEND_ENABLED=true with
 // RESEND_API_KEY and RESEND_FROM set.
+//
+// Retention cleanup runs automatically every hour (configurable via
+// CleanupInterval in worker.Config) even when sending is disabled, so PII
+// payloads and stale pending events are bounded in all deployments.
 package main
 
 import (
