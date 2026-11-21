@@ -7,9 +7,11 @@ import {
   createApplication,
   createTask,
   deleteApplication,
+  getNotificationSettings,
   listApplications,
   listTasks,
   patchApplication,
+  patchNotificationSettings,
   patchTask,
   taskIcsUrl,
   toChannel,
@@ -83,6 +85,13 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   const [taskDraft, setTaskDraft] = useState<TaskDraft | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  // The preference mirrors the server, never a local guess: null until the
+  // owner-scoped read confirms it, and reset by the per-session remount.
+  const [notificationEnabled, setNotificationEnabled] = useState<boolean | null>(null);
+  const [notificationLoading, setNotificationLoading] = useState(session !== null);
+  const [notificationSaving, setNotificationSaving] = useState(false);
+  const [notificationError, setNotificationError] = useState("");
+  const [notificationNotice, setNotificationNotice] = useState("");
 
   async function sessionToken(): Promise<string> {
     const token = await session?.getToken();
@@ -167,6 +176,54 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
       cancelled = true;
     };
   }, [session, tasksShowAll, taskCursor, taskPageIndex, taskReloadKey]);
+
+  useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+    void (async () => {
+      setNotificationLoading(true);
+      setNotificationError("");
+      setNotificationNotice("");
+      try {
+        const token = await session.getToken();
+        if (cancelled) return;
+        if (!token) throw new Error("Your session is unavailable. Please sign in again.");
+        const next = await getNotificationSettings(token);
+        if (cancelled) return;
+        setNotificationEnabled(next.reminders_enabled);
+      } catch (caught) {
+        if (!cancelled) {
+          // A failure must not leave an earlier or assumed value on screen.
+          setNotificationEnabled(null);
+          setNotificationError(messageFrom(caught));
+        }
+      } finally {
+        if (!cancelled) setNotificationLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session]);
+
+  async function changeNotificationSetting(enabled: boolean) {
+    if (!session) return;
+    setNotificationSaving(true);
+    setNotificationError("");
+    setNotificationNotice("");
+    try {
+      const token = await sessionToken();
+      // The checkbox keeps the last confirmed value while saving; only the
+      // API's response may declare the new preference.
+      const next = await patchNotificationSettings(token, enabled);
+      setNotificationEnabled(next.reminders_enabled);
+      setNotificationNotice(next.reminders_enabled ? "Preference saved: reminders on." : "Preference saved: reminders off.");
+    } catch (caught) {
+      setNotificationError(messageFrom(caught));
+    } finally {
+      setNotificationSaving(false);
+    }
+  }
 
   function reload() {
     setReloadKey((key) => key + 1);
@@ -538,6 +595,12 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     taskDraft={taskDraft}
     error={error}
     notice={notice}
+    notificationEnabled={notificationEnabled}
+    notificationLoading={notificationLoading}
+    notificationSaving={notificationSaving}
+    notificationError={notificationError}
+    notificationNotice={notificationNotice}
+    onNotificationChange={changeNotificationSetting}
     onCreate={addApplication}
     onStatusChange={(application, status) => void changeStatus(application, status)}
     onEdit={(application) => { setTaskDraft(null); setEditing(application); setError(""); setNotice(""); }}

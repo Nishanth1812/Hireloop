@@ -9,6 +9,7 @@ import { ApplicationCaptureForm } from "./ApplicationCaptureForm";
 import { ApplicationEditForm } from "./ApplicationEditForm";
 import { ApplicationFilterBar } from "./ApplicationFilterBar";
 import { ApplicationList } from "./ApplicationList";
+import { NotificationControl } from "./NotificationControl";
 import { TaskForm } from "./TaskForm";
 import { TodayPanel } from "./TodayPanel";
 import { ThemeControl } from "./ThemeControl";
@@ -38,6 +39,12 @@ type Props = {
   taskDraft: TaskDraft | null;
   error: string;
   notice: string;
+  notificationEnabled: boolean | null;
+  notificationLoading: boolean;
+  notificationSaving: boolean;
+  notificationError: string;
+  notificationNotice: string;
+  onNotificationChange: (enabled: boolean) => void;
   onCreate: (event: FormEvent<HTMLFormElement>) => void;
   onStatusChange: (application: Application, status: Application["status"]) => void;
   onEdit: (application: Application) => void;
@@ -63,6 +70,7 @@ type Props = {
 export function ApplicationDashboard({
   email, result, filters, page, hasPrevious, hasNext, loading, loadError, saving, busyId, editingApplication,
   taskPage, taskPageIndex, taskHasPrevious, taskHasNext, taskLoading, taskLoadError, tasksShowAll, taskBusyId, taskDraft, error, notice,
+  notificationEnabled, notificationLoading, notificationSaving, notificationError, notificationNotice, onNotificationChange,
   onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onAddTask, onApplyFilters, onClearFilters,
   onPrevious, onNext, onToggleFinished, onTaskPrevious, onTaskNext, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask, onExport,
 }: Props) {
@@ -104,6 +112,15 @@ export function ApplicationDashboard({
           <div><strong>{result.counts.applied}</strong><span>Applied</span></div>
         </div>
       </section>
+
+      <NotificationControl
+        enabled={notificationEnabled}
+        loading={notificationLoading}
+        saving={notificationSaving}
+        error={notificationError}
+        notice={notificationNotice}
+        onChange={onNotificationChange}
+      />
 
       {error && <p className="message error-message" role="alert">{error}</p>}
       {notice && <p className="message success-message" role="status">{notice}</p>}

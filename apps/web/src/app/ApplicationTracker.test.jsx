@@ -17,7 +17,10 @@ mock.module("@clerk/nextjs", () => ({
 mock.module("./_components/ApplicationDashboard", () => ({
   ApplicationDashboard: (props) => {
     dashboardProps = props;
-    const { email, result, filters, page, error, loading, loadError, taskPage } = props;
+    const {
+      email, result, filters, page, error, loading, loadError, taskPage,
+      notificationEnabled, notificationLoading, notificationSaving, notificationError, notificationNotice, onNotificationChange,
+    } = props;
     return <div>
       <span>{email}</span>
       <span>{loading ? "Loading" : "Ready"}</span>
@@ -27,6 +30,12 @@ mock.module("./_components/ApplicationDashboard", () => ({
       {error && <p role="alert">{error}</p>}
       {result.items.map((item) => <p key={item.id}>{item.company}</p>)}
       <div data-testid="today">{taskPage.items.map((task) => <p key={task.id}>{task.title}</p>)}</div>
+      <span data-testid="notifications">{notificationEnabled === null ? "unknown" : String(notificationEnabled)}</span>
+      {notificationLoading && <span data-testid="notifications-loading">Loading settings</span>}
+      {notificationSaving && <span data-testid="notifications-saving">Saving settings</span>}
+      {notificationError && <p data-testid="notifications-error">{notificationError}</p>}
+      {notificationNotice && <p data-testid="notifications-notice">{notificationNotice}</p>}
+      <input type="checkbox" data-testid="notifications-toggle" checked={notificationEnabled ?? false} onChange={(event) => onNotificationChange(event.target.checked)} />
     </div>;
   },
 }));
@@ -137,8 +146,9 @@ test("a successful create clears a stale load error so the new record is visible
 
   expect(container.querySelector('[data-testid="load-error"]') === null).toBe(true);
   // The new record is confirmed by the follow-up list request, not assumed.
-  // The separate Today request also runs on this account's initial render.
-  expect(calls).toBe(4);
+  // The separate Today and notification-settings reads also run on this
+  // account's initial render.
+  expect(calls).toBe(5);
 });
 
 test("next requests the page after the current cursor", async () => {
@@ -349,6 +359,7 @@ test("switching accounts immediately hides the previous account's records", asyn
   let completeB;
   globalThis.fetch = async (url, options) => {
     if (url === "/api/tasks") return taskResponse();
+    if (url === "/api/notification-settings") return Response.json({ reminders_enabled: true });
     return options.headers.Authorization === "Bearer a"
       ? response("Account A company")
       : new Promise((resolve) => { completeB = resolve; });
@@ -657,6 +668,7 @@ test("a previous account's delayed response cannot overwrite the next account", 
   let completeA;
   globalThis.fetch = async (url, options) => {
     if (url === "/api/tasks") return taskResponse();
+    if (url === "/api/notification-settings") return Response.json({ reminders_enabled: true });
     return options.headers.Authorization === "Bearer a"
       ? new Promise((resolve) => { completeA = resolve; })
       : response("Account B company");
@@ -671,4 +683,152 @@ test("a previous account's delayed response cannot overwrite the next account", 
   session = null;
   await render();
   expect(container.textContent).toBe("Sign in");
+});
+
+test("reads the owner's notification preference with the session token", async () => {
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, token: options.headers.Authorization });
+    if (url === "/api/notification-settings") return Response.json({ reminders_enabled: false });
+    if (url === "/api/tasks") return taskResponse();
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  const settings = requests.filter((request) => request.url === "/api/notification-settings");
+  expect(settings.length).toBe(1);
+  expect(settings[0].token).toBe("Bearer a");
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("false");
+});
+
+test("the preference is announced as loading until the read completes", async () => {
+  let completeSettings;
+  globalThis.fetch = async (url) => {
+    if (url === "/api/notification-settings") return new Promise((resolve) => { completeSettings = resolve; });
+    if (url === "/api/tasks") return taskResponse();
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  expect(container.querySelector('[data-testid="notifications-loading"]')).not.toBeNull();
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("unknown");
+  await act(async () => { completeSettings(Response.json({ reminders_enabled: true })); });
+  expect(container.querySelector('[data-testid="notifications-loading"]')).toBeNull();
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("true");
+});
+
+test("a failed settings read shows an error and never a stale preference", async () => {
+  globalThis.fetch = async (url) => {
+    if (url === "/api/notification-settings") return new Response("unavailable", { status: 503 });
+    if (url === "/api/tasks") return taskResponse();
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("unknown");
+  expect(container.querySelector('[data-testid="notifications-error"]').textContent).toMatch(/API or database is unavailable/);
+  expect(container.querySelector('[data-testid="notifications-loading"]')).toBeNull();
+});
+
+test("saving patches the boolean preference and trusts the server's response", async () => {
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, method: options.method, body: options.body });
+    if (url === "/api/notification-settings") {
+      return Response.json({ reminders_enabled: options.method === "PATCH" ? false : true });
+    }
+    if (url === "/api/tasks") return taskResponse();
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("true");
+
+  await act(async () => { await dashboardProps.onNotificationChange(false); });
+
+  const patch = requests.find((request) => request.method === "PATCH");
+  expect(patch.url).toBe("/api/notification-settings");
+  expect(JSON.parse(patch.body)).toEqual({ reminders_enabled: false });
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("false");
+  expect(container.querySelector('[data-testid="notifications-notice"]').textContent).toMatch(/reminders off/i);
+});
+
+test("a write in flight keeps the confirmed value until the response arrives", async () => {
+  let completePatch;
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/notification-settings") {
+      if (options.method === "PATCH") return new Promise((resolve) => { completePatch = resolve; });
+      return Response.json({ reminders_enabled: true });
+    }
+    if (url === "/api/tasks") return taskResponse();
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onNotificationChange(false); });
+  expect(container.querySelector('[data-testid="notifications-saving"]')).not.toBeNull();
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("true");
+
+  await act(async () => { completePatch(Response.json({ reminders_enabled: false })); });
+  expect(container.querySelector('[data-testid="notifications-saving"]')).toBeNull();
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("false");
+});
+
+test("a rejected write keeps the confirmed value and surfaces the error", async () => {
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/notification-settings") {
+      if (options.method === "PATCH") return new Response("unavailable", { status: 503 });
+      return Response.json({ reminders_enabled: true });
+    }
+    if (url === "/api/tasks") return taskResponse();
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  await act(async () => { await dashboardProps.onNotificationChange(false); });
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("true");
+  expect(container.querySelector('[data-testid="notifications-error"]').textContent).toMatch(/API or database is unavailable/);
+  expect(container.querySelector('[data-testid="notifications-saving"]')).toBeNull();
+});
+
+test("switching accounts resets the preference and ignores a delayed read from the old account", async () => {
+  let completeA;
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/tasks") return taskResponse();
+    if (url === "/api/notification-settings") {
+      if (options.headers.Authorization === "Bearer a") return new Promise((resolve) => { completeA = resolve; });
+      return Response.json({ reminders_enabled: false });
+    }
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  expect(container.querySelector('[data-testid="notifications-loading"]')).not.toBeNull();
+
+  session = account("b");
+  await render();
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("false");
+  await act(async () => { completeA(Response.json({ reminders_enabled: true })); });
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("false");
+});
+
+test("a delayed preference write from a previous account cannot overwrite the next account", async () => {
+  let completeA;
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/tasks") return taskResponse();
+    if (url === "/api/notification-settings") {
+      if (options.method === "PATCH" && options.headers.Authorization === "Bearer a") {
+        return new Promise((resolve) => { completeA = resolve; });
+      }
+      return Response.json({ reminders_enabled: true });
+    }
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onNotificationChange(false); });
+  session = account("b");
+  await render();
+  await act(async () => { completeA(Response.json({ reminders_enabled: false })); });
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("true");
 });

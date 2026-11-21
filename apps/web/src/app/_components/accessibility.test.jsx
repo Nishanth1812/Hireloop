@@ -19,6 +19,7 @@ const { ApplicationList } = await import("./ApplicationList");
 const { ApplicationCaptureForm } = await import("./ApplicationCaptureForm");
 const { ApplicationEditForm } = await import("./ApplicationEditForm");
 const { ApplicationFilterBar } = await import("./ApplicationFilterBar");
+const { NotificationControl } = await import("./NotificationControl");
 const { TaskForm } = await import("./TaskForm");
 const { TodayPanel } = await import("./TodayPanel");
 
@@ -536,4 +537,84 @@ test("the edit form labels every field, pre-fills values, and offers save and ca
   assertFocusableWithName(submit);
   const cancel = [...container.querySelectorAll("button")].find((b) => b.textContent.trim() === "Cancel");
   assertFocusableWithName(cancel);
+});
+
+function notificationProps(overrides = {}) {
+  return {
+    enabled: true,
+    loading: false,
+    saving: false,
+    error: "",
+    notice: "",
+    onChange: noop,
+    ...overrides,
+  };
+}
+
+test("the notification control is a labelled native checkbox with truthful wording", async () => {
+  await render(<NotificationControl {...notificationProps()} />);
+  const section = container.querySelector(".notification-control");
+  expect(section.getAttribute("aria-labelledby")).toBe("notifications-title");
+
+  const checkbox = container.querySelector("#notifications-enabled");
+  assertFocusableWithName(checkbox);
+  expect(checkbox.tagName).toBe("INPUT");
+  expect(checkbox.type).toBe("checkbox");
+  expect(checkbox.checked).toBe(true);
+  expect(checkbox.hasAttribute("disabled")).toBe(false);
+
+  const label = container.querySelector('label[for="notifications-enabled"]');
+  expect(label).not.toBeNull();
+  expect(label.textContent.trim()).toMatch(/reminders/i);
+
+  const describedBy = (checkbox.getAttribute("aria-describedby") || "").split(/\s+/);
+  expect(describedBy).toContain("notifications-state");
+  expect(describedBy).toContain("notifications-detail");
+
+  const detail = container.querySelector("#notifications-detail").textContent;
+  expect(detail).toMatch(/does not guarantee/i);
+  expect(detail).toMatch(/does not activate the reminder worker/i);
+  expect(container.querySelector(".notification-state").textContent).toMatch(/preference is on/i);
+});
+
+test("the notification control marks itself busy and disables the checkbox while loading or saving", async () => {
+  await render(<NotificationControl {...notificationProps({ enabled: null, loading: true })} />);
+  let section = container.querySelector(".notification-control");
+  expect(section.getAttribute("aria-busy")).toBe("true");
+  expect(container.querySelector('[role="status"]').textContent).toMatch(/Loading notification settings/i);
+  expect(container.querySelector("#notifications-enabled").disabled).toBe(true);
+
+  await render(<NotificationControl {...notificationProps({ saving: true })} />);
+  section = container.querySelector(".notification-control");
+  expect(section.getAttribute("aria-busy")).toBe("true");
+  expect(container.querySelector('[role="status"]').textContent).toMatch(/Saving your preference/i);
+  expect(container.querySelector("#notifications-enabled").disabled).toBe(true);
+
+  await render(<NotificationControl {...notificationProps()} />);
+  section = container.querySelector(".notification-control");
+  expect(section.getAttribute("aria-busy")).toBe("false");
+  expect(container.querySelector("#notifications-enabled").disabled).toBe(false);
+});
+
+test("the notification control announces load errors and saved confirmations", async () => {
+  await render(<NotificationControl {...notificationProps({ enabled: null, error: "Settings unavailable." })} />);
+  expect(container.querySelector('[role="alert"]').textContent).toBe("Settings unavailable.");
+  expect(container.querySelector(".notification-state").textContent).toBe("");
+  expect(container.querySelector(".notification-control").getAttribute("aria-busy")).toBe("false");
+
+  await render(<NotificationControl {...notificationProps({ notice: "Reminders turned off." })} />);
+  const confirmation = container.querySelector(".success-message");
+  expect(confirmation.getAttribute("role")).toBe("status");
+  expect(confirmation.textContent).toMatch(/turned off/i);
+});
+
+test("the notification checkbox follows the confirmed value and reports changes", async () => {
+  const changes = [];
+  await render(<NotificationControl {...notificationProps({ enabled: false, onChange: (value) => changes.push(value) })} />);
+  const checkbox = container.querySelector("#notifications-enabled");
+  expect(checkbox.checked).toBe(false);
+  expect(container.querySelector(".notification-state").textContent).toMatch(/preference is off/i);
+
+  await act(async () => { checkbox.click(); });
+  expect(changes).toEqual([true]);
 });

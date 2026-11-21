@@ -178,3 +178,22 @@ export function patchTask(token: string, id: string, input: TaskPatch): Promise<
 export function taskIcsUrl(id: string): string {
   return `/api/tasks/${encodeURIComponent(id)}/ics`;
 }
+
+// NotificationSettings is the API's owner-scoped preference envelope. The
+// field name mirrors the wire format (snake_case); there is no delivery claim
+// in it — it records the preference only.
+export type NotificationSettings = {
+  reminders_enabled: boolean;
+};
+
+export function getNotificationSettings(token: string): Promise<NotificationSettings> {
+  return request("/api/notification-settings", token);
+}
+
+export function patchNotificationSettings(token: string, enabled: boolean): Promise<NotificationSettings> {
+  return request("/api/notification-settings", token, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reminders_enabled: enabled }),
+  });
+}

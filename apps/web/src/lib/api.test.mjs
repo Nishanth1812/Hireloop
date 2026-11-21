@@ -319,3 +319,57 @@ test("delete accepts the API's empty success response", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("notification client exposes the supported operations", () => {
+  assert.ok(api, "notification API client is missing");
+  assert.equal(typeof api.getNotificationSettings, "function");
+  assert.equal(typeof api.patchNotificationSettings, "function");
+});
+
+test("getNotificationSettings sends the token and reads the preference envelope", async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ reminders_enabled: false });
+  };
+  try {
+    const result = await api.getNotificationSettings("access-token");
+    assert.equal(request.url, "/api/notification-settings");
+    assert.equal(request.options.headers.Authorization, "Bearer access-token");
+    assert.equal(result.reminders_enabled, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("patchNotificationSettings sends only the boolean preference as JSON", async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ reminders_enabled: true });
+  };
+  try {
+    const result = await api.patchNotificationSettings("access-token", true);
+    assert.equal(request.url, "/api/notification-settings");
+    assert.equal(request.options.method, "PATCH");
+    assert.equal(request.options.headers.Authorization, "Bearer access-token");
+    assert.equal(request.options.headers["Content-Type"], "application/json");
+    assert.deepEqual(JSON.parse(request.options.body), { reminders_enabled: true });
+    assert.equal(result.reminders_enabled, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("notification settings failures return a useful message", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("unavailable", { status: 503 });
+  try {
+    await assert.rejects(api.getNotificationSettings("access-token"), /API or database is unavailable/);
+    await assert.rejects(api.patchNotificationSettings("access-token", false), /API or database is unavailable/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

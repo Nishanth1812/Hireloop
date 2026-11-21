@@ -112,6 +112,15 @@ h1 { margin-bottom: 7px; font-size: clamp(2rem, 4vw, 2.7rem); line-height: 1.1; 
 h2 { margin-bottom: 6px; font-size: 1.2rem; letter-spacing: -0.025em; }
 h3 { margin-bottom: 8px; font-size: 1rem; }
 .welcome-row .muted, .capture-panel > .muted { margin-bottom: 0; }
+.notification-control { margin-bottom: 22px; padding: 20px 24px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+.notification-heading .muted { margin-bottom: 0; font-size: 0.88rem; }
+.notification-toggle { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+.notification-toggle input { width: 18px; height: 18px; margin: 0; accent-color: var(--focus-ring); cursor: pointer; }
+.notification-toggle input:disabled { cursor: not-allowed; }
+.notification-toggle label { font-size: 0.92rem; font-weight: 700; }
+.notification-state { margin: 10px 0 0; color: var(--muted); font-size: 0.82rem; }
+.notification-control .message { margin: 12px 0 0; }
+.notification-detail { margin: 12px 0 0; font-size: 0.78rem; }
 .summary { display: flex; align-items: center; gap: 26px; padding: 0 4px 3px; }
 .summary div { display: grid; gap: 1px; }
 .summary strong { font-size: 1.16rem; line-height: 1.2; }
