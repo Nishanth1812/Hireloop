@@ -14,6 +14,7 @@ import (
 	"hireloop/api/internal/httpapi"
 	"hireloop/api/internal/identities"
 	"hireloop/api/internal/reminders"
+	"hireloop/api/internal/resend"
 	"hireloop/api/internal/tasks"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -74,9 +75,22 @@ func main() {
 	if address == "" {
 		address = "127.0.0.1:8080"
 	}
+
+	// Resend webhook receiver: verifies Svix signatures over the raw body.
+	// Fail closed when no signing secret is configured (the route then
+	// returns 503 instead of accepting events).
+	var webhookVerifier *resend.WebhookVerifier
+	if secret := strings.TrimSpace(os.Getenv("RESEND_WEBHOOK_SECRET")); secret != "" {
+		v, err := resend.NewWebhookVerifier(secret)
+		if err != nil {
+			log.Fatalf("invalid Resend webhook secret: %v", err)
+		}
+		webhookVerifier = v
+	}
+
 	server := &http.Server{
 		Addr:              address,
-		Handler:           httpapi.NewHandlerWithTasks(clerkVerifier, identityMapper, store, taskStore, reminderStore),
+		Handler:           httpapi.NewHandlerWithTasks(clerkVerifier, identityMapper, store, taskStore, reminderStore, webhookVerifier),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("Hireloop API listening on http://%s", server.Addr)

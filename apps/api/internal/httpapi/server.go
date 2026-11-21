@@ -11,6 +11,8 @@ import (
 	"hireloop/api/internal/applications"
 	"hireloop/api/internal/clerk"
 	"hireloop/api/internal/identities"
+	"hireloop/api/internal/reminders"
+	"hireloop/api/internal/resend"
 	"hireloop/api/internal/tasks"
 )
 
@@ -19,6 +21,7 @@ import (
 type notificationSettingsStore interface {
 	RemindersEnabled(ctx context.Context, userID string) (bool, error)
 	SetRemindersEnabled(ctx context.Context, userID string, enabled bool) error
+	RecordWebhookEvent(ctx context.Context, eventID, eventEmailID, eventType string, tr reminders.Transition) (bool, error)
 }
 
 type user struct {
@@ -48,10 +51,10 @@ type applicationCounts struct {
 // NewHandler keeps the applications-only handler used by existing callers and
 // tests. Production wires task routes through NewHandlerWithTasks.
 func NewHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store) http.Handler {
-	return NewHandlerWithTasks(clerkVerifier, identityMapper, store, nil, nil)
+	return NewHandlerWithTasks(clerkVerifier, identityMapper, store, nil, nil, nil)
 }
 
-func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store, taskStore tasks.Store, reminderStore notificationSettingsStore) http.Handler {
+func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store, taskStore tasks.Store, reminderStore notificationSettingsStore, webhookVerifier *resend.WebhookVerifier) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -470,6 +473,41 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 			return
 		}
 		notificationSettings(w, enabled)
+	})
+
+	// Resend webhooks. The route is not authenticated: it exists so the
+	// provider can deliver delivery events, and it fails closed when no
+	// signing secret is configured (503) and rejects unsigned or invalid
+	// events (400). Every verified event is persisted with a unique
+	// provider-event-id constraint before it can change anything, so
+	// replays are ignored durably and can never overwrite rescheduled
+	// versions of the same job.
+	mux.HandleFunc("POST /api/webhook/resend", func(w http.ResponseWriter, r *http.Request) {
+		if webhookVerifier == nil {
+			http.Error(w, "resend webhooks unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		event, err := webhookVerifier.VerifyRequest(r.Context(), r)
+		if err != nil {
+			http.Error(w, "invalid webhook", http.StatusBadRequest)
+			return
+		}
+		if reminderStore == nil {
+			http.Error(w, "notification settings unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		tr, ok := reminders.TransitionForEvent(event.Type)
+		if !ok {
+			// Events that never change delivery state (scheduled, opened,
+			// clicked, received): acknowledge without writing.
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if _, err := reminderStore.RecordWebhookEvent(r.Context(), event.ID, event.EmailID, string(event.Type), tr); err != nil {
+			http.Error(w, "webhook processing failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 	return mux
 }

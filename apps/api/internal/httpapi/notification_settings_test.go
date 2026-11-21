@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"hireloop/api/internal/clerk"
+	"hireloop/api/internal/reminders"
 )
 
 // fakeSettingsStore models the notification-settings contract used by the
@@ -50,6 +51,10 @@ func (f *fakeSettingsStore) SetRemindersEnabled(_ context.Context, userID string
 	return nil
 }
 
+func (f *fakeSettingsStore) RecordWebhookEvent(_ context.Context, _, _, _ string, _ reminders.Transition) (bool, error) {
+	return false, nil
+}
+
 func newSettingsHarness(t *testing.T, store *fakeSettingsStore) (http.Handler, string, string) {
 	t.Helper()
 	now := time.Now()
@@ -61,7 +66,7 @@ func newSettingsHarness(t *testing.T, store *fakeSettingsStore) (http.Handler, s
 	verifier.SetNow(func() time.Time { return now })
 	handler := NewHandlerWithTasks(verifier, testMapper{bindings: map[string]string{
 		"clerk-a": "owner-a", "clerk-b": "owner-b",
-	}}, nil, nil, store)
+	}}, nil, nil, store, nil)
 	return handler, tokenA, tokenB
 }
 
@@ -152,7 +157,7 @@ func TestNotificationSettingsUnavailableWithoutStore(t *testing.T) {
 	tokenA, keyA := signTestRS256(t, now, map[string]any{"sub": "clerk-a"}, "kid")
 	verifier := clerk.NewStaticVerifier("https://clerk.example.com", map[string]*rsa.PublicKey{"kid": &keyA.PublicKey})
 	verifier.SetNow(func() time.Time { return now })
-	handler := NewHandlerWithTasks(verifier, testMapper{bindings: map[string]string{"clerk-a": "owner-a"}}, nil, nil, nil)
+	handler := NewHandlerWithTasks(verifier, testMapper{bindings: map[string]string{"clerk-a": "owner-a"}}, nil, nil, nil, nil)
 	for _, tc := range []struct{ method, body, path string }{
 		{http.MethodGet, "", "/api/notification-settings"},
 		{http.MethodPatch, `{"reminders_enabled":false}`, "/api/notification-settings"},
