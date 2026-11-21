@@ -488,8 +488,8 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   // save it as a file. The export is built by the API from the stored
   // deadline, so no time or zone is invented on the client.
   async function exportTaskIcs(task: Task) {
-    const token = await sessionToken();
     try {
+      const token = await sessionToken();
       const response = await fetch(taskIcsUrl(task.id), { headers: { Authorization: `Bearer ${token}` } });
       if (!response.ok) throw new Error("The task calendar entry could not be exported.");
       const blob = new Blob([await response.text()], { type: "text/calendar; charset=utf-8" });
@@ -497,8 +497,13 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
       const anchor = document.createElement("a");
       anchor.href = url;
       anchor.download = `task-${task.id}.ics`;
-      anchor.click();
-      void setTimeout(() => URL.revokeObjectURL(url), 1000);
+      try {
+        document.body.appendChild(anchor);
+        anchor.click();
+      } finally {
+        anchor.remove();
+        void setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
     } catch (caught) {
       setError(messageFrom(caught));
     }

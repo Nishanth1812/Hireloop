@@ -420,6 +420,24 @@ test("an exact deadline without a zone is rejected before any request", async ()
   expect(dashboardProps.taskDraft).not.toBeNull();
 });
 
+test("calendar export shows token errors without requesting a download", async () => {
+  let failToken = false;
+  let exports = 0;
+  session = account("a", async () => {
+    if (failToken) throw new Error("Session unavailable");
+    return "token";
+  });
+  globalThis.fetch = async (url) => {
+    if (url.includes("/ics")) exports++;
+    return url.startsWith("/api/tasks") ? taskResponse() : Response.json(page());
+  };
+  await render();
+  failToken = true;
+  await act(async () => { dashboardProps.onExport(openTask()); });
+  expect(exports).toBe(0);
+  expect(container.querySelector('[role="alert"]').textContent).toContain("Session unavailable");
+});
+
 test("creating a task uses the selected application", async () => {
   const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved" };
   let body;

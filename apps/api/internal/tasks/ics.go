@@ -11,8 +11,7 @@ import (
 //
 //   - PrecisionDate:    DUE;VALUE=DATE with the stored calendar day — no time
 //     and no zone are invented for a deadline the user gave as a day.
-//   - PrecisionInstant: DUE;TZID=<original zone> with the stored wall time in
-//     that zone, so the exported instant is the one the user chose.
+//   - PrecisionInstant: DUE as the stored UTC instant, with seconds and Z.
 //   - PrecisionNone:    no DUE at all.
 //
 // Tasks whose deadline fields are empty, inconsistent or invalid for their
@@ -34,13 +33,11 @@ func ExportIcs(task Task) (string, error) {
 		if err != nil {
 			return "", ErrInvalid
 		}
-		_, wall := renderInstant(instant, task.TimeZone)
-		if wall == "" {
+		// RFC 5545 DATE-TIME cannot represent fractional seconds.
+		if instant.Nanosecond() != 0 {
 			return "", ErrInvalid
 		}
-		// The app stores minutes; DATE-TIME values carry no seconds in this
-		// export, so none are invented for a deadline recorded as minutes.
-		dueLine = "DUE;TZID=" + task.TimeZone + ":" + compactIcsDateTime(wall)
+		dueLine = "DUE:" + instant.UTC().Format("20060102T150405Z")
 	case PrecisionNone:
 		if task.DueDate != "" || task.DueAt != "" || task.TimeZone != "" {
 			return "", ErrInvalid
@@ -77,12 +74,6 @@ func ExportIcs(task Task) (string, error) {
 	return b.String(), nil
 }
 
-// compactIcsDateTime turns a wall time such as "2026-11-12T18:00" into the
-// RFC 5545 DATE-TIME form "20261112T1800" (minutes precision, no seconds).
-func compactIcsDateTime(wall string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(wall, "-", ""), ":", "")
-}
-
 func icsStatus(status string) string {
 	switch status {
 	case StatusDone:
@@ -98,6 +89,12 @@ func icsStatus(status string) string {
 // comma are quoted with a backslash, and line breaks become the two-character
 // sequence "\n" so a value can never disturb the calendar's line structure.
 func escapeIcsText(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if (r < 0x20 && r != '\t' && r != '\r' && r != '\n') || r == 0x7f {
+			return -1
+		}
+		return r
+	}, value)
 	value = strings.ReplaceAll(value, "\\", "\\\\")
 	value = strings.ReplaceAll(value, ";", "\\;")
 	value = strings.ReplaceAll(value, ",", "\\,")

@@ -1,7 +1,7 @@
 "use client";
 
 import type { Application, Task } from "@/lib/api";
-import { deadlineText, reminderText } from "@/lib/tasks";
+import { deadlineText } from "@/lib/tasks";
 
 function TaskCard({ task, application, busy, onEdit, onComplete, onCancel, onExport }: {
   task: Task;
@@ -13,7 +13,6 @@ function TaskCard({ task, application, busy, onEdit, onComplete, onCancel, onExp
   onExport: (task: Task) => void;
 }) {
   const deadline = deadlineText(task);
-  const reminder = reminderText(task);
   return (
     <li className={`task-row ${task.status}`}>
       <div className="task-copy">
@@ -21,7 +20,6 @@ function TaskCard({ task, application, busy, onEdit, onComplete, onCancel, onExp
         <span>{application ? `${application.role} at ${application.company}` : "Linked application"}</span>
         <span className="task-deadline">{deadline.when}</span>
         <span className="task-detail">{deadline.detail}</span>
-        {reminder && <span className="task-reminder">{reminder}</span>}
         <button className="task-export-button" type="button" disabled={busy}
           onClick={() => onExport(task)} aria-label={`Export ${task.title} calendar entry`}>Export ICS</button>
         {task.status !== "open" && <span className="task-status">Status: {task.status}</span>}

@@ -91,27 +91,3 @@ test("an edited task's zone stays available in the choice list", () => {
   assert.deepEqual(tasks.zoneChoices("Pacific/Fiji").slice(0, 1), ["Pacific/Fiji"]);
   assert.deepEqual(tasks.zoneChoices("UTC"), tasks.TIME_ZONE_CHOICES);
 });
-
-test("open date-only tasks show a reminder on the day, with no invented time", () => {
-  assert.ok(tasks, "task display helpers are missing");
-  const reminder = tasks.reminderText(task());
-  assert.equal(reminder, "Reminder: 12 Nov 2026");
-  assert.doesNotMatch(reminder, /\d{1,2}:\d{2}/);
-});
-
-test("finished tasks have no reminder — completion and cancellation suppress it", () => {
-  assert.equal(tasks.reminderText(task({ status: "done" })), null);
-  assert.equal(tasks.reminderText(task({ status: "cancelled" })), null);
-});
-
-test("tasks without a readable deadline have no reminder", () => {
-  assert.equal(tasks.reminderText(task({ due_precision: "none", due_date: "", due_at: "", time_zone: "" })), null);
-  assert.equal(tasks.reminderText(task({ due_precision: "instant", due_at: "not-a-date", time_zone: "UTC" })), null);
-});
-
-test("an instant reminder keeps the stored wall time", () => {
-  const instant = task({
-    due_precision: "instant", due_at: "2026-11-12T12:30:00Z", due_local: "2026-11-12T18:00", time_zone: "Asia/Kolkata",
-  });
-  assert.equal(tasks.reminderText(instant), "Reminder: 12 Nov 2026, 18:00");
-});

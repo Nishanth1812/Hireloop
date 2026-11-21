@@ -521,8 +521,8 @@ func TestPostgresTaskIcsExportRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExportIcs stored instant task: %v", err)
 	}
-	if !strings.Contains(export, "DUE;TZID=Asia/Kolkata:20261112T1800") {
-		t.Fatalf("export = %q, want the stored wall time in the original zone", export)
+	if !strings.Contains(export, "DUE:20261112T123000Z") {
+		t.Fatalf("export = %q, want the stored instant in UTC", export)
 	}
 	if !strings.Contains(export, "SUMMARY:Interview") {
 		t.Fatalf("export = %q", export)

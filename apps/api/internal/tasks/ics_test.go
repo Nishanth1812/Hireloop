@@ -47,9 +47,7 @@ func TestExportIcsDateOnlyHonorsPrecision(t *testing.T) {
 	}
 }
 
-func TestExportIcsInstantUsesOriginalZone(t *testing.T) {
-	// 12:30 UTC is 18:00 in Asia/Kolkata (UTC+5:30); the export must keep the
-	// stored wall time and the original zone.
+func TestExportIcsInstantPreservesUTCInstant(t *testing.T) {
 	task := icsFixtureTask()
 	task.DuePrecision = PrecisionInstant
 	task.DueDate = ""
@@ -60,11 +58,25 @@ func TestExportIcsInstantUsesOriginalZone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExportIcs: %v", err)
 	}
-	if got := icsLine(t, export, "DUE"); got != "DUE;TZID=Asia/Kolkata:20261112T1800" {
-		t.Fatalf("DUE line = %q, want DUE;TZID=Asia/Kolkata:20261112T1800", got)
+	if got := icsLine(t, export, "DUE"); got != "DUE:20261112T123000Z" {
+		t.Fatalf("DUE line = %q, want DUE:20261112T123000Z", got)
 	}
 	if strings.Contains(export, "STATUS:COMPLETED") {
 		t.Fatalf("open task exported as completed: %q", export)
+	}
+}
+
+func TestExportIcsPreservesSecondOccurrenceDuringOverlap(t *testing.T) {
+	task := icsFixtureTask()
+	task.DuePrecision, task.DueDate = PrecisionInstant, ""
+	task.DueAt, task.TimeZone = "2026-11-01T06:30:00Z", "America/New_York"
+	export, err := ExportIcs(task)
+	if err != nil || icsLine(t, export, "DUE") != "DUE:20261101T063000Z" {
+		t.Fatalf("overlap export = %q, err = %v", export, err)
+	}
+	task.DueAt = "2026-11-01T06:30:00.123456Z"
+	if _, err := ExportIcs(task); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("fractional instant error = %v, want ErrInvalid", err)
 	}
 }
 
@@ -79,8 +91,8 @@ func TestExportIcsInstantInUTCZone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExportIcs: %v", err)
 	}
-	if got := icsLine(t, export, "DUE"); got != "DUE;TZID=UTC:20261112T1800" {
-		t.Fatalf("DUE line = %q, want DUE;TZID=UTC:20261112T1800", got)
+	if got := icsLine(t, export, "DUE"); got != "DUE:20261112T180000Z" {
+		t.Fatalf("DUE line = %q, want DUE:20261112T180000Z", got)
 	}
 }
 
@@ -176,6 +188,15 @@ func TestExportIcsEscapesTextValues(t *testing.T) {
 	}
 }
 
+func TestExportIcsRemovesInvalidControlCharacters(t *testing.T) {
+	task := icsFixtureTask()
+	task.Title = "Interview\x01\x7f now"
+	export, err := ExportIcs(task)
+	if err != nil || !strings.Contains(export, "SUMMARY:Interview now\r\n") {
+		t.Fatalf("export = %q, err = %v", export, err)
+	}
+}
+
 func TestExportIcsRejectsInvalidDeadlinesAndTasks(t *testing.T) {
 	base := func() Task {
 		task := icsFixtureTask()
@@ -190,29 +211,58 @@ func TestExportIcsRejectsInvalidDeadlinesAndTasks(t *testing.T) {
 		{"missing id", func() Task { t := base(); t.ID = ""; return t }()},
 		{"empty precision", func() Task { t := base(); t.DuePrecision = ""; return t }()},
 		{"date without a day", func() Task {
-			t := base(); t.DuePrecision = PrecisionDate; return t
+			t := base()
+			t.DuePrecision = PrecisionDate
+			return t
 		}()},
 		{"date with a time", func() Task {
-			t := base(); t.DuePrecision = PrecisionDate; t.DueDate = "2026-11-12"; t.DueAt = "2026-11-12T18:00:00Z"; return t
+			t := base()
+			t.DuePrecision = PrecisionDate
+			t.DueDate = "2026-11-12"
+			t.DueAt = "2026-11-12T18:00:00Z"
+			return t
 		}()},
 		{"date with a zone", func() Task {
-			t := base(); t.DuePrecision = PrecisionDate; t.DueDate = "2026-11-12"; t.TimeZone = "Asia/Kolkata"; return t
+			t := base()
+			t.DuePrecision = PrecisionDate
+			t.DueDate = "2026-11-12"
+			t.TimeZone = "Asia/Kolkata"
+			return t
 		}()},
 		{"date without the day of month", func() Task {
-			t := base(); t.DuePrecision = PrecisionDate; t.DueDate = "2026-11"; return t
+			t := base()
+			t.DuePrecision = PrecisionDate
+			t.DueDate = "2026-11"
+			return t
 		}()},
 		{"none with a day", func() Task { t := base(); t.DuePrecision = PrecisionNone; t.DueDate = "2026-11-12"; return t }()},
 		{"instant without wall time", func() Task {
-			t := base(); t.DuePrecision = PrecisionInstant; t.DueLocal = "2026-11-12T18:00"; t.TimeZone = "Asia/Kolkata"; return t
+			t := base()
+			t.DuePrecision = PrecisionInstant
+			t.DueLocal = "2026-11-12T18:00"
+			t.TimeZone = "Asia/Kolkata"
+			return t
 		}()},
 		{"instant without a zone", func() Task {
-			t := base(); t.DuePrecision = PrecisionInstant; t.DueLocal = "2026-11-12T18:00"; return t
+			t := base()
+			t.DuePrecision = PrecisionInstant
+			t.DueLocal = "2026-11-12T18:00"
+			return t
 		}()},
 		{"instant with an unknown zone", func() Task {
-			t := base(); t.DuePrecision = PrecisionInstant; t.DueLocal = "2026-11-12T18:00"; t.TimeZone = "Not/AZone"; return t
+			t := base()
+			t.DuePrecision = PrecisionInstant
+			t.DueLocal = "2026-11-12T18:00"
+			t.TimeZone = "Not/AZone"
+			return t
 		}()},
 		{"instant with a day as well", func() Task {
-			t := base(); t.DuePrecision = PrecisionInstant; t.DueLocal = "2026-11-12T18:00"; t.TimeZone = "Asia/Kolkata"; t.DueDate = "2026-11-12"; return t
+			t := base()
+			t.DuePrecision = PrecisionInstant
+			t.DueLocal = "2026-11-12T18:00"
+			t.TimeZone = "Asia/Kolkata"
+			t.DueDate = "2026-11-12"
+			return t
 		}()},
 		{"invalid status", func() Task { t := base(); t.Status = "bogus"; return t }()},
 	}

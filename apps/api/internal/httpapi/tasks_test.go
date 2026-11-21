@@ -65,8 +65,7 @@ func (s *fakeTaskStore) Create(_ context.Context, owner string, input tasks.Inpu
 		wall, err := time.Parse("2006-01-02T15:04", task.DueLocal)
 		if err == nil {
 			if loc, err := time.LoadLocation(task.TimeZone); err == nil {
-				if candidate := time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, loc);
-					candidate.In(loc).Format("2006-01-02T15:04") == wall.Format("2006-01-02T15:04") {
+				if candidate := time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, loc); candidate.In(loc).Format("2006-01-02T15:04") == wall.Format("2006-01-02T15:04") {
 					task.DueAt = candidate.UTC().Format(time.RFC3339)
 				}
 			}
@@ -355,8 +354,8 @@ func TestTaskIcsExportIsOwnerScopedAndWellFormed(t *testing.T) {
 	if !strings.Contains(body, "BEGIN:VCALENDAR\r\n") || !strings.HasSuffix(body, "END:VCALENDAR\r\n") {
 		t.Fatalf("export is not a calendar: %q", body)
 	}
-	if !strings.Contains(body, "DUE;TZID=Asia/Kolkata:20261112T1800") {
-		t.Fatalf("export = %q, want the stored wall time in the original zone", body)
+	if !strings.Contains(body, "DUE:20261112T123000Z") {
+		t.Fatalf("export = %q, want the stored instant in UTC", body)
 	}
 	if !strings.Contains(body, "SUMMARY:Interview") || !strings.Contains(body, "STATUS:NEEDS-ACTION") {
 		t.Fatalf("export = %q", body)
