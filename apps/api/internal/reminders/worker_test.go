@@ -47,9 +47,14 @@ func TestApplyOutcomeMapsDeliveryStates(t *testing.T) {
 	}
 }
 
-func TestNullDispatcherReportsFailure(t *testing.T) {
-	if got := (NullDispatcher{}).Send(nil, Notification{}); got != OutcomeFailed {
-		t.Fatalf("NullDispatcher = %q, want %q", got, OutcomeFailed)
+func TestWorkerWithoutDispatcherIsNotReady(t *testing.T) {
+	// A missing provider: the worker idles instead of leasing or
+	// exhausting jobs.
+	if (NewWorker(nil, Config{})).Ready() {
+		t.Fatal("worker without a dispatcher must not be ready")
+	}
+	if !(NewWorker(nil, Config{Dispatcher: &fakeDispatcher{}})).Ready() {
+		t.Fatal("worker with a dispatcher must be ready")
 	}
 }
 

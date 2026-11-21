@@ -15,6 +15,8 @@ package identities
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"strings"
 )
 
 // Mapper resolves a verified Clerk subject to a Supabase auth.users UUID.
@@ -40,4 +42,30 @@ func (m PostgresMapper) Resolve(ctx context.Context, clerkSubject string) (strin
 		return "", false, err
 	}
 	return id, true, nil
+}
+
+// ResolveOwnerSubject maps a Supabase owner id back to the Clerk subject
+// bound to it. When no binding exists the owner id is returned as-is: new
+// signups own their records by Clerk subject, so an unbound owner id is
+// itself a subject. Ownership is never guessed from email or any other
+// claim: a bound owner without a binding surfaces the owner id, and the
+// Clerk lookup downstream fails safely rather than guessing.
+func ResolveOwnerSubject(ctx context.Context, db *sql.DB, ownerID string) (string, error) {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" {
+		return "", errors.New("identities: owner id required")
+	}
+	var subject string
+	err := db.QueryRowContext(ctx,
+		`SELECT clerk_subject FROM public.user_identities WHERE supabase_user_id = $1`, ownerID).Scan(&subject)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ownerID, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(subject) == "" {
+		return "", errors.New("identities: bound clerk subject is empty")
+	}
+	return subject, nil
 }

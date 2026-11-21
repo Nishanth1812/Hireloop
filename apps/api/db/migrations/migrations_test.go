@@ -262,6 +262,37 @@ func TestUserNotificationSettingsMigrationIsAdditive(t *testing.T) {
 	}
 }
 
+// TestResendCorrelationMigrationIsAdditive pins the Resend-wiring schema:
+// versioned delivery evidence, the provider email mapping, and the event
+// ledger. The delivery-state check is extended, not dropped, and nothing
+// drops or deletes rows.
+func TestResendCorrelationMigrationIsAdditive(t *testing.T) {
+	applied := migrationStatements(t, 9)
+	for _, fragment := range []string{
+		"delivery_version int NOT NULL DEFAULT 0",
+		"CHECK (delivery_version >= 0)",
+		"ADD COLUMN provider_email_id text",
+		"ADD COLUMN provider_version int",
+		"'permanent_failed'",
+		"CREATE TABLE public.reminder_email_events",
+		"provider_event_id text PRIMARY KEY",
+		"ENABLE ROW LEVEL SECURITY",
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 009 is missing %q", fragment)
+		}
+	}
+	if !strings.Contains(applied, "'permanent_failed'") {
+		t.Error("migration 009 must add the permanent_failed delivery state")
+	}
+	if strings.Contains(applied, "DROP TABLE") || strings.Contains(applied, "DELETE FROM") {
+		t.Error("migration 009 must not remove or rewrite existing data")
+	}
+	if !strings.Contains(rawMigration(t, 9), "Rollback:") {
+		t.Error("migration 009 must document how to reverse it")
+	}
+}
+
 func TestApplyIsIdempotentAgainstConfiguredDatabase(t *testing.T) {
 	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
 	if databaseURL == "" {

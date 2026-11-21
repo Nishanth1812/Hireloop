@@ -65,6 +65,8 @@ func registerCleanup(t *testing.T, db *sql.DB, owner string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		for _, stmt := range []string{
+			`DELETE FROM reminder_email_events WHERE job_id IN (SELECT id FROM reminder_jobs WHERE user_id = $1)`,
+			`DELETE FROM reminder_email_events WHERE provider_email_id IN (SELECT provider_email_id FROM reminder_jobs WHERE user_id = $1) AND job_id IS NULL`,
 			`DELETE FROM reminder_jobs WHERE user_id = $1`,
 			`DELETE FROM tasks WHERE user_id = $1`,
 			`DELETE FROM applications WHERE user_id = $1`,
@@ -524,7 +526,7 @@ func TestRecordCallbackDeduplicatesAndApplies(t *testing.T) {
 	jobID := jobIDForTask(ctx, t, db, taskID)
 	w := NewWorker(store, Config{Scope: []string{owner}, MaxRetries: 3})
 
-	applied, err := w.RecordCallback(ctx, owner, jobID, "cb-1", OutcomeDelivered)
+	applied, err := w.RecordCallback(ctx, owner, jobID, OutcomeDelivered)
 	if err != nil || !applied {
 		t.Fatalf("first callback = %v, %v", applied, err)
 	}
@@ -532,31 +534,31 @@ func TestRecordCallbackDeduplicatesAndApplies(t *testing.T) {
 	if err != nil || job.DeliveryState != StateDelivered {
 		t.Fatalf("job = %+v, %v", job, err)
 	}
-	// The same callback key is deduplicated and changes nothing.
-	if applied, err := w.RecordCallback(ctx, owner, jobID, "cb-1", OutcomeDelivered); err != nil || applied {
+	// A repeated callback changes nothing: the transition is not strictly
+	// stronger than the recorded state.
+	if applied, err := w.RecordCallback(ctx, owner, jobID, OutcomeDelivered); err != nil || applied {
 		t.Fatalf("repeated callback = %v, %v", applied, err)
 	}
-	// Callbacks for terminal jobs are ignored, whatever the key.
-	if applied, err := w.RecordCallback(ctx, owner, jobID, "cb-2", OutcomeDelivered); err != nil || applied {
+	// Callbacks for terminal jobs are ignored, whatever the outcome.
+	if applied, err := w.RecordCallback(ctx, owner, jobID, OutcomeFailed); err != nil || applied {
 		t.Fatalf("callback on terminal job = %v, %v", applied, err)
 	}
 	// Another owner's callback for the same notification id is not found.
-	if applied, err := w.RecordCallback(ctx, ownerB, jobID, "cb-x", OutcomeDelivered); err != nil || applied {
+	if applied, err := w.RecordCallback(ctx, ownerB, jobID, OutcomeDelivered); err != nil || applied {
 		t.Fatalf("callback with another owner = %v, %v", applied, err)
 	}
 
-	// A callback on a non-terminal job applies the retry transition and
-	// records the key so repeats are deduplicated.
+	// A callback on a non-terminal job applies the retry transition.
 	taskID2 := seedInstantTask(ctx, t, db, owner, past)
 	if err := store.Schedule(ctx, db, owner, taskID2, past); err != nil {
 		t.Fatal(err)
 	}
 	jobID2 := jobIDForTask(ctx, t, db, taskID2)
-	if applied, err := w.RecordCallback(ctx, owner, jobID2, "cb-3", OutcomeFailed); err != nil || !applied {
+	if applied, err := w.RecordCallback(ctx, owner, jobID2, OutcomeFailed); err != nil || !applied {
 		t.Fatalf("callback on scheduled job = %v, %v", applied, err)
 	}
 	job2, err := store.Get(ctx, owner, jobID2)
-	if err != nil || job2.DeliveryState != StateFailed || job2.RetryAt == nil || job2.CallbackKey != "cb-3" {
+	if err != nil || job2.DeliveryState != StateFailed || job2.RetryAt == nil {
 		t.Fatalf("job2 = %+v, %v", job2, err)
 	}
 }

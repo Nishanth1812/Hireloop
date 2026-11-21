@@ -48,9 +48,9 @@ type Config struct {
 
 func NewWorker(store *Store, cfg Config) *Worker {
 	cfg.normalize()
-	dispatcher := cfg.Dispatcher
-	if dispatcher == nil {
-		dispatcher = NullDispatcher{}
+	var dispatcher Dispatcher
+	if cfg.Dispatcher != nil {
+		dispatcher = cfg.Dispatcher
 	}
 	now := cfg.Now
 	if now == nil {
@@ -58,6 +58,11 @@ func NewWorker(store *Store, cfg Config) *Worker {
 	}
 	return &Worker{store: store, dispatcher: dispatcher, cfg: cfg, now: now}
 }
+
+// Ready reports whether the worker has a delivery adapter. With no provider
+// configured it idles instead of claiming jobs: a missing provider never
+// leases, dispatches or exhausts work.
+func (w *Worker) Ready() bool { return w.dispatcher != nil }
 
 func (c *Config) normalize() {
 	if c.PollInterval <= 0 {
@@ -105,6 +110,9 @@ func (w *Worker) Run(ctx context.Context) error {
 // The re-read in dispatchOne means suppression that lands between the claim
 // and the dispatch takes effect.
 func (w *Worker) poll(ctx context.Context, limit int) (int, error) {
+	if !w.Ready() {
+		return 0, nil
+	}
 	now := w.now()
 	jobs, err := w.store.ClaimDue(ctx, now, limit, rand.Text(), now.Add(w.cfg.LeaseTTL), w.cfg.Scope)
 	if err != nil {
@@ -155,16 +163,18 @@ func (w *Worker) dispatchOne(ctx context.Context, job Job) error {
 		})
 	}
 	outcome := w.dispatcher.Send(ctx, Notification{
-		ID: current.ID, UserID: current.UserID, TaskID: current.TaskID, DueAt: current.DueAt, Title: title,
+		ID: current.ID, UserID: current.UserID, TaskID: current.TaskID, DueAt: current.DueAt,
+		Title: title, Version: current.DeliveryVersion,
 	})
 	return w.store.RecordDelivery(ctx, current.ID, current.LeaseToken, w.applyOutcome(current, outcome))
 }
 
-// RecordCallback applies an asynchronous provider callback to a job and
-// reports whether the callback was new (applied). Repeated callbacks with the
-// same callback_key are deduplicated and ignored; so are callbacks for
-// terminal jobs.
-func (w *Worker) RecordCallback(ctx context.Context, userID, notificationID, callbackKey string, outcome Outcome) (bool, error) {
+// RecordCallback applies an asynchronous provider callback to the job and
+// reports whether it was applied. The store deduplicates replays by the
+// provider event id, correlates by the job's current provider email id, and
+// applies only strictly stronger transitions, so old callbacks cannot
+// overwrite rescheduled or terminal jobs.
+func (w *Worker) RecordCallback(ctx context.Context, userID, notificationID string, outcome Outcome) (bool, error) {
 	job, err := w.store.Get(ctx, userID, notificationID)
 	if errors.Is(err, ErrNotFound) {
 		return false, nil
@@ -172,16 +182,13 @@ func (w *Worker) RecordCallback(ctx context.Context, userID, notificationID, cal
 	if err != nil {
 		return false, err
 	}
-	switch job.DeliveryState {
-	case StateDelivered, StateExhausted, StateSuppressed:
-		return false, nil
-	}
-	return w.store.RecordCallback(ctx, job.ID, callbackKey, w.applyOutcome(job, outcome))
+	return w.store.RecordCallback(ctx, job.ID, job.ProviderEmailID, w.applyOutcome(job, outcome))
 }
 
 // applyOutcome maps a dispatcher outcome to an atomic transition: only a
-// confirming adapter sets 'delivered' or 'accepted'; failures and ambiguous
-// timeouts schedule retries.
+// confirming adapter sets 'delivered' or 'accepted'; failures, ambiguous
+// timeouts and permanent provider errors schedule retries or move the job to
+// the terminal state.
 func (w *Worker) applyOutcome(job Job, outcome Outcome) Transition {
 	now := w.now()
 	switch outcome {
@@ -192,6 +199,8 @@ func (w *Worker) applyOutcome(job Job, outcome Outcome) Transition {
 	case OutcomeUncertain:
 		return w.retryTransition(job, now, StateUncertain,
 			"dispatch timed out or returned an ambiguous result; delivery may or may not have happened")
+	case OutcomePermanent:
+		return Transition{State: StatePermanentFailed, Note: "permanent provider failure; not retried"}
 	default:
 		return w.retryTransition(job, now, StateFailed, "dispatch failed")
 	}
