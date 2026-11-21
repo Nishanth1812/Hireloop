@@ -257,6 +257,10 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 	// Task routes. The owner always comes from the verified session; a body
 	// field or a guessed id can only ever narrow to that owner's rows.
 	taskFailure := func(w http.ResponseWriter, err error) {
+		if errors.Is(err, tasks.ErrInvalid) {
+			http.Error(w, "invalid task", http.StatusBadRequest)
+			return
+		}
 		if errors.Is(err, tasks.ErrNotFound) {
 			http.Error(w, "task not found", http.StatusNotFound)
 			return

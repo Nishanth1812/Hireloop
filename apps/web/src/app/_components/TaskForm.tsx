@@ -47,7 +47,7 @@ export function TaskForm({ application, task, applications, saving, onSave, onCa
         {precision === "date" && (
           <>
             <label htmlFor="task-due-date">Due date</label>
-            <input id="task-due-date" name="due_date" type="date" defaultValue={task?.due_date} />
+            <input id="task-due-date" name="due_date" type="date" defaultValue={task?.due_date} required />
             <p className="field-hint">A date-only deadline never implies a time or a time zone.</p>
           </>
         )}
