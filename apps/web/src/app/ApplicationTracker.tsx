@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { useSession } from "@clerk/nextjs";
 import {
@@ -92,6 +92,8 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   const [notificationSaving, setNotificationSaving] = useState(false);
   const [notificationError, setNotificationError] = useState("");
   const [notificationNotice, setNotificationNotice] = useState("");
+  const notificationRevision = useRef(0);
+  const notificationWrite = useRef(false);
 
   async function sessionToken(): Promise<string> {
     const token = await session?.getToken();
@@ -180,19 +182,18 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   useEffect(() => {
     if (!session) return;
     let cancelled = false;
+    const revision = notificationRevision.current;
     void (async () => {
       setNotificationLoading(true);
-      setNotificationError("");
-      setNotificationNotice("");
       try {
         const token = await session.getToken();
         if (cancelled) return;
         if (!token) throw new Error("Your session is unavailable. Please sign in again.");
         const next = await getNotificationSettings(token);
-        if (cancelled) return;
+        if (cancelled || revision !== notificationRevision.current) return;
         setNotificationEnabled(next.reminders_enabled);
       } catch (caught) {
-        if (!cancelled) {
+        if (!cancelled && revision === notificationRevision.current) {
           // A failure must not leave an earlier or assumed value on screen.
           setNotificationEnabled(null);
           setNotificationError(messageFrom(caught));
@@ -207,11 +208,9 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   }, [session]);
 
   async function changeNotificationSetting(enabled: boolean) {
-    if (!session) return;
-    // Guard against same-session GET/PATCH race: do not send a PATCH while the
-    // initial GET is still in flight. The checkbox is disabled during loading,
-    // but this provides a second line of defense.
-    if (notificationLoading) return;
+    if (!session || notificationLoading || notificationWrite.current) return;
+    notificationWrite.current = true;
+    notificationRevision.current++;
     setNotificationSaving(true);
     setNotificationError("");
     setNotificationNotice("");
@@ -225,6 +224,8 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     } catch (caught) {
       setNotificationError(messageFrom(caught));
     } finally {
+      notificationRevision.current++;
+      notificationWrite.current = false;
       setNotificationSaving(false);
     }
   }

@@ -774,6 +774,29 @@ test("a write in flight keeps the confirmed value until the response arrives", a
   expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("false");
 });
 
+test("a same-session refresh cannot overwrite a completed preference write", async () => {
+  let completePatch;
+  let completeRefresh;
+  let reads = 0;
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/notification-settings") {
+      if (options.method === "PATCH") return new Promise((resolve) => { completePatch = resolve; });
+      if (++reads === 1) return Response.json({ reminders_enabled: true });
+      return new Promise((resolve) => { completeRefresh = resolve; });
+    }
+    if (url === "/api/tasks") return taskResponse();
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onNotificationChange(false); });
+  session = account("a");
+  await render();
+  await act(async () => { completePatch(Response.json({ reminders_enabled: false })); });
+  await act(async () => { completeRefresh(Response.json({ reminders_enabled: true })); });
+  expect(container.querySelector('[data-testid="notifications"]').textContent).toBe("false");
+});
+
 test("a rejected write keeps the confirmed value and surfaces the error", async () => {
   globalThis.fetch = async (url, options) => {
     if (url === "/api/notification-settings") {
