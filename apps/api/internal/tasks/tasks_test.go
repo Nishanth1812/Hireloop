@@ -1,6 +1,8 @@
 package tasks
 
 import (
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -58,32 +60,63 @@ func TestInstantResolutionUsesOriginalZone(t *testing.T) {
 	}
 }
 
-func TestInstantResolutionHandlesDaylightSavingBoundaries(t *testing.T) {
-	// A local time inside the spring-forward gap does not exist. Reject it
-	// rather than silently storing and showing a different clock time.
-	spring := Input{ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
-		DueLocal: "2026-03-08T02:30", TimeZone: "America/New_York"}
-	if spring.Valid() {
-		t.Fatal("a nonexistent spring-forward wall time must be rejected")
+func TestInstantResolutionRejectsGapsAndAmbiguousWallTimes(t *testing.T) {
+	// Gaps never happened, and overlaps happened twice. Neither may be silently
+	// resolved to an instant the user never chose. Non-hour shifts matter too:
+	// Lord Howe's fall-back is 30 minutes, not an hour.
+	for _, tc := range []struct{ name, local, zone string }{
+		{"one-hour gap", "2026-03-08T02:30", "America/New_York"},
+		{"one-hour overlap", "2026-11-01T01:30", "America/New_York"},
+		{"half-hour gap", "2026-10-04T02:15", "Australia/Lord_Howe"},
+		{"half-hour overlap", "2026-04-05T01:45", "Australia/Lord_Howe"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := Input{ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
+				DueLocal: tc.local, TimeZone: tc.zone}
+			if in.Valid() {
+				t.Fatalf("%s %s must be rejected", tc.local, tc.zone)
+			}
+			if _, _, ok := in.resolve(); ok {
+				t.Fatalf("%s %s resolved despite being invalid", tc.local, tc.zone)
+			}
+		})
 	}
+}
 
-	// An ambiguous local time (fall back) resolves to one real instant in the
-	// zone, and rendering keeps that exact wall time with its own offset.
-	fall := Input{ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
-		DueLocal: "2026-11-01T01:30", TimeZone: "America/New_York"}
-	_, fallDeadline, ok := fall.resolve()
-	if !ok {
-		t.Fatal("fall-back wall time should resolve, not error")
+func TestInstantResolutionKeepsValidUnambiguousTimesIncludingNonHourZones(t *testing.T) {
+	for _, tc := range []struct{ local, zone, utc string }{
+		{"2026-11-01T00:30", "America/New_York", "2026-11-01T04:30:00Z"},
+		{"2026-11-01T02:30", "America/New_York", "2026-11-01T07:30:00Z"},
+		{"2026-04-05T01:15", "Australia/Lord_Howe", "2026-04-04T14:15:00Z"},
+		{"2026-11-12T18:00", "Asia/Kolkata", "2026-11-12T12:30:00Z"},
+		{"2026-11-12T18:00", "UTC", "2026-11-12T18:00:00Z"},
+	} {
+		t.Run(tc.local+" "+tc.zone, func(t *testing.T) {
+			in := Input{ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
+				DueLocal: tc.local, TimeZone: tc.zone}
+			_, deadline, ok := in.resolve()
+			if !ok {
+				t.Fatal("valid wall time was rejected")
+			}
+			instant := deadline.instant.(time.Time)
+			if !instant.Equal(mustParseUTC(t, tc.utc)) {
+				t.Fatalf("resolved %v, want %s", instant, tc.utc)
+			}
+			utc, local := renderInstant(instant, tc.zone)
+			if utc != tc.utc || local != tc.local {
+				t.Fatalf("rendered %q / %q, want %q / %q", utc, local, tc.utc, tc.local)
+			}
+		})
 	}
-	fallInstant := fallDeadline.instant.(time.Time)
-	if fallInstant.Equal(time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC)) == false &&
-		fallInstant.Equal(time.Date(2026, 11, 1, 6, 30, 0, 0, time.UTC)) == false {
-		t.Fatalf("fall-back instant = %v, want one of the two real 01:30 instants", fallInstant)
+}
+
+func mustParseUTC(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		t.Fatal(err)
 	}
-	utc, local := renderInstant(fallInstant, fall.TimeZone)
-	if utc != fallInstant.Format(time.RFC3339) || local != "2026-11-01T01:30" {
-		t.Fatalf("fall-back render = %q / %q", utc, local)
-	}
+	return parsed
 }
 
 func TestDateOnlyHasNoInstantOrZone(t *testing.T) {
@@ -118,6 +151,93 @@ func TestPatchInputValid(t *testing.T) {
 	}
 	if title := (PatchInput{Title: ptr("  New title  ")}); title.Valid() && *title.Title != "New title" {
 		t.Fatalf("patch values are not trimmed: %q", *title.Title)
+	}
+}
+
+// A cursor is a position in the four-column sort key. These checks pin the
+// bounds and the filter binding without a database.
+func TestParseQueryIsBoundedAndRejectsUnknownInput(t *testing.T) {
+	for name, raw := range map[string]string{
+		"unknown parameter":  "?status=open",
+		"empty filter":       "?filter=",
+		"bad filter":         "?filter=today",
+		"empty cursor":       "?cursor=",
+		"bad cursor":         "?cursor=not-a-token",
+		"zero page size":     "?page_size=0",
+		"negative page size": "?page_size=-1",
+		"oversized page":     "?page_size=51",
+		"numeric garbage":    "?page_size=many",
+	} {
+		t.Run(name, func(t *testing.T) {
+			values, err := url.ParseQuery(strings.TrimPrefix(raw, "?"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ParseQuery(values); err == nil {
+				t.Fatalf("%s was accepted", raw)
+			}
+		})
+	}
+	for raw, want := range map[string]struct {
+		size    int
+		showAll bool
+	}{
+		"":                         {DefaultPageSize, false},
+		"?filter=open":             {DefaultPageSize, false},
+		"?filter=all":              {DefaultPageSize, true},
+		"?page_size=1":             {1, false},
+		"?page_size=50&filter=all": {MaxPageSize, true},
+	} {
+		values, err := url.ParseQuery(strings.TrimPrefix(raw, "?"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		filter, err := ParseQuery(values)
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		if filter.PageSize != want.size || filter.ShowAll != want.showAll || filter.After != nil {
+			t.Fatalf("%s = %+v", raw, filter)
+		}
+	}
+}
+
+func TestCursorCarriesEveryTieBreakAndIsFilterBound(t *testing.T) {
+	filter := Filter{PageSize: 2}
+	created := time.Date(2026, 11, 1, 9, 0, 0, 123456789, time.UTC)
+	id := "33333333-3333-4333-8333-333333333333"
+	token := EncodeCursor(filter, "2026-12-01", "2026-12-01T09:00:00.123456789Z", created, id)
+
+	values, err := url.ParseQuery("page_size=2&cursor=" + url.QueryEscape(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseQuery(values)
+	if err != nil {
+		t.Fatalf("valid cursor rejected: %v", err)
+	}
+	if parsed.After == nil || parsed.After.Day != "2026-12-01" || parsed.After.At != "2026-12-01T09:00:00.123456789Z" ||
+		!parsed.After.CreatedAt.Equal(created) || parsed.After.ID != id || parsed.PageSize != 2 {
+		t.Fatalf("decoded cursor = %+v / %+v", parsed, *parsed.After)
+	}
+	// The same token is a different view when showAll changes.
+	allValues, err := url.ParseQuery("filter=all&cursor=" + url.QueryEscape(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseQuery(allValues); err == nil {
+		t.Fatal("cursor minted for open tasks was accepted for filter=all")
+	}
+
+	// The no-deadline and no-instant sentinels survive an exact round trip.
+	sentinel := EncodeCursor(Filter{ShowAll: true}, noDeadlineDay, noInstantAt, created, id)
+	sentinelValues, err := url.ParseQuery("filter=all&cursor=" + url.QueryEscape(sentinel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromSentinel, err := ParseQuery(sentinelValues)
+	if err != nil || fromSentinel.After == nil || fromSentinel.After.Day != noDeadlineDay || fromSentinel.After.At != noInstantAt {
+		t.Fatalf("sentinel cursor = %+v, err = %v", fromSentinel, err)
 	}
 }
 

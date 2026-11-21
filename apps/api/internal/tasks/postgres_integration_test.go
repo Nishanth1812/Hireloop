@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
@@ -135,14 +136,14 @@ func TestPostgresTaskDeadlinePrecisionRoundTrip(t *testing.T) {
 		t.Fatalf("cancel task: %+v, err = %v", cancelled, err)
 	}
 	open, err := store.List(ctx, owner, Filter{})
-	if err != nil || len(open) != 0 {
+	if err != nil || len(open.Items) != 0 || open.Total != 0 {
 		t.Fatalf("open actions after completion = %+v, err = %v", open, err)
 	}
 	all, err := store.List(ctx, owner, Filter{ShowAll: true})
-	if err != nil || len(all) != 2 {
+	if err != nil || len(all.Items) != 2 || all.Total != 2 {
 		t.Fatalf("all tasks after completion = %+v, err = %v", all, err)
 	}
-	for _, task := range all {
+	for _, task := range all.Items {
 		if task.Status == StatusOpen {
 			t.Fatalf("finished task still open after reload: %+v", task)
 		}
@@ -213,7 +214,7 @@ func TestPostgresTasksAreOwnerScoped(t *testing.T) {
 		t.Fatalf("B linking A's application: err = %v, want not found", err)
 	}
 	listB, err := store.List(ctx, ownerB, Filter{ShowAll: true})
-	if err != nil || len(listB) != 0 {
+	if err != nil || len(listB.Items) != 0 || listB.Total != 0 {
 		t.Fatalf("B list = %+v, err = %v", listB, err)
 	}
 	// A's row is unchanged by every attempt above.
@@ -253,13 +254,191 @@ func TestPostgresTaskListOrdersSoonestDeadlineFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{soon.ID, late.ID, noDeadline.ID}
-	if len(list) != len(want) {
-		t.Fatalf("list length = %d, want %d", len(list), len(want))
+	if len(list.Items) != len(want) {
+		t.Fatalf("list length = %d, want %d", len(list.Items), len(want))
 	}
 	for i := range want {
-		if list[i].ID != want[i] {
-			t.Fatalf("order[%d] = %s (%s), want %s", i, list[i].ID, list[i].Title, want[i])
+		if list.Items[i].ID != want[i] {
+			t.Fatalf("order[%d] = %s (%s), want %s", i, list.Items[i].ID, list.Items[i].Title, want[i])
 		}
+	}
+}
+
+// walkPages follows next_cursor to the end, refusing to loop forever if a
+// broken cursor ever repeated a position.
+func walkPages(t *testing.T, store PostgresStore, ctx context.Context, owner string, filter Filter) ([]Task, ListResult) {
+	t.Helper()
+	seen := map[string]bool{}
+	all := []Task{}
+	last := ListResult{}
+	var err error
+	for page := 0; page < 100; page++ {
+		last, err = store.List(ctx, owner, filter)
+		if err != nil {
+			t.Fatalf("list page %d: %v", page, err)
+		}
+		if len(last.Items) > last.PageSize {
+			t.Fatalf("page %d returned %d rows, more than page_size %d", page, len(last.Items), last.PageSize)
+		}
+		for _, task := range last.Items {
+			if seen[task.ID] {
+				t.Fatalf("page %d repeated task %s", page, task.ID)
+			}
+			seen[task.ID] = true
+			all = append(all, task)
+		}
+		if last.NextCursor == "" {
+			return all, last
+		}
+		cursor, err := filter.decodeCursor(last.NextCursor)
+		if err != nil {
+			t.Fatalf("decode cursor: %v", err)
+		}
+		filter.After = &cursor
+	}
+	t.Fatal("pagination did not terminate")
+	return nil, ListResult{}
+}
+
+func TestPostgresTaskListIsBoundedAndContinues(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appID := seedApplication(ctx, t, db, owner)
+
+	want := []string{}
+	for i := 0; i < 5; i++ {
+		task, err := store.Create(ctx, owner, Input{
+			ApplicationID: appID, Title: fmt.Sprintf("Task %d", i),
+			DuePrecision: PrecisionDate, DueDate: fmt.Sprintf("2026-12-%02d", i+1),
+		})
+		if err != nil {
+			t.Fatalf("create task %d: %v", i, err)
+		}
+		want = append(want, task.ID)
+	}
+	filter := Filter{PageSize: 2}
+	items, last := walkPages(t, store, ctx, owner, filter)
+	if last.Total != 5 || len(items) != 5 {
+		t.Fatalf("walked %d of %d tasks", len(items), last.Total)
+	}
+	for i := range want {
+		if items[i].ID != want[i] {
+			t.Fatalf("walked order[%d] = %s, want %s", i, items[i].ID, want[i])
+		}
+	}
+	// A cursor past the last row is an empty page with no continuation.
+	filter.After = &Cursor{Day: "2026-12-05", At: noInstantAt,
+		CreatedAt: time.Date(2026, 12, 5, 0, 0, 0, 0, time.UTC), ID: "ffffffff-ffff-4fff-8fff-ffffffffffff"}
+	past, err := store.List(ctx, owner, filter)
+	if err != nil || len(past.Items) != 0 || past.NextCursor != "" || past.Total != 5 {
+		t.Fatalf("past-last page = %+v, err = %v", past, err)
+	}
+}
+
+func TestPostgresTaskListTiesAreDeterministicAcrossPages(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appID := seedApplication(ctx, t, db, owner)
+
+	// Identical deadline day and created_at leave id as the only tie-break.
+	// Inserting under the random test owner never touches another account.
+	fixed := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	want := []string{}
+	for i := 0; i < 5; i++ {
+		var id string
+		err := db.QueryRowContext(ctx, `INSERT INTO tasks
+			(user_id, application_id, title, due_precision, due_date, created_at)
+			VALUES ($1, $2, $3, 'date', '2026-12-01', $4) RETURNING id`,
+			owner, appID, fmt.Sprintf("Tie %d", i), fixed).Scan(&id)
+		if err != nil {
+			t.Fatalf("seed tied task: %v", err)
+		}
+		want = append(want, id)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(want)))
+	items, last := walkPages(t, store, ctx, owner, Filter{PageSize: 2})
+	if last.Total != 5 || len(items) != 5 {
+		t.Fatalf("walked %d of %d tied tasks", len(items), last.Total)
+	}
+	for i := range want {
+		if items[i].ID != want[i] {
+			t.Fatalf("tie order[%d] = %s, want %s", i, items[i].ID, want[i])
+		}
+	}
+}
+
+func TestPostgresTaskListOwnerIsolationAcrossPages(t *testing.T) {
+	store, db, ownerA := openIntegrationStore(t)
+	ownerB := randomOwner(t)
+	cleanupOwner(t, db, ownerB)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appA := seedApplication(ctx, t, db, ownerA)
+	appB := seedApplication(ctx, t, db, ownerB)
+
+	var bID string
+	if err := db.QueryRowContext(ctx, `INSERT INTO tasks
+		(user_id, application_id, title, due_precision, due_date)
+		VALUES ($1, $2, 'B secret', 'date', '2026-01-01') RETURNING id`, ownerB, appB).Scan(&bID); err != nil {
+		t.Fatalf("seed B task: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := store.Create(ctx, ownerA, Input{
+			ApplicationID: appA, Title: fmt.Sprintf("A %d", i),
+			DuePrecision: PrecisionDate, DueDate: fmt.Sprintf("2026-12-%02d", i+1),
+		}); err != nil {
+			t.Fatalf("seed A task: %v", err)
+		}
+	}
+	items, last := walkPages(t, store, ctx, ownerA, Filter{PageSize: 2})
+	if len(items) != 5 || last.Total != 5 {
+		t.Fatalf("A walked %d of %d", len(items), last.Total)
+	}
+	for _, task := range items {
+		if task.ID == bID {
+			t.Fatal("A's pages leaked B's task")
+		}
+	}
+	onlyB, err := store.List(ctx, ownerB, Filter{ShowAll: true, PageSize: 2})
+	if err != nil || len(onlyB.Items) != 1 || onlyB.Total != 1 || onlyB.NextCursor != "" {
+		t.Fatalf("B list = %+v, err = %v", onlyB, err)
+	}
+	if onlyB.Items[0].ID != bID {
+		t.Fatal("B's list did not return B's own task")
+	}
+}
+
+func TestPostgresTaskCreateRejectsAmbiguousLocalTimes(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appID := seedApplication(ctx, t, db, owner)
+
+	for _, tc := range []struct{ name, local, zone string }{
+		{"one-hour overlap", "2026-11-01T01:30", "America/New_York"},
+		{"half-hour overlap", "2026-04-05T01:45", "Australia/Lord_Howe"},
+		{"one-hour gap", "2026-03-08T02:30", "America/New_York"},
+		{"half-hour gap", "2026-10-04T02:15", "Australia/Lord_Howe"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := store.Create(ctx, owner, Input{
+				ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
+				DueLocal: tc.local, TimeZone: tc.zone,
+			})
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("%s %s: err = %v, want ErrInvalid", tc.local, tc.zone, err)
+			}
+		})
+	}
+	// A valid unambiguous instant in a non-hour-shift zone still round-trips.
+	valid, err := store.Create(ctx, owner, Input{
+		ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
+		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+	})
+	if err != nil || valid.DueAt != "2026-11-12T12:30:00Z" || valid.DueLocal != "2026-11-12T18:00" {
+		t.Fatalf("valid instant = %+v, err = %v", valid, err)
 	}
 }
 

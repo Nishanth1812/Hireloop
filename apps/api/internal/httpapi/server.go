@@ -301,35 +301,32 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 			http.Error(w, "tasks unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		values := r.URL.Query()
-		for key := range values {
-			if key != "filter" {
-				http.Error(w, "invalid task query", http.StatusBadRequest)
-				return
-			}
-		}
-		filter := tasks.Filter{}
-		if values.Has("filter") && values.Get("filter") == "" {
+		filter, err := tasks.ParseQuery(r.URL.Query())
+		if err != nil {
 			http.Error(w, "invalid task query", http.StatusBadRequest)
 			return
 		}
-		switch values.Get("filter") {
-		case "", "open":
-		case "all":
-			filter.ShowAll = true
-		default:
-			http.Error(w, "invalid task query", http.StatusBadRequest)
-			return
-		}
-		items, err := taskStore.List(r.Context(), u.ID, filter)
+		result, err := taskStore.List(r.Context(), u.ID, filter)
 		if err != nil {
 			taskFailure(w, err)
 			return
 		}
+		items := result.Items
+		if items == nil {
+			items = []tasks.Task{}
+		}
+		var nextCursor *string
+		if result.NextCursor != "" {
+			cursor := result.NextCursor
+			nextCursor = &cursor
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(struct {
-			Items []tasks.Task `json:"items"`
-		}{Items: items})
+			Items      []tasks.Task `json:"items"`
+			PageSize   int          `json:"page_size"`
+			Total      int          `json:"total"`
+			NextCursor *string      `json:"next_cursor"`
+		}{Items: items, PageSize: result.PageSize, Total: result.Total, NextCursor: nextCursor})
 	})
 	mux.HandleFunc("GET /api/tasks/{id}", func(w http.ResponseWriter, r *http.Request) {
 		u, ok := authenticate(w, r)

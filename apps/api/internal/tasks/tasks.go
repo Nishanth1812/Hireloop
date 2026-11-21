@@ -1,10 +1,18 @@
 package tasks
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +33,27 @@ var ErrInvalid = errors.New("invalid task")
 const (
 	maxTitleLength    = 200
 	maxTimeZoneLength = 64
+)
+
+// List bounds. A task list is always a page: the UI must never receive an
+// unbounded feed and then quietly stop showing rows past a client-side cap.
+const (
+	DefaultPageSize = 25
+	MaxPageSize     = 50
+
+	QueryFilter     = "filter"
+	QueryCursor     = "cursor"
+	QueryPageSize   = "page_size"
+	maxCursorLength = 1024
+
+	FilterOpen = "open"
+	FilterAll  = "all"
+
+	// Keyset sentinel values. Postgres orders DATE 'infinity' after every real
+	// date and TIMESTAMPTZ '-infinity' before every real instant, matching the
+	// SQL view's NULLS LAST / NULLS FIRST ordering without a nullable tuple.
+	noDeadlineDay = "infinity"
+	noInstantAt   = "-infinity"
 )
 
 // Status values are the manual workflow's lifecycle: an action starts open and
@@ -84,15 +113,37 @@ type Task struct {
 	CreatedAt     string `json:"created_at"`
 }
 
-// Filter selects which lifecycle states a list returns. Only "all" widens the
-// default open-actions view.
+// Filter is a validated, bounded list query. ShowAll widens the default
+// open-actions view; PageSize and After describe one keyset page. ParseQuery
+// builds it from raw input, so callers never construct a cursor by hand.
 type Filter struct {
-	ShowAll bool
+	ShowAll  bool
+	PageSize int
+	After    *Cursor
+}
+
+// Cursor is a decoded keyset position: the complete sort key of the last row
+// on the previous page. All four parts are needed because several tasks can
+// share a deadline day, an instant, or a created_at; id makes the order total.
+type Cursor struct {
+	Day       string // YYYY-MM-DD, or "infinity" for a task with no deadline
+	At        string // RFC3339Nano UTC, or "-infinity" when due_at is NULL
+	CreatedAt time.Time
+	ID        string
+}
+
+// ListResult carries one page plus the honest total of matching rows, so a
+// bounded page never masquerades as the whole list.
+type ListResult struct {
+	Items      []Task
+	PageSize   int
+	Total      int
+	NextCursor string
 }
 
 type Store interface {
 	Create(context.Context, string, Input) (Task, error)
-	List(context.Context, string, Filter) ([]Task, error)
+	List(context.Context, string, Filter) (ListResult, error)
 	Get(context.Context, string, string) (Task, error)
 	Patch(context.Context, string, string, PatchInput) (Task, error)
 }
@@ -155,10 +206,7 @@ func resolveDeadline(precision, date, local, zone string) (resolvedDeadline, boo
 		if date != "" || local == "" || zone == "" || !validLocal(local) || !validZone(zone) {
 			return resolvedDeadline{}, false
 		}
-		// Parse the wall time first for calendar/time range checks, then resolve
-		// it in the chosen zone. time.Date handles DST gaps and overlaps
-		// deterministically instead of guessing an offset in the browser.
-		wall, err := time.Parse("2006-01-02T15:04", local)
+		wall, err := time.Parse(localLayout, local)
 		if err != nil {
 			return resolvedDeadline{}, false
 		}
@@ -166,11 +214,8 @@ func resolveDeadline(precision, date, local, zone string) (resolvedDeadline, boo
 		if err != nil {
 			return resolvedDeadline{}, false
 		}
-		instant := time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, loc).UTC()
-		// A wall time inside a spring-forward gap does not exist. Go normalizes
-		// it to a real instant, but silently showing a different clock time
-		// would be misleading, so require the user to enter a real local time.
-		if _, derived := renderInstant(instant, zone); derived != local {
+		instant, ok := resolveWallTime(wall, loc)
+		if !ok {
 			return resolvedDeadline{}, false
 		}
 		return resolvedDeadline{precision: precision, instant: instant, zone: zone}, true
@@ -185,9 +230,45 @@ func validDate(value string) bool {
 	return err == nil && parsed.Format("2006-01-02") == value
 }
 
+const localLayout = "2006-01-02T15:04"
+
 func validLocal(value string) bool {
-	parsed, err := time.Parse("2006-01-02T15:04", value)
-	return err == nil && parsed.Format("2006-01-02T15:04") == value
+	parsed, err := time.Parse(localLayout, value)
+	return err == nil && parsed.Format(localLayout) == value
+}
+
+// resolveWallTime maps a local wall time to exactly one instant in loc.
+// Gaps (spring forward) have no instant and overlaps (fall back) have two:
+// both are rejected so the API never silently picks an offset the user did
+// not choose. Probing a day on either side finds the offsets in force before
+// and after a transition, which covers non-hour shifts such as Lord Howe's
+// 30-minute change.
+func resolveWallTime(wall time.Time, loc *time.Location) (time.Time, bool) {
+	candidate := time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, loc)
+	candidateUTC := candidate.UTC()
+	// A spring-forward gap is normalized by time.Date to a different wall
+	// time; showing that instead of what was entered would be misleading.
+	if candidate.In(loc).Format(localLayout) != wall.Format(localLayout) {
+		return time.Time{}, false
+	}
+	_, offset := candidate.In(loc).Zone()
+	offsets := []int{offset}
+	for _, delta := range []time.Duration{-24 * time.Hour, 24 * time.Hour} {
+		_, other := candidate.Add(delta).In(loc).Zone()
+		if other != offset {
+			offsets = append(offsets, other)
+		}
+	}
+	naive := time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, time.UTC)
+	for _, seconds := range offsets {
+		alternative := naive.Add(-time.Duration(seconds) * time.Second)
+		if !alternative.Equal(candidateUTC) && alternative.In(loc).Format(localLayout) == wall.Format(localLayout) {
+			// Two different instants share this wall time: ask the caller to
+			// supply an explicit offset or a different local time.
+			return time.Time{}, false
+		}
+	}
+	return candidateUTC, true
 }
 
 func validZone(value string) bool {
@@ -208,6 +289,150 @@ func validZone(value string) bool {
 
 func validStatus(value string) bool {
 	return value == StatusOpen || value == StatusDone || value == StatusCancelled
+}
+
+// ParseQuery validates and normalizes raw list parameters. Unknown parameters,
+// an explicitly empty value and out-of-range page sizes are rejected instead
+// of being ignored or clamped, so a client bug cannot widen a result set.
+func ParseQuery(values url.Values) (Filter, error) {
+	for key := range values {
+		switch key {
+		case QueryFilter, QueryCursor, QueryPageSize:
+		default:
+			return Filter{}, fmt.Errorf("unsupported task query parameter %q", key)
+		}
+	}
+	filter := Filter{}
+	if values.Has(QueryFilter) {
+		if values.Get(QueryFilter) == "" {
+			return Filter{}, fmt.Errorf("%s must not be empty", QueryFilter)
+		}
+		switch values.Get(QueryFilter) {
+		case FilterOpen:
+		case FilterAll:
+			filter.ShowAll = true
+		default:
+			return Filter{}, fmt.Errorf("invalid %s", QueryFilter)
+		}
+	}
+	if raw := values.Get(QueryPageSize); raw != "" {
+		size, err := strconv.Atoi(raw)
+		if err != nil || size < 1 || size > MaxPageSize {
+			return Filter{}, fmt.Errorf("%s must be between 1 and %d", QueryPageSize, MaxPageSize)
+		}
+		filter.PageSize = size
+	}
+	filter.normalize()
+	// The cursor is bound to the filter that produced it: applying a token
+	// minted for another view would skip or repeat rows without warning.
+	if values.Has(QueryCursor) {
+		cursor, err := filter.decodeCursor(values.Get(QueryCursor))
+		if err != nil {
+			return Filter{}, err
+		}
+		filter.After = &cursor
+	}
+	return filter, nil
+}
+
+// Normalize applies defaults to a Filter built in-process (tests, future
+// callers) and reports whether it is usable.
+func (f *Filter) Normalize() bool {
+	f.normalize()
+	return f.PageSize >= 1 && f.PageSize <= MaxPageSize
+}
+
+func (f *Filter) normalize() {
+	if f.PageSize == 0 {
+		f.PageSize = DefaultPageSize
+	}
+}
+
+// taskCursorToken is the decoded form of the opaque cursor. Version lets a
+// future format reject old tokens explicitly instead of misreading them.
+type taskCursorToken struct {
+	Version   int    `json:"v"`
+	Day       string `json:"d"`
+	At        string `json:"a"`
+	CreatedAt string `json:"c"`
+	ID        string `json:"i"`
+	Filters   string `json:"f"`
+}
+
+const taskCursorVersion = 1
+
+// cursorFilterHash binds a cursor to the view that produced it. Page size is
+// deliberately absent: it changes how many rows a page holds, not where the
+// sought position is.
+func (f Filter) cursorFilterHash() string {
+	view := FilterOpen
+	if f.ShowAll {
+		view = FilterAll
+	}
+	sum := sha256.Sum256([]byte("filter=" + view))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func (f Filter) encodeCursor(day, at string, createdAt time.Time, id string) string {
+	payload, err := json.Marshal(taskCursorToken{
+		Version:   taskCursorVersion,
+		Day:       day,
+		At:        at,
+		CreatedAt: createdAt.UTC().Format(time.RFC3339Nano),
+		ID:        id,
+		Filters:   f.cursorFilterHash(),
+	})
+	if err != nil {
+		// Only strings and an int are marshaled, so this cannot fail.
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+// EncodeCursor builds a continuation token for a filter and position. Tokens
+// are not signed; authorization is enforced by the owner-scoped query.
+func EncodeCursor(filter Filter, day, at string, createdAt time.Time, id string) string {
+	filter.normalize()
+	return filter.encodeCursor(day, at, createdAt, id)
+}
+
+// decodeCursor validates a token before it reaches SQL. A well-formed cursor
+// stays usable even if the row it points at was deleted: it is a position,
+// not a row reference.
+func (f Filter) decodeCursor(raw string) (Cursor, error) {
+	if raw == "" {
+		return Cursor{}, fmt.Errorf("%s must not be empty", QueryCursor)
+	}
+	if len(raw) > maxCursorLength {
+		return Cursor{}, fmt.Errorf("%s is too long", QueryCursor)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	var token taskCursorToken
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&token); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	if token.Version != taskCursorVersion || token.Filters != f.cursorFilterHash() {
+		return Cursor{}, fmt.Errorf("%s does not match these filters", QueryCursor)
+	}
+	if (token.Day != noDeadlineDay && !validDate(token.Day)) || !ValidID(token.ID) {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	if token.At != noInstantAt {
+		instant, err := time.Parse(time.RFC3339Nano, token.At)
+		if err != nil || instant.UTC().Format(time.RFC3339Nano) != token.At {
+			return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+		}
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, token.CreatedAt)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	return Cursor{Day: token.Day, At: token.At, CreatedAt: createdAt, ID: token.ID}, nil
 }
 
 // Valid rejects an empty patch and any individually invalid field before the
@@ -259,6 +484,11 @@ type taskRow struct {
 const taskColumns = `id, application_id, title, status, due_precision,
 	COALESCE(to_char(due_date, 'YYYY-MM-DD'), ''), due_at, COALESCE(time_zone, ''), created_at`
 
+// taskPageColumns adds the computed deadline day to the read projection. It is
+// ordered after taskColumns so the same base columns scan into the same places.
+const taskPageColumns = taskColumns + `,
+	COALESCE(to_char(due_date, 'YYYY-MM-DD'), to_char((due_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD'), 'infinity')`
+
 type scanner interface {
 	Scan(dest ...any) error
 }
@@ -270,6 +500,10 @@ func scanTask(row scanner) (Task, error) {
 	if err != nil {
 		return Task{}, err
 	}
+	return taskFromRow(raw), nil
+}
+
+func taskFromRow(raw taskRow) Task {
 	result := Task{
 		ID:            raw.ID,
 		ApplicationID: raw.ApplicationID,
@@ -283,7 +517,32 @@ func scanTask(row scanner) (Task, error) {
 	if raw.Precision == PrecisionInstant && raw.At.Valid {
 		result.DueAt, result.DueLocal = renderInstant(raw.At.Time, raw.Zone)
 	}
-	return result, nil
+	return result
+}
+
+// taskPageRow is a task plus the exact keyset position of its row. The sentinels
+// keep the tuple non-null, so a row comparison can seek past it deterministically.
+type taskPageRow struct {
+	Task      Task
+	Day       string
+	At        string
+	CreatedAt time.Time
+}
+
+func scanTaskPage(row scanner) (taskPageRow, error) {
+	var raw taskRow
+	var page taskPageRow
+	err := row.Scan(&raw.ID, &raw.ApplicationID, &raw.Title, &raw.Status, &raw.Precision,
+		&raw.Date, &raw.At, &raw.Zone, &raw.CreatedAt, &page.Day, &page.CreatedAt)
+	if err != nil {
+		return taskPageRow{}, err
+	}
+	page.Task = taskFromRow(raw)
+	page.At = noInstantAt
+	if raw.At.Valid {
+		page.At = raw.At.Time.UTC().Format(time.RFC3339Nano)
+	}
+	return page, nil
 }
 
 // renderInstant keeps the UTC instant and the original zone together. The
@@ -321,27 +580,76 @@ func (s PostgresStore) Create(ctx context.Context, userID string, in Input) (Tas
 	return task, err
 }
 
-func (s PostgresStore) List(ctx context.Context, userID string, filter Filter) ([]Task, error) {
-	query := `SELECT ` + taskColumns + ` FROM tasks WHERE user_id = $1`
-	if !filter.ShowAll {
-		query += ` AND status = '` + StatusOpen + `'`
-	}
-	query += ` ORDER BY COALESCE(due_date, (due_at AT TIME ZONE 'UTC')::date) ASC NULLS LAST,
-		due_at ASC NULLS FIRST, created_at DESC, id DESC`
-	rows, err := s.DB.QueryContext(ctx, query, userID)
+func (s PostgresStore) List(ctx context.Context, userID string, filter Filter) (ListResult, error) {
+	filter.normalize()
+	result := ListResult{PageSize: filter.PageSize, Items: []Task{}}
+
+	// The count and the page share one read-only snapshot so the total always
+	// describes the rows this page can return, even under concurrent writes.
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
 	if err != nil {
-		return nil, err
+		return ListResult{}, err
+	}
+	defer tx.Rollback()
+
+	where := `user_id = $1`
+	if !filter.ShowAll {
+		where += ` AND status = '` + StatusOpen + `'`
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM tasks WHERE `+where, userID).Scan(&result.Total); err != nil {
+		return ListResult{}, err
+	}
+	if result.Total == 0 {
+		return result, nil
+	}
+
+	// Keyset (seek) pagination over the exact four-column sort key. Deadline
+	// day and due_at are compared ASC with their sentinels, then created_at and
+	// id DESC; one look-ahead row decides whether another page exists.
+	pageSQL := `SELECT ` + taskPageColumns + ` FROM tasks WHERE ` + where
+	args := []any{userID}
+	if filter.After != nil {
+		args = append(args, filter.After.Day, filter.After.At, filter.After.CreatedAt, filter.After.ID)
+		n := len(args)
+		key := `COALESCE(due_date, (due_at AT TIME ZONE 'UTC')::date, 'infinity'::date)`
+		at := `COALESCE(due_at, '-infinity'::timestamptz)`
+		pageSQL += fmt.Sprintf(` AND ((%s, %s) > ($%d::date, $%d::timestamptz)
+			OR ((%s, %s) = ($%d::date, $%d::timestamptz)
+				AND (created_at < $%d::timestamptz
+					OR (created_at = $%d::timestamptz AND id < $%d::uuid))))`,
+			key, at, n, n+1, key, at, n, n+1, n+2, n+2, n+3)
+	}
+	args = append(args, filter.PageSize+1)
+	pageSQL += ` ORDER BY COALESCE(due_date, (due_at AT TIME ZONE 'UTC')::date) ASC NULLS LAST,
+		due_at ASC NULLS FIRST, created_at DESC, id DESC LIMIT $` + strconv.Itoa(len(args))
+
+	rows, err := tx.QueryContext(ctx, pageSQL, args...)
+	if err != nil {
+		return ListResult{}, err
 	}
 	defer rows.Close()
-	result := []Task{}
+	page := make([]taskPageRow, 0, filter.PageSize+1)
 	for rows.Next() {
-		task, err := scanTask(rows)
+		row, err := scanTaskPage(rows)
 		if err != nil {
-			return nil, err
+			return ListResult{}, err
 		}
-		result = append(result, task)
+		page = append(page, row)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return ListResult{}, err
+	}
+	if len(page) > filter.PageSize {
+		// The look-ahead row proves another page exists; the cursor points at
+		// the last row actually returned, never at the look-ahead row.
+		last := page[filter.PageSize-1]
+		result.NextCursor = filter.encodeCursor(last.Day, last.At, last.CreatedAt, last.Task.ID)
+		page = page[:filter.PageSize]
+	}
+	for _, row := range page {
+		result.Items = append(result.Items, row.Task)
+	}
+	return result, nil
 }
 
 func (s PostgresStore) Get(ctx context.Context, userID, id string) (Task, error) {
