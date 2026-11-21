@@ -401,12 +401,37 @@ test("creating a task posts the deadline shape and reloads Today", async () => {
 
   const post = requests.find((request) => request.method === "POST");
   expect(post.url).toBe("/api/tasks");
+  // The test environment's browser zone is UTC; it is captured for the
+  // approximate nudges but never becomes a deadline time or zone.
   expect(JSON.parse(post.body)).toEqual({
     application_id: "app-1", title: "Submit assessment", due_precision: "date", due_date: "2026-11-12",
+    reminder_zone: "UTC",
   });
   expect(requests.filter((request) => request.url === "/api/tasks").length).toBeGreaterThan(1);
   expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
   expect(dashboardProps.taskDraft).toBeNull();
+});
+
+test("editing a date task keeps the browser zone saved at creation", async () => {
+  const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved" };
+  const task = openTask({ reminder_zone: "Asia/Kolkata" });
+  let patch;
+  globalThis.fetch = async (url, options) => {
+    if (options.method === "PATCH") { patch = JSON.parse(options.body); return Response.json(task); }
+    if (url.startsWith("/api/tasks")) return taskResponse([task]);
+    return Response.json(page({ items: [app], total: 1 }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onEditTask(task, app); });
+  await act(async () => {
+    await dashboardProps.onSaveTask({
+      preventDefault() {},
+      currentTarget: formWith({ title: "Submit the form", due_precision: "date", due_date: task.due_date }),
+    }, task.id);
+  });
+  expect(patch.title).toBe("Submit the form");
+  expect(patch.reminder_zone).toBe("Asia/Kolkata");
 });
 
 test("an exact deadline without a zone is rejected before any request", async () => {

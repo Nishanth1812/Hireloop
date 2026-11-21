@@ -20,6 +20,7 @@ function TaskCard({ task, application, busy, onEdit, onComplete, onCancel, onExp
         <span>{application ? `${application.role} at ${application.company}` : "Linked application"}</span>
         <span className="task-deadline">{deadline.when}</span>
         <span className="task-detail">{deadline.detail}</span>
+        {deadline.reminder && <span className="task-detail">{deadline.reminder}</span>}
         <button className="task-export-button" type="button" disabled={busy}
           onClick={() => onExport(task)} aria-label={`Export ${task.title} calendar entry`}>Export ICS</button>
         {task.status !== "open" && <span className="task-status">Status: {task.status}</span>}

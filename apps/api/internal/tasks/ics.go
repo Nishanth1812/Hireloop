@@ -10,7 +10,9 @@ import (
 // The export uses only the deadline shape already stored on the task:
 //
 //   - PrecisionDate:    DUE;VALUE=DATE with the stored calendar day — no time
-//     and no zone are invented for a deadline the user gave as a day.
+//     and no zone are invented for a deadline the user gave as a day. A stored
+//     reminder_zone is deliberately not exported: it only schedules an
+//     approximate nudge and is not a cutoff or an alarm on the deadline.
 //   - PrecisionInstant: DUE as the stored UTC instant, with seconds and Z.
 //   - PrecisionNone:    no DUE at all.
 //

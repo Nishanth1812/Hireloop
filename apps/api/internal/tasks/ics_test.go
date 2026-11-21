@@ -47,6 +47,25 @@ func TestExportIcsDateOnlyHonorsPrecision(t *testing.T) {
 	}
 }
 
+func TestExportIcsDateOnlyIgnoresApproximateReminderZone(t *testing.T) {
+	task := icsFixtureTask()
+	// A browser zone used only for approximate nudges is not part of the
+	// deadline shape: the export must stay a plain DATE with no alarm.
+	task.ReminderZone = "Asia/Kolkata"
+	export, err := ExportIcs(task)
+	if err != nil {
+		t.Fatalf("ExportIcs: %v", err)
+	}
+	if got := icsLine(t, export, "DUE"); got != "DUE;VALUE=DATE:20261112" {
+		t.Fatalf("DUE line = %q, want DUE;VALUE=DATE:20261112", got)
+	}
+	for _, forbidden := range []string{"TZID", "VALARM", "TRIGGER", "Asia/Kolkata"} {
+		if strings.Contains(export, forbidden) {
+			t.Errorf("date-only export must not carry %q: %q", forbidden, export)
+		}
+	}
+}
+
 func TestExportIcsInstantPreservesUTCInstant(t *testing.T) {
 	task := icsFixtureTask()
 	task.DuePrecision = PrecisionInstant

@@ -19,7 +19,7 @@ import {
 import type {
   Application, ApplicationFilters, ApplicationPage, ApplicationPatch, Task, TaskInput, TaskPage, TaskPatch, TaskStatus,
 } from "@/lib/api";
-import { localDeadlineIssue } from "@/lib/tasks";
+import { browserTimeZone, localDeadlineIssue } from "@/lib/tasks";
 import { ApplicationDashboard } from "./_components/ApplicationDashboard";
 import type { TaskDraft } from "./_components/ApplicationDashboard";
 import { SignInPanel } from "./_components/SignInPanel";
@@ -472,6 +472,13 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         setError("Choose a date for this deadline.");
         return;
       }
+      // Capture the browser's IANA zone at creation for approximate nudges.
+      // An edit keeps the zone already saved, and an old task without one can
+      // gain it on edit. An unavailable or invalid zone is omitted rather than
+      // guessed, so no cutoff or local hour is invented.
+      const storedZone = taskDraft.task?.due_precision === "date" ? taskDraft.task.reminder_zone : "";
+      const zone = storedZone || browserTimeZone();
+      if (zone) fields.reminder_zone = zone;
     }
     if (precision === "instant") {
       fields.due_local = String(data.get("due_local") ?? "").trim();
@@ -510,6 +517,7 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
           title,
           due_precision: precision,
           ...(precision === "date" ? { due_date: fields.due_date } : {}),
+          ...(precision === "date" && fields.reminder_zone ? { reminder_zone: fields.reminder_zone } : {}),
           ...(precision === "instant" ? { due_local: fields.due_local, time_zone: fields.time_zone } : {}),
         };
         await createTask(token, input);

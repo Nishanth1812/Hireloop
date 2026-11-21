@@ -13,11 +13,11 @@ const appID = "11111111-1111-4111-8111-111111111111"
 type pageScanner struct{ created time.Time }
 
 func (s pageScanner) Scan(dest ...any) error {
-	if len(dest) != 10 {
-		return fmt.Errorf("expected 10 scan destinations, got %d", len(dest))
+	if len(dest) != 11 {
+		return fmt.Errorf("expected 11 scan destinations, got %d", len(dest))
 	}
-	*dest[8].(*time.Time) = s.created
-	*dest[9].(*string) = "infinity"
+	*dest[9].(*time.Time) = s.created
+	*dest[10].(*string) = "infinity"
 	return nil
 }
 
@@ -40,6 +40,12 @@ func TestDeadlinePrecisionIsValidatedAndKeptDistinct(t *testing.T) {
 		{"date-only", Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate, DueDate: "2026-11-12"}, true},
 		{"date-only with a time", Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate, DueDate: "2026-11-12T18:00"}, false},
 		{"date-only with a zone", Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate, DueDate: "2026-11-12", TimeZone: "Asia/Kolkata"}, false},
+		{"date-only with browser reminder zone", Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate, DueDate: "2026-11-12", ReminderZone: "Asia/Kolkata"}, true},
+		{"date-only with UTC reminder zone", Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate, DueDate: "2026-11-12", ReminderZone: "UTC"}, true},
+		{"date-only with unknown reminder zone", Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate, DueDate: "2026-11-12", ReminderZone: "Mars/Olympus"}, false},
+		{"date-only with server-local reminder zone", Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate, DueDate: "2026-11-12", ReminderZone: "Local"}, false},
+		{"no deadline with reminder zone", Input{ApplicationID: appID, Title: "Reply", ReminderZone: "UTC"}, false},
+		{"instant with reminder zone", Input{ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant, DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata", ReminderZone: "UTC"}, false},
 		{"impossible date", Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate, DueDate: "2026-02-30"}, false},
 		{"exact instant", Input{ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant, DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata"}, true},
 		{"instant without zone", Input{ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant, DueLocal: "2026-11-12T18:00"}, false},
@@ -77,6 +83,51 @@ func TestInstantResolutionUsesOriginalZone(t *testing.T) {
 	utc, local := renderInstant(instant, input.TimeZone)
 	if utc != "2026-11-12T12:30:00Z" || local != "2026-11-12T18:00" {
 		t.Fatalf("rendered %q / %q, want the original instant and wall time", utc, local)
+	}
+}
+
+func TestDateResolutionKeepsOptionalReminderZoneSeparate(t *testing.T) {
+	input := Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate,
+		DueDate: "2026-11-12", ReminderZone: "  Asia/Kolkata  "}
+	precision, deadline, ok := input.resolve()
+	if !ok || precision != PrecisionDate || input.ReminderZone != "Asia/Kolkata" {
+		t.Fatalf("resolve: %v %+v %v", precision, deadline, ok)
+	}
+	if deadline.reminderZone != "Asia/Kolkata" || deadline.zone != nil || deadline.date != "2026-11-12" {
+		t.Fatalf("deadline = %+v, want zone only in reminderZone", deadline)
+	}
+	// A missing browser zone is not an error: the task stays a plain date.
+	input = Input{ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionDate, DueDate: "2026-11-12"}
+	if _, deadline, ok := input.resolve(); !ok || deadline.reminderZone != nil {
+		t.Fatalf("date without zone: %+v %v", deadline, ok)
+	}
+}
+
+func TestScheduleIdentityTracksReminderInputs(t *testing.T) {
+	instant := time.Date(2026, 11, 12, 12, 30, 0, 0, time.UTC)
+	base := resolvedDeadline{precision: PrecisionInstant, instant: instant, zone: "Asia/Kolkata"}
+	stored := Task{DuePrecision: PrecisionInstant, DueAt: "2026-11-12T12:30:00Z", TimeZone: "Asia/Kolkata"}
+	if !sameSchedule(currentSchedule(stored), resolvedSchedule(base)) {
+		t.Fatal("an unchanged instant deadline must keep in-flight jobs")
+	}
+	changed := base
+	changed.instant = instant.Add(time.Minute)
+	if sameSchedule(currentSchedule(stored), resolvedSchedule(changed)) {
+		t.Fatal("a changed instant must reschedule jobs")
+	}
+
+	dateTask := Task{DuePrecision: PrecisionDate, DueDate: "2026-11-12", ReminderZone: "Asia/Kolkata"}
+	dateDeadline := resolvedDeadline{precision: PrecisionDate, date: "2026-11-12", reminderZone: "Asia/Kolkata"}
+	if !sameSchedule(currentSchedule(dateTask), resolvedSchedule(dateDeadline)) {
+		t.Fatal("an unchanged date deadline and zone must keep in-flight jobs")
+	}
+	dateDeadline.reminderZone = "UTC"
+	if sameSchedule(currentSchedule(dateTask), resolvedSchedule(dateDeadline)) {
+		t.Fatal("a changed reminder zone must reschedule approximate jobs")
+	}
+	dateDeadline.reminderZone = ""
+	if sameSchedule(currentSchedule(dateTask), resolvedSchedule(dateDeadline)) {
+		t.Fatal("removing the reminder zone must retire approximate jobs")
 	}
 }
 

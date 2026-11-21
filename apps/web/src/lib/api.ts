@@ -112,6 +112,8 @@ export type TaskPrecision = "none" | "date" | "instant";
 // A task keeps its deadline precision on the wire. Date-only deadlines have a
 // due_date and no time or zone; exact deadlines have a UTC due_at plus the
 // original IANA time_zone and the wall time (due_local) that produced it.
+// reminder_zone is separate from time_zone: it is the browser zone captured
+// for approximate date-only reminders and is never a cutoff or a deadline.
 export type Task = {
   id: string;
   application_id: string;
@@ -122,6 +124,7 @@ export type Task = {
   due_local: string;
   due_at: string;
   time_zone: string;
+  reminder_zone: string;
   created_at: string;
 };
 
@@ -132,9 +135,10 @@ export type TaskInput = {
   due_date?: string;
   due_local?: string;
   time_zone?: string;
+  reminder_zone?: string;
 };
 
-export type TaskPatch = Partial<Pick<Task, "title" | "status" | "due_precision" | "due_date" | "due_local" | "time_zone">>;
+export type TaskPatch = Partial<Pick<Task, "title" | "status" | "due_precision" | "due_date" | "due_local" | "time_zone" | "reminder_zone">>;
 
 // TaskPage is the API's bounded keyset page. total counts every row matching
 // the view (open only by default), so the Today panel never treats one page

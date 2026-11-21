@@ -32,21 +32,45 @@ export function formatInstant(dueAt: string, zone: string): { when: string; zone
   return { when, zoneLabel: offset ? `${zone} (${offset})` : zone };
 }
 
-export function deadlineText(task: Task): { when: string; detail: string } {
+export function deadlineText(task: Task): { when: string; detail: string; reminder: string } {
   if (task.due_precision === "date") {
     return {
       when: formatDateOnly(task.due_date),
       detail: "Cutoff time unspecified — no time or zone was recorded.",
+      // Kept separate from the deadline text: a nudge is not part of the
+      // deadline and must never read like a guaranteed cutoff.
+      reminder: task.reminder_zone
+        ? "Approximate reminders the day before and on the morning of this date, in the browser zone saved with the task. They are not a guaranteed cutoff."
+        : "No approximate reminders: this task has no saved browser zone.",
     };
   }
   if (task.due_precision === "instant") {
     const formatted = formatInstant(task.due_at, task.time_zone);
     if (!formatted) {
-      return { when: "Deadline needs attention", detail: "The stored deadline could not be displayed." };
+      return { when: "Deadline needs attention", detail: "The stored deadline could not be displayed.", reminder: "" };
     }
-    return { when: formatted.when, detail: `Original zone: ${formatted.zoneLabel}.` };
+    return { when: formatted.when, detail: `Original zone: ${formatted.zoneLabel}.`, reminder: "" };
   }
-  return { when: "No deadline", detail: "No cutoff date was recorded." };
+  return { when: "No deadline", detail: "No cutoff date was recorded.", reminder: "" };
+}
+
+const ianaZone = /^[A-Za-z_][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)+$/;
+
+// browserTimeZone reads the browser's IANA zone at task creation. If the
+// platform cannot supply one, or it is not a usable IANA name, this returns
+// "" and the caller omits the field: no zone is invented and no approximate
+// reminder is scheduled. No abbreviations or server-local guesses are used.
+export function browserTimeZone(): string {
+  try {
+    if (typeof Intl === "undefined" || !Intl.DateTimeFormat) return "";
+    const zone = new Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
+    if (zone !== "UTC" && (!ianaZone.test(zone) || zone.length > 64)) return "";
+    // Confirm this platform can actually format in the reported zone.
+    new Intl.DateTimeFormat("en-GB", { timeZone: zone });
+    return zone;
+  } catch {
+    return "";
+  }
 }
 
 // A short, explicit list keeps the form small. An existing task's zone is

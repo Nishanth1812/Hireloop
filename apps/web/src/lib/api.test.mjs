@@ -286,6 +286,33 @@ test("createTask posts the full deadline shape as JSON", async () => {
   }
 });
 
+test("createTask sends the browser reminder zone for date-only tasks", async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ id: "t3", due_precision: "date" }, { status: 201 });
+  };
+  try {
+    await api.createTask("access-token", {
+      application_id: "app/1",
+      title: "Submit form",
+      due_precision: "date",
+      due_date: "2026-11-21",
+      reminder_zone: "Asia/Kolkata",
+    });
+    assert.deepEqual(JSON.parse(request.options.body), {
+      application_id: "app/1",
+      title: "Submit form",
+      due_precision: "date",
+      due_date: "2026-11-21",
+      reminder_zone: "Asia/Kolkata",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("patchTask sends only the status for completion and encodes the id", async () => {
   const originalFetch = globalThis.fetch;
   let request;

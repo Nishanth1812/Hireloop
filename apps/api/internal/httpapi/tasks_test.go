@@ -53,6 +53,7 @@ func (s *fakeTaskStore) Create(_ context.Context, owner string, input tasks.Inpu
 		DueDate:       input.DueDate,
 		DueLocal:      input.DueLocal,
 		TimeZone:      input.TimeZone,
+		ReminderZone:  input.ReminderZone,
 		CreatedAt:     "2026-11-01T09:00:00Z",
 	}
 	if task.DuePrecision == "" {
@@ -153,7 +154,7 @@ func (s *fakeTaskStore) Patch(_ context.Context, owner, id string, input tasks.P
 		}
 		if input.DuePrecision != nil {
 			task.DuePrecision = *input.DuePrecision
-			task.DueDate, task.DueLocal, task.DueAt, task.TimeZone = "", "", "", ""
+			task.DueDate, task.DueLocal, task.DueAt, task.TimeZone, task.ReminderZone = "", "", "", "", ""
 			if input.DueDate != nil {
 				task.DueDate = *input.DueDate
 			}
@@ -162,6 +163,9 @@ func (s *fakeTaskStore) Patch(_ context.Context, owner, id string, input tasks.P
 			}
 			if input.TimeZone != nil {
 				task.TimeZone = *input.TimeZone
+			}
+			if input.ReminderZone != nil {
+				task.ReminderZone = *input.ReminderZone
 			}
 		}
 		s.records[owner][i] = task
@@ -557,6 +561,40 @@ func TestTaskRoutesUnavailableWithoutStore(t *testing.T) {
 		handler.ServeHTTP(w, r)
 		if w.Code != http.StatusServiceUnavailable {
 			t.Errorf("%s %s: %d, want 503", tc.method, tc.path, w.Code)
+		}
+	}
+}
+
+func TestTaskReminderZoneRoundTripsAndRejectsBadZones(t *testing.T) {
+	h := newTaskHarness(t)
+	create := fmt.Sprintf(`{"application_id":%q,"title":"Submit form","due_precision":"date","due_date":"2026-11-21","reminder_zone":"Asia/Kolkata"}`, taskAppID)
+	w := h.request(h.token, http.MethodPost, create, "/api/tasks")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create date task with browser zone: %d %s", w.Code, w.Body.String())
+	}
+	var created tasks.Task
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ReminderZone != "Asia/Kolkata" || created.TimeZone != "" || created.DueAt != "" {
+		t.Fatalf("created task = %+v, want zone only in reminder_zone", created)
+	}
+	// The zone is part of the stored task and changes only when the client
+	// sends a new one; an ordinary title edit keeps it.
+	if w := h.request(h.token, http.MethodPatch, `{"title":"Submit the form"}`, taskPath(created.ID)); w.Code != http.StatusOK {
+		t.Fatalf("edit title: %d %s", w.Code, w.Body.String())
+	}
+	if got := h.store.records["owner-a"][0].ReminderZone; got != "Asia/Kolkata" {
+		t.Fatalf("reminder zone after edit = %q", got)
+	}
+
+	for name, body := range map[string]string{
+		"unknown zone":    fmt.Sprintf(`{"application_id":%q,"title":"x","due_precision":"date","due_date":"2026-11-21","reminder_zone":"Mars/Olympus"}`, taskAppID),
+		"server local":    fmt.Sprintf(`{"application_id":%q,"title":"x","due_precision":"date","due_date":"2026-11-21","reminder_zone":"Local"}`, taskAppID),
+		"exact plus zone": fmt.Sprintf(`{"application_id":%q,"title":"x","due_precision":"instant","due_local":"2026-11-21T09:00","time_zone":"UTC","reminder_zone":"UTC"}`, taskAppID),
+	} {
+		if w := h.request(h.token, http.MethodPost, body, "/api/tasks"); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s, want 400", name, w.Code, w.Body.String())
 		}
 	}
 }

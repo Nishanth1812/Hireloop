@@ -72,10 +72,12 @@ const (
 )
 
 // Input is the create payload. The deadline is a closed shape:
-//   - PrecisionNone:    all three deadline fields empty
-//   - PrecisionDate:    DueDate = YYYY-MM-DD, DueLocal and TimeZone empty
+//   - PrecisionNone:    deadline fields empty
+//   - PrecisionDate:    DueDate = YYYY-MM-DD, DueLocal and TimeZone empty.
+//     ReminderZone may carry the browser's IANA zone for approximate nudges;
+//     absent or invalid means no nudge and no invented cutoff.
 //   - PrecisionInstant: DueLocal = YYYY-MM-DDTHH:MM in TimeZone (IANA name),
-//     DueDate empty. The API resolves the wall time to a UTC instant.
+//     DueDate and ReminderZone empty. The API resolves the wall time to UTC.
 //
 // Empty precision means "no deadline"; no value is ever inferred for the user.
 type Input struct {
@@ -85,6 +87,7 @@ type Input struct {
 	DueDate       string `json:"due_date"`
 	DueLocal      string `json:"due_local"`
 	TimeZone      string `json:"time_zone"`
+	ReminderZone  string `json:"reminder_zone"`
 }
 
 // PatchInput has pointer fields so a missing key means "unchanged". Changing
@@ -97,6 +100,7 @@ type PatchInput struct {
 	DueDate      *string `json:"due_date"`
 	DueLocal     *string `json:"due_local"`
 	TimeZone     *string `json:"time_zone"`
+	ReminderZone *string `json:"reminder_zone"`
 }
 
 // Task is the wire record. DueLocal is derived from DueAt in the original
@@ -111,6 +115,7 @@ type Task struct {
 	DueLocal      string `json:"due_local"`
 	DueAt         string `json:"due_at"`
 	TimeZone      string `json:"time_zone"`
+	ReminderZone  string `json:"reminder_zone"`
 	CreatedAt     string `json:"created_at"`
 }
 
@@ -151,10 +156,11 @@ type Store interface {
 
 // resolvedDeadline is the validated, database-ready form of Input's deadline.
 type resolvedDeadline struct {
-	precision string
-	date      any // nil or YYYY-MM-DD string
-	instant   any // nil or time.Time in UTC
-	zone      any // nil or IANA name
+	precision    string
+	date         any // nil or YYYY-MM-DD string
+	instant      any // nil or time.Time in UTC
+	zone         any // nil or IANA name for an exact instant
+	reminderZone any // nil or IANA name for date-only approximate reminders
 }
 
 var ianaZone = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+)+$`)
@@ -174,6 +180,7 @@ func (i *Input) resolve() (string, resolvedDeadline, bool) {
 	i.DueDate = strings.TrimSpace(i.DueDate)
 	i.DueLocal = strings.TrimSpace(i.DueLocal)
 	i.TimeZone = strings.TrimSpace(i.TimeZone)
+	i.ReminderZone = strings.TrimSpace(i.ReminderZone)
 
 	if !applications.ValidID(i.ApplicationID) || !validTitle(i.Title) {
 		return "", resolvedDeadline{}, false
@@ -181,7 +188,7 @@ func (i *Input) resolve() (string, resolvedDeadline, bool) {
 	if i.DuePrecision == "" {
 		i.DuePrecision = PrecisionNone
 	}
-	deadline, ok := resolveDeadline(i.DuePrecision, i.DueDate, i.DueLocal, i.TimeZone)
+	deadline, ok := resolveDeadline(i.DuePrecision, i.DueDate, i.DueLocal, i.TimeZone, i.ReminderZone)
 	return i.DuePrecision, deadline, ok
 }
 
@@ -189,22 +196,33 @@ func validTitle(value string) bool {
 	return value != "" && len(value) <= maxTitleLength && !strings.ContainsRune(value, 0)
 }
 
-func resolveDeadline(precision, date, local, zone string) (resolvedDeadline, bool) {
+func resolveDeadline(precision, date, local, zone, reminderZone string) (resolvedDeadline, bool) {
 	switch precision {
 	case PrecisionNone:
-		if date != "" || local != "" || zone != "" {
+		if date != "" || local != "" || zone != "" || reminderZone != "" {
 			return resolvedDeadline{}, false
 		}
 		return resolvedDeadline{precision: precision}, true
 
 	case PrecisionDate:
+		// The reminder zone is optional: a browser that cannot supply a
+		// usable IANA zone simply omits it, and the task gets no approximate
+		// reminder. A supplied zone must be a real IANA name, so garbage is
+		// rejected rather than silently used to pick a local hour.
 		if date == "" || local != "" || zone != "" || !validDate(date) {
 			return resolvedDeadline{}, false
 		}
-		return resolvedDeadline{precision: precision, date: date}, true
+		if reminderZone != "" && !validZone(reminderZone) {
+			return resolvedDeadline{}, false
+		}
+		deadline := resolvedDeadline{precision: precision, date: date}
+		if reminderZone != "" {
+			deadline.reminderZone = reminderZone
+		}
+		return deadline, true
 
 	case PrecisionInstant:
-		if date != "" || local == "" || zone == "" || !validLocal(local) || !validZone(zone) {
+		if date != "" || local == "" || zone == "" || reminderZone != "" || !validLocal(local) || !validZone(zone) {
 			return resolvedDeadline{}, false
 		}
 		wall, err := time.Parse(localLayout, local)
@@ -440,7 +458,7 @@ func (f Filter) decodeCursor(raw string) (Cursor, error) {
 // store reads the row. The complete deadline shape is re-validated after the
 // patch is merged with the stored task.
 func (i *PatchInput) Valid() bool {
-	if i.Title == nil && i.Status == nil && i.DuePrecision == nil && i.DueDate == nil && i.DueLocal == nil && i.TimeZone == nil {
+	if i.Title == nil && i.Status == nil && i.DuePrecision == nil && i.DueDate == nil && i.DueLocal == nil && i.TimeZone == nil && i.ReminderZone == nil {
 		return false
 	}
 	trim := func(value *string) string {
@@ -459,7 +477,7 @@ func (i *PatchInput) Valid() bool {
 			return false
 		}
 	}
-	for _, field := range []*string{i.DueDate, i.DueLocal, i.TimeZone} {
+	for _, field := range []*string{i.DueDate, i.DueLocal, i.TimeZone, i.ReminderZone} {
 		if field != nil && strings.ContainsRune(trim(field), 0) {
 			return false
 		}
@@ -479,11 +497,13 @@ type taskRow struct {
 	Date          string
 	At            sql.NullTime
 	Zone          string
+	ReminderZone  string
 	CreatedAt     time.Time
 }
 
 const taskColumns = `id, application_id, title, status, due_precision,
-	COALESCE(to_char(due_date, 'YYYY-MM-DD'), ''), due_at, COALESCE(time_zone, ''), created_at`
+	COALESCE(to_char(due_date, 'YYYY-MM-DD'), ''), due_at, COALESCE(time_zone, ''),
+	COALESCE(reminder_zone, ''), created_at`
 
 // taskPageColumns adds the computed deadline day to the read projection. It is
 // ordered after taskColumns so the same base columns scan into the same places.
@@ -497,7 +517,7 @@ type scanner interface {
 func scanTask(row scanner) (Task, error) {
 	var raw taskRow
 	err := row.Scan(&raw.ID, &raw.ApplicationID, &raw.Title, &raw.Status, &raw.Precision,
-		&raw.Date, &raw.At, &raw.Zone, &raw.CreatedAt)
+		&raw.Date, &raw.At, &raw.Zone, &raw.ReminderZone, &raw.CreatedAt)
 	if err != nil {
 		return Task{}, err
 	}
@@ -513,6 +533,7 @@ func taskFromRow(raw taskRow) Task {
 		DuePrecision:  raw.Precision,
 		DueDate:       raw.Date,
 		TimeZone:      raw.Zone,
+		ReminderZone:  raw.ReminderZone,
 		CreatedAt:     raw.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if raw.Precision == PrecisionInstant && raw.At.Valid {
@@ -534,7 +555,7 @@ func scanTaskPage(row scanner) (taskPageRow, error) {
 	var raw taskRow
 	var page taskPageRow
 	err := row.Scan(&raw.ID, &raw.ApplicationID, &raw.Title, &raw.Status, &raw.Precision,
-		&raw.Date, &raw.At, &raw.Zone, &raw.CreatedAt, &page.Day)
+		&raw.Date, &raw.At, &raw.Zone, &raw.ReminderZone, &raw.CreatedAt, &page.Day)
 	if err != nil {
 		return taskPageRow{}, err
 	}
@@ -568,21 +589,82 @@ type PostgresStore struct {
 	Jobs *reminders.Store
 }
 
-// dueAtForSchedule reports the instant a task should schedule its reminder
-// for: only exact-instant deadlines get a job; date-only deadlines never
-// invent a time and get none.
-func dueAtForSchedule(deadline resolvedDeadline) (time.Time, bool) {
-	if deadline.precision != PrecisionInstant || deadline.instant == nil {
-		return time.Time{}, false
+// scheduleIdentity is the part of a task that determines its reminder jobs.
+// A patch that leaves it unchanged must not reset an in-flight job; a change
+// to any part (including the browser zone of a date-only task) replaces the
+// whole set of jobs inside the task's transaction.
+type scheduleIdentity struct {
+	precision string
+	date      string
+	zone      string
+	at        time.Time
+}
+
+func currentSchedule(task Task) scheduleIdentity {
+	identity := scheduleIdentity{precision: task.DuePrecision}
+	switch task.DuePrecision {
+	case PrecisionInstant:
+		identity.zone = task.TimeZone
+		if at, err := time.Parse(time.RFC3339Nano, task.DueAt); err == nil {
+			identity.at = at.UTC()
+		}
+	case PrecisionDate:
+		identity.date, identity.zone = task.DueDate, task.ReminderZone
 	}
-	dueAt, ok := deadline.instant.(time.Time)
-	return dueAt, ok
+	return identity
+}
+
+func resolvedSchedule(deadline resolvedDeadline) scheduleIdentity {
+	identity := scheduleIdentity{precision: deadline.precision}
+	switch deadline.precision {
+	case PrecisionInstant:
+		identity.zone, _ = deadline.zone.(string)
+		if at, ok := deadline.instant.(time.Time); ok {
+			identity.at = at.UTC()
+		}
+	case PrecisionDate:
+		identity.date, _ = deadline.date.(string)
+		identity.zone, _ = deadline.reminderZone.(string)
+	}
+	return identity
+}
+
+func sameSchedule(a, b scheduleIdentity) bool {
+	if a.precision != b.precision || a.date != b.date || a.zone != b.zone {
+		return false
+	}
+	return a.at.Equal(b.at)
+}
+
+// applySchedule replaces a task's jobs with those its deadline warrants:
+// two advance jobs for an exact instant, the two approximate local nudges for
+// a date-only deadline with a browser zone, or none when the zone is absent,
+// the deadline is cleared or every eligible time is already in the past.
+func (s PostgresStore) applySchedule(ctx context.Context, tx *sql.Tx, userID, taskID string, deadline resolvedDeadline) error {
+	if s.Jobs == nil {
+		return nil
+	}
+	switch deadline.precision {
+	case PrecisionInstant:
+		if dueAt, ok := deadline.instant.(time.Time); ok {
+			return s.Jobs.Schedule(ctx, tx, userID, taskID, dueAt)
+		}
+	case PrecisionDate:
+		date, _ := deadline.date.(string)
+		zone, _ := deadline.reminderZone.(string)
+		// An absent browser zone is deliberate safe degradation: no zone is
+		// invented and no approximate reminder is scheduled. Old date-only
+		// tasks have no stored zone and follow the same path.
+		slots := reminders.DateApproxSlots(date, zone, time.Now())
+		return s.Jobs.ScheduleApprox(ctx, tx, userID, taskID, slots)
+	}
+	return s.Jobs.Suppress(ctx, tx, userID, taskID, reminders.SuppressRescheduled)
 }
 
 // syncReminderJobs maintains the durable-reminder invariants after a task
-// patch, inside the same transaction as the task update: a finished task
-// suppresses unsent reminders, and a rescheduled instant deadline reactivates
-// the job or suppresses it when the deadline is cleared or made date-only.
+// patch, inside the same transaction as the task update: a finished or
+// cancelled task suppresses unsent reminders, and any change to the deadline
+// (including its precision or the date-only reminder zone) replaces the jobs.
 func (s PostgresStore) syncReminderJobs(ctx context.Context, tx *sql.Tx, userID, taskID string, current Task, status string, deadline resolvedDeadline) error {
 	if s.Jobs == nil {
 		return nil
@@ -594,25 +676,10 @@ func (s PostgresStore) syncReminderJobs(ctx context.Context, tx *sql.Tx, userID,
 		}
 		return s.Jobs.Suppress(ctx, tx, userID, taskID, reason)
 	}
-	if dueAt, ok := dueAtForSchedule(deadline); ok {
-		// Only move the job when the stored instant actually changed: a
-		// patch that leaves the deadline alone must not reset an in-flight job.
-		if current.DuePrecision != PrecisionInstant || !instantsEqual(current.DueAt, dueAt) {
-			return s.Jobs.Schedule(ctx, tx, userID, taskID, dueAt)
-		}
+	if sameSchedule(currentSchedule(current), resolvedSchedule(deadline)) {
 		return nil
 	}
-	// Open with no instant deadline: a previous instant job is now obsolete.
-	if current.DuePrecision == PrecisionInstant && current.DueAt != "" {
-		return s.Jobs.Suppress(ctx, tx, userID, taskID, reminders.SuppressRescheduled)
-	}
-	return nil
-}
-
-// instantsEqual compares the stored RFC 3339 UTC instant with a resolved one.
-func instantsEqual(stored string, want time.Time) bool {
-	got, err := time.Parse(time.RFC3339Nano, stored)
-	return err == nil && got.Equal(want)
+	return s.applySchedule(ctx, tx, userID, taskID, deadline)
 }
 
 func (s PostgresStore) Create(ctx context.Context, userID string, in Input) (Task, error) {
@@ -625,11 +692,11 @@ func (s PostgresStore) Create(ctx context.Context, userID string, in Input) (Tas
 		// owner, so a guessed application id cannot attach a task to another
 		// account's record. No row means 404, never a database error.
 		row := q.QueryRowContext(ctx, `INSERT INTO tasks
-			(user_id, application_id, title, status, due_precision, due_date, due_at, time_zone)
-			SELECT $1, $2, $3, '`+StatusOpen+`', $4, $5, $6, $7
+			(user_id, application_id, title, status, due_precision, due_date, due_at, time_zone, reminder_zone)
+			SELECT $1, $2, $3, '`+StatusOpen+`', $4, $5, $6, $7, $8
 			WHERE EXISTS (SELECT 1 FROM applications WHERE id = $2 AND user_id = $1)
 			RETURNING `+taskColumns,
-			userID, in.ApplicationID, in.Title, precision, deadline.date, deadline.instant, deadline.zone)
+			userID, in.ApplicationID, in.Title, precision, deadline.date, deadline.instant, deadline.zone, deadline.reminderZone)
 		task, err := scanTask(row)
 		if errors.Is(err, sql.ErrNoRows) {
 			return Task{}, ErrNotFound
@@ -650,10 +717,8 @@ func (s PostgresStore) Create(ctx context.Context, userID string, in Input) (Tas
 	if err != nil {
 		return Task{}, err
 	}
-	if dueAt, ok := dueAtForSchedule(deadline); ok {
-		if err := s.Jobs.Schedule(ctx, tx, userID, task.ID, dueAt); err != nil {
-			return Task{}, err
-		}
+	if err := s.applySchedule(ctx, tx, userID, task.ID, deadline); err != nil {
+		return Task{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Task{}, err
@@ -773,19 +838,22 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 	merged := Input{ApplicationID: current.ApplicationID, DuePrecision: target}
 	switch target {
 	case PrecisionNone:
-		if input.DueDate != nil || input.DueLocal != nil || input.TimeZone != nil {
+		if input.DueDate != nil || input.DueLocal != nil || input.TimeZone != nil || input.ReminderZone != nil {
 			return Task{}, ErrInvalid
 		}
 	case PrecisionDate:
 		if input.DueLocal != nil || input.TimeZone != nil {
 			return Task{}, ErrInvalid
 		}
-		merged.DueDate = current.DueDate
+		merged.DueDate, merged.ReminderZone = current.DueDate, current.ReminderZone
 		if input.DueDate != nil {
 			merged.DueDate = *input.DueDate
 		}
+		if input.ReminderZone != nil {
+			merged.ReminderZone = *input.ReminderZone
+		}
 	case PrecisionInstant:
-		if input.DueDate != nil {
+		if input.DueDate != nil || input.ReminderZone != nil {
 			return Task{}, ErrInvalid
 		}
 		merged.DueLocal, merged.TimeZone = current.DueLocal, current.TimeZone
@@ -822,10 +890,10 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 	}
 
 	updated, err := scanTask(tx.QueryRowContext(ctx, `UPDATE tasks SET
-		title = $3, status = $4, due_precision = $5, due_date = $6, due_at = $7, time_zone = $8
+		title = $3, status = $4, due_precision = $5, due_date = $6, due_at = $7, time_zone = $8, reminder_zone = $9
 		WHERE user_id = $1 AND id = $2 RETURNING `+taskColumns,
 		userID, id, merged.Title, strings.TrimSpace(status), precision,
-		deadline.date, deadline.instant, deadline.zone))
+		deadline.date, deadline.instant, deadline.zone, deadline.reminderZone))
 	if err != nil {
 		return Task{}, err
 	}

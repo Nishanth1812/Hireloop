@@ -27,6 +27,34 @@ test("date-only deadlines show a day and say the cutoff time is unspecified", ()
   assert.doesNotMatch(result.detail, /Asia\/|UTC|GMT/);
 });
 
+test("date-only reminders are described as approximate, separately from the deadline", () => {
+  assert.match(tasks.deadlineText(task({ reminder_zone: "Asia/Kolkata" })).reminder, /approximate/i);
+  assert.match(tasks.deadlineText(task({ reminder_zone: "Asia/Kolkata" })).reminder, /not a guaranteed cutoff/i);
+  assert.match(tasks.deadlineText(task()).reminder, /no approximate reminders/i);
+  // The cutoff wording stays unchanged: a nudge is not part of the deadline.
+  assert.equal(tasks.deadlineText(task({ reminder_zone: "Asia/Kolkata" })).detail, "Cutoff time unspecified — no time or zone was recorded.");
+});
+
+test("browser zone is used only when it is a usable IANA name", () => {
+  const originalIntl = globalThis.Intl;
+  try {
+    globalThis.Intl = { DateTimeFormat: class {
+      resolvedOptions() { return { timeZone: "Asia/Kolkata" }; }
+      constructor(options) { if (options?.timeZone === "Bad/Zone") throw new Error("unknown"); }
+    } };
+    assert.equal(tasks.browserTimeZone(), "Asia/Kolkata");
+    globalThis.Intl = { DateTimeFormat: class {
+      resolvedOptions() { return { timeZone: "Not/AZone" }; }
+      constructor() { throw new Error("unknown"); }
+    } };
+    assert.equal(tasks.browserTimeZone(), "");
+    globalThis.Intl = undefined;
+    assert.equal(tasks.browserTimeZone(), "");
+  } finally {
+    globalThis.Intl = originalIntl;
+  }
+});
+
 test("date-only formatting never shifts the day with the machine's timezone", () => {
   assert.equal(tasks.formatDateOnly("2026-01-01"), "1 Jan 2026");
   assert.equal(tasks.formatDateOnly("2026-12-31"), "31 Dec 2026");

@@ -389,6 +389,8 @@ test("date-only and exact deadline controls are distinct and labelled", async ()
   expect(dateLabel.textContent.trim()).toMatch(/due date/i);
   expect(container.querySelector("#task-time-zone")).toBeNull();
   expect(container.textContent).toMatch(/never implies a time/i);
+  expect(container.textContent).toMatch(/approximate reminders/i);
+  expect(container.textContent).toMatch(/not a guaranteed cutoff/i);
 
   await render(<TaskForm key="instant-task" {...taskFormProps({ task: {
     ...dateTask, id: "t2", due_precision: "instant", due_local: "2026-11-12T18:00", time_zone: "Asia/Kolkata",
