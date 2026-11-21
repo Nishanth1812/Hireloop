@@ -9,13 +9,20 @@ import (
 	"hireloop/api/internal/resend"
 )
 
+// dispatcherStore is the store surface the Resend dispatcher uses. *Store
+// implements it; tests inject in-memory fakes.
+type dispatcherStore interface {
+	Get(ctx context.Context, userID, id string) (Job, error)
+	SetProviderEmailID(ctx context.Context, jobID string, version int, emailID string) error
+}
+
 // ResendDispatcher implements Dispatcher over the existing resend adapter
 // (apps/api/internal/resend). The verified primary email is resolved at send
 // time through an OwnerEmailResolver (Clerk Backend API in production); the
 // provider email id Resend returns is persisted through the store so
 // provider callbacks and the webhook route can correlate events by email id.
 type ResendDispatcher struct {
-	store   *Store
+	store   dispatcherStore
 	sender  resendSend
 	from    string
 	resolve OwnerEmailResolver
@@ -28,7 +35,7 @@ type resendSend interface {
 
 // NewResendDispatcher builds a dispatcher that sends through sender, sending
 // from from, resolving each owner's verified primary email through resolve.
-func NewResendDispatcher(store *Store, sender resendSend, from string, resolve OwnerEmailResolver) *ResendDispatcher {
+func NewResendDispatcher(store dispatcherStore, sender resendSend, from string, resolve OwnerEmailResolver) *ResendDispatcher {
 	return &ResendDispatcher{store: store, sender: sender, from: from, resolve: resolve}
 }
 
