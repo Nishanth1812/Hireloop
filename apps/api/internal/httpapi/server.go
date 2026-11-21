@@ -379,5 +379,36 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(task)
 	})
+	// Per-task calendar export. The task read is owner-scoped, so a
+	// cross-owner id is a 404 and the export is generated from exactly the
+	// deadline shape stored on the task.
+	mux.HandleFunc("GET /api/tasks/{id}/ics", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		id := r.PathValue("id")
+		if !tasks.ValidID(id) {
+			http.Error(w, "invalid task ID", http.StatusBadRequest)
+			return
+		}
+		if taskStore == nil {
+			http.Error(w, "tasks unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		task, err := taskStore.Get(r.Context(), u.ID, id)
+		if err != nil {
+			taskFailure(w, err)
+			return
+		}
+		export, err := tasks.ExportIcs(task)
+		if err != nil {
+			taskFailure(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "text/calendar; charset=utf-8")
+		w.Header().Set("Content-Disposition", "attachment; filename=task-"+id+".ics")
+		_, _ = w.Write([]byte(export))
+	})
 	return mux
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -482,5 +483,55 @@ func TestPostgresTaskShapeConstraintRejectsDateWithZone(t *testing.T) {
 		 VALUES ($1, $2, 'Bad shape', 'date', '2026-11-12', 'Asia/Kolkata')`, owner, appID)
 	if err == nil {
 		t.Fatal("database accepted a date-only deadline with a timezone")
+	}
+}
+
+func TestPostgresTaskIcsExportRoundTrip(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appID := seedApplication(ctx, t, db, owner)
+
+	dateTask, err := store.Create(ctx, owner, Input{
+		ApplicationID: appID, Title: "Apply by date", DuePrecision: PrecisionDate, DueDate: "2026-11-12",
+	})
+	if err != nil {
+		t.Fatalf("create date-only task: %v", err)
+	}
+	dateExport, err := ExportIcs(dateTask)
+	if err != nil {
+		t.Fatalf("ExportIcs date task: %v", err)
+	}
+	if !strings.Contains(dateExport, "DUE;VALUE=DATE:20261112") || strings.Contains(dateExport, "TZID") {
+		t.Fatalf("date export = %q, want DUE;VALUE=DATE:20261112 with no zone", dateExport)
+	}
+
+	instantTask, err := store.Create(ctx, owner, Input{
+		ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
+		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+	})
+	if err != nil {
+		t.Fatalf("create instant task: %v", err)
+	}
+	got, err := store.Get(ctx, owner, instantTask.ID)
+	if err != nil {
+		t.Fatalf("get instant task: %v", err)
+	}
+	export, err := ExportIcs(got)
+	if err != nil {
+		t.Fatalf("ExportIcs stored instant task: %v", err)
+	}
+	if !strings.Contains(export, "DUE;TZID=Asia/Kolkata:20261112T1800") {
+		t.Fatalf("export = %q, want the stored wall time in the original zone", export)
+	}
+	if !strings.Contains(export, "SUMMARY:Interview") {
+		t.Fatalf("export = %q", export)
+	}
+
+	// Another owner cannot read the task, so its export is not reachable.
+	other := randomOwner(t)
+	cleanupOwner(t, db, other)
+	if _, err := store.Get(ctx, other, instantTask.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("other owner get = %v, want ErrNotFound", err)
 	}
 }

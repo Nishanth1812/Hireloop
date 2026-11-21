@@ -58,6 +58,20 @@ func (s *fakeTaskStore) Create(_ context.Context, owner string, input tasks.Inpu
 	if task.DuePrecision == "" {
 		task.DuePrecision = tasks.PrecisionNone
 	}
+	// Mirror the real store: a stored instant task also carries the resolved
+	// UTC instant, so reads and the calendar export see the same complete
+	// shape the database CHECK enforces.
+	if task.DuePrecision == tasks.PrecisionInstant && task.DueLocal != "" && task.TimeZone != "" {
+		wall, err := time.Parse("2006-01-02T15:04", task.DueLocal)
+		if err == nil {
+			if loc, err := time.LoadLocation(task.TimeZone); err == nil {
+				if candidate := time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, loc);
+					candidate.In(loc).Format("2006-01-02T15:04") == wall.Format("2006-01-02T15:04") {
+					task.DueAt = candidate.UTC().Format(time.RFC3339)
+				}
+			}
+		}
+	}
 	s.records[owner] = append(s.records[owner], task)
 	return task, nil
 }
@@ -314,6 +328,68 @@ func TestTaskCreateEditCompleteCancelAndPrecision(t *testing.T) {
 	}
 }
 
+func TestTaskIcsExportIsOwnerScopedAndWellFormed(t *testing.T) {
+	h := newTaskHarness(t)
+	instant := fmt.Sprintf(`{"application_id":%q,"title":"Interview","due_precision":"instant","due_local":"2026-11-12T18:00","time_zone":"Asia/Kolkata"}`, taskAppID)
+	w := h.request(h.token, http.MethodPost, instant, "/api/tasks")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create instant task: %d %s", w.Code, w.Body.String())
+	}
+	var interview tasks.Task
+	if err := json.Unmarshal(w.Body.Bytes(), &interview); err != nil {
+		t.Fatal(err)
+	}
+	if interview.DueAt == "" {
+		t.Fatalf("fake store should carry the resolved instant: %+v", interview)
+	}
+
+	icsPath := taskPath(interview.ID) + "/ics"
+	if w := h.request(h.tokenB, http.MethodGet, "", icsPath); w.Code != http.StatusNotFound {
+		t.Fatalf("other owner's export = %d, want 404", w.Code)
+	}
+	w = h.request(h.token, http.MethodGet, "", icsPath)
+	if w.Code != http.StatusOK {
+		t.Fatalf("owner export = %d %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "BEGIN:VCALENDAR\r\n") || !strings.HasSuffix(body, "END:VCALENDAR\r\n") {
+		t.Fatalf("export is not a calendar: %q", body)
+	}
+	if !strings.Contains(body, "DUE;TZID=Asia/Kolkata:20261112T1800") {
+		t.Fatalf("export = %q, want the stored wall time in the original zone", body)
+	}
+	if !strings.Contains(body, "SUMMARY:Interview") || !strings.Contains(body, "STATUS:NEEDS-ACTION") {
+		t.Fatalf("export = %q", body)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/calendar") {
+		t.Fatalf("content type = %q", ct)
+	}
+	if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, "task-"+interview.ID+".ics") {
+		t.Fatalf("content disposition = %q", cd)
+	}
+}
+
+func TestTaskIcsExportRejectsMissingAuthInvalidAndUnknownTasks(t *testing.T) {
+	h := newTaskHarness(t)
+	const id = "22222222-2222-4222-8222-000000000001"
+	if w := h.request("", http.MethodGet, "", taskPath(id)+"/ics"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("no auth = %d, want 401", w.Code)
+	}
+	h.store.err = tasks.ErrInvalid
+	if w := h.request(h.token, http.MethodGet, "", taskPath(id)+"/ics"); w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid task = %d, want 400", w.Code)
+	}
+	h.store.err = nil
+	for _, p := range []string{taskPath("not-a-uuid") + "/ics", taskPath("22222222-2222-4222-8222-short") + "/ics"} {
+		if w := h.request(h.token, http.MethodGet, "", p); w.Code != http.StatusBadRequest {
+			t.Fatalf("malformed id %s = %d, want 400", p, w.Code)
+		}
+	}
+	if w := h.request(h.token, http.MethodGet, "", taskPath(id)+"/ics"); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown task = %d, want 404", w.Code)
+	}
+}
+
 func TestTaskValidationAndQueryAreBounded(t *testing.T) {
 	h := newTaskHarness(t)
 	badBodies := map[string]string{
@@ -473,6 +549,7 @@ func TestTaskRoutesUnavailableWithoutStore(t *testing.T) {
 		{http.MethodGet, "", "/api/tasks"},
 		{http.MethodPost, fmt.Sprintf(`{"application_id":%q,"title":"x"}`, taskAppID), "/api/tasks"},
 		{http.MethodGet, "", taskPath("22222222-2222-4222-8222-000000000001")},
+		{http.MethodGet, "", taskPath("22222222-2222-4222-8222-000000000001") + "/ics"},
 		{http.MethodPatch, `{"status":"done"}`, taskPath("22222222-2222-4222-8222-000000000001")},
 	} {
 		r := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))
