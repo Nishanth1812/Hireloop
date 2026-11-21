@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"hireloop/api/db/migrations"
+	"hireloop/api/internal/reminders"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -61,17 +62,20 @@ func openIntegrationStore(t *testing.T) (PostgresStore, *sql.DB, string) {
 
 	owner := randomOwner(t)
 	cleanupOwner(t, db, owner)
-	return PostgresStore{DB: db}, db, owner
+	return PostgresStore{DB: db, Jobs: &reminders.Store{DB: db}}, db, owner
 }
 
 // cleanupOwner registers removal of every row a random test owner can create,
-// including a second owner used by isolation tests. It never touches another
-// owner's data.
+// including reminder jobs, and a second owner used by isolation tests. It
+// never touches another owner's data.
 func cleanupOwner(t *testing.T, db *sql.DB, owner string) {
 	t.Helper()
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cleanupCancel()
+		if _, err := db.ExecContext(cleanupCtx, `DELETE FROM reminder_jobs WHERE user_id = $1`, owner); err != nil {
+			t.Errorf("cleanup reminder jobs for test owner: %v", err)
+		}
 		if _, err := db.ExecContext(cleanupCtx, `DELETE FROM tasks WHERE user_id = $1`, owner); err != nil {
 			t.Errorf("cleanup tasks for test owner: %v", err)
 		}
@@ -91,6 +95,18 @@ func seedApplication(ctx context.Context, t *testing.T, db *sql.DB, owner string
 		t.Fatalf("seed application: %v", err)
 	}
 	return id
+}
+
+// jobForTask reads the reminder job scheduled for a task, scoped to the
+// owner. It returns sql.ErrNoRows when the task has no job.
+func jobForTask(ctx context.Context, t *testing.T, store PostgresStore, db *sql.DB, owner, taskID string) (reminders.Job, error) {
+	t.Helper()
+	var jobID string
+	if err := db.QueryRowContext(ctx,
+		`SELECT id FROM reminder_jobs WHERE user_id = $1 AND task_id = $2`, owner, taskID).Scan(&jobID); err != nil {
+		return reminders.Job{}, err
+	}
+	return store.Jobs.Get(ctx, owner, jobID)
 }
 
 func TestPostgresLegacyAmbiguousInstantCanBeUpdated(t *testing.T) {
@@ -533,5 +549,178 @@ func TestPostgresTaskIcsExportRoundTrip(t *testing.T) {
 	cleanupOwner(t, db, other)
 	if _, err := store.Get(ctx, other, instantTask.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("other owner get = %v, want ErrNotFound", err)
+	}
+}
+
+func TestPostgresTaskCreateSchedulesInstantReminderJob(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appID := seedApplication(ctx, t, db, owner)
+
+	instant, err := store.Create(ctx, owner, Input{
+		ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
+		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+	})
+	if err != nil {
+		t.Fatalf("create instant task: %v", err)
+	}
+	job, err := jobForTask(ctx, t, store, db, owner, instant.ID)
+	if err != nil {
+		t.Fatalf("job for instant task: %v", err)
+	}
+	if job.DeliveryState != reminders.StateScheduled || job.TaskID != instant.ID || job.UserID != owner {
+		t.Fatalf("job = %+v", job)
+	}
+	want, err := time.Parse(time.RFC3339Nano, instant.DueAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !job.DueAt.Equal(want) {
+		t.Fatalf("job due_at = %v, want %v", job.DueAt, want)
+	}
+
+	// Date-only and none deadlines never get a reminder job: a time or alarm
+	// is never invented for a day-only deadline.
+	dateTask, err := store.Create(ctx, owner, Input{ApplicationID: appID, Title: "Apply by date", DuePrecision: PrecisionDate, DueDate: "2026-12-01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobForTask(ctx, t, store, db, owner, dateTask.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("date-only task got a job: %v", err)
+	}
+	none, err := store.Create(ctx, owner, Input{ApplicationID: appID, Title: "Reply to recruiter"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobForTask(ctx, t, store, db, owner, none.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("no-deadline task got a job: %v", err)
+	}
+}
+
+func TestPostgresTaskPatchSuppressesJobsOnCompletionAndCancellation(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appID := seedApplication(ctx, t, db, owner)
+
+	done, err := store.Create(ctx, owner, Input{
+		ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
+		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := store.Create(ctx, owner, Input{
+		ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionInstant,
+		DueLocal: "2026-12-01T09:00", TimeZone: "UTC",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Patch(ctx, owner, done.ID, PatchInput{Status: ptr(StatusDone)}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := jobForTask(ctx, t, store, db, owner, done.ID)
+	if err != nil || job.DeliveryState != reminders.StateSuppressed || job.SuppressReason != reminders.SuppressCompleted {
+		t.Fatalf("completed job = %+v, %v", job, err)
+	}
+	if _, err := store.Patch(ctx, owner, cancelled.ID, PatchInput{Status: ptr(StatusCancelled)}); err != nil {
+		t.Fatal(err)
+	}
+	job, err = jobForTask(ctx, t, store, db, owner, cancelled.ID)
+	if err != nil || job.DeliveryState != reminders.StateSuppressed || job.SuppressReason != reminders.SuppressCancelled {
+		t.Fatalf("cancelled job = %+v, %v", job, err)
+	}
+}
+
+func TestPostgresTaskPatchReschedulesAndClearsJobs(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appID := seedApplication(ctx, t, db, owner)
+
+	task, err := store.Create(ctx, owner, Input{
+		ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
+		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobBefore, err := jobForTask(ctx, t, store, db, owner, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Moving the deadline keeps the same job identity and reactivates it with
+	// the new instant.
+	moved, err := store.Patch(ctx, owner, task.ID, PatchInput{DueLocal: ptr("2026-11-13T09:00"), TimeZone: ptr("Asia/Kolkata")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobAfter, err := jobForTask(ctx, t, store, db, owner, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobAfter.ID != jobBefore.ID {
+		t.Fatalf("job identity changed: %s -> %s", jobBefore.ID, jobAfter.ID)
+	}
+	if jobAfter.DeliveryState != reminders.StateScheduled {
+		t.Fatalf("rescheduled job state = %s, want scheduled", jobAfter.DeliveryState)
+	}
+	want, err := time.Parse(time.RFC3339Nano, moved.DueAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !jobAfter.DueAt.Equal(want) {
+		t.Fatalf("rescheduled job due_at = %v, want %v", jobAfter.DueAt, want)
+	}
+
+	// A title-only patch leaves the scheduled job alone.
+	if _, err := store.Patch(ctx, owner, task.ID, PatchInput{Title: ptr("Interview round two")}); err != nil {
+		t.Fatal(err)
+	}
+	job2, err := jobForTask(ctx, t, store, db, owner, task.ID)
+	if err != nil || job2.DeliveryState != reminders.StateScheduled || !job2.DueAt.Equal(jobAfter.DueAt) {
+		t.Fatalf("job after title patch = %+v, %v", job2, err)
+	}
+
+	// Clearing the deadline suppresses the job.
+	if _, err := store.Patch(ctx, owner, task.ID, PatchInput{DuePrecision: ptr(PrecisionNone)}); err != nil {
+		t.Fatal(err)
+	}
+	job3, err := jobForTask(ctx, t, store, db, owner, task.ID)
+	if err != nil || job3.DeliveryState != reminders.StateSuppressed || job3.SuppressReason != reminders.SuppressRescheduled {
+		t.Fatalf("cleared-deadline job = %+v, %v", job3, err)
+	}
+}
+
+func TestPostgresTaskPatchJobsAreOwnerScoped(t *testing.T) {
+	store, db, ownerA := openIntegrationStore(t)
+	ownerB := randomOwner(t)
+	cleanupOwner(t, db, ownerB)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appA := seedApplication(ctx, t, db, ownerA)
+
+	taskA, err := store.Create(ctx, ownerA, Input{
+		ApplicationID: appA, Title: "A interview", DuePrecision: PrecisionInstant,
+		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobA, err := jobForTask(ctx, t, store, db, ownerA, taskA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// B cannot complete or reschedule A's task: A's job is unchanged.
+	if _, err := store.Patch(ctx, ownerB, taskA.ID, PatchInput{Status: ptr(StatusDone)}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("B patching A's task = %v, want ErrNotFound", err)
+	}
+	jobAfter, err := jobForTask(ctx, t, store, db, ownerA, taskA.ID)
+	if err != nil || jobAfter.DeliveryState != reminders.StateScheduled || jobAfter.ID != jobA.ID {
+		t.Fatalf("A's job after B's attempts = %+v, %v", jobAfter, err)
 	}
 }

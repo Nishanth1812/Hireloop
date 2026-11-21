@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"hireloop/api/internal/reminders"
 )
 
 // Field bounds. The database constraints in migration 005 mirror the text
@@ -409,7 +411,12 @@ type Store interface {
 	Delete(context.Context, string, string) (bool, error)
 }
 
-type PostgresStore struct{ DB *sql.DB }
+type PostgresStore struct {
+	DB *sql.DB
+	// Jobs is the reminders store that owns reminder jobs for this
+	// application's tasks; nil skips deletion suppression.
+	Jobs *reminders.Store
+}
 
 // applicationColumns is the read projection used by every returning query. New
 // columns read with COALESCE(..., '') so a row written before migration 005
@@ -630,7 +637,19 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 }
 
 func (s PostgresStore) Delete(ctx context.Context, userID, id string) (bool, error) {
-	result, err := s.DB.ExecContext(ctx, `DELETE FROM applications WHERE user_id=$1 AND id=$2`, userID, id)
+	// Suppress queued reminder jobs for this application's tasks before the
+	// cascade deletes them, so the tombstones record why they will not fire.
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if s.Jobs != nil {
+		if err := s.Jobs.SuppressByApplication(ctx, tx, userID, id, reminders.SuppressDeleted); err != nil {
+			return false, err
+		}
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM applications WHERE user_id=$1 AND id=$2`, userID, id)
 	if err != nil {
 		return false, err
 	}
@@ -638,5 +657,9 @@ func (s PostgresStore) Delete(ctx context.Context, userID, id string) (bool, err
 	if err != nil {
 		return false, err
 	}
-	return rowsAffected != 0, nil
+	if rowsAffected == 0 {
+		_ = tx.Rollback()
+		return false, nil
+	}
+	return true, tx.Commit()
 }

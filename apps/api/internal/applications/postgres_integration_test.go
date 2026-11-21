@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"hireloop/api/db/migrations"
+	"hireloop/api/internal/reminders"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -69,11 +70,14 @@ func openIntegrationStore(t *testing.T) (PostgresStore, *sql.DB, string) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cleanupCancel()
+		if _, err := db.ExecContext(cleanupCtx, `DELETE FROM reminder_jobs WHERE user_id = $1`, owner); err != nil {
+			t.Errorf("cleanup reminder jobs for test owner: %v", err)
+		}
 		if _, err := db.ExecContext(cleanupCtx, `DELETE FROM applications WHERE user_id = $1`, owner); err != nil {
 			t.Errorf("cleanup rows for test owner: %v", err)
 		}
 	})
-	return PostgresStore{DB: db}, db, owner
+	return PostgresStore{DB: db, Jobs: &reminders.Store{DB: db}}, db, owner
 }
 
 // insertSeedRow inserts a row with an explicit created_at so pagination order is
@@ -711,4 +715,47 @@ func mustCursor(t *testing.T, result ListResult) *Cursor {
 		t.Fatalf("decode next cursor: %v", err)
 	}
 	return &cursor
+}
+
+// TestPostgresDeleteSuppressesQueuedReminderJobs proves deletion suppresses
+// the application's unsent reminder jobs: they are tombstoned as 'deleted'
+// and never claimable again.
+func TestPostgresDeleteSuppressesQueuedReminderJobs(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	appID := insertSeedRow(ctx, t, db, owner, "Acme", "Engineer", "saved", time.Now())
+	due := time.Now().Add(-time.Hour)
+	var taskID string
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO tasks (user_id, application_id, title, due_precision, due_at, time_zone)
+		 VALUES ($1, $2, 'Interview', 'instant', $3, 'UTC') RETURNING id`,
+		owner, appID, due).Scan(&taskID); err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	remindersStore := &reminders.Store{DB: db}
+	if err := remindersStore.Schedule(ctx, db, owner, taskID, due); err != nil {
+		t.Fatalf("schedule job: %v", err)
+	}
+	var jobID string
+	if err := db.QueryRowContext(ctx, `SELECT id FROM reminder_jobs WHERE task_id = $1`, taskID).Scan(&jobID); err != nil {
+		t.Fatalf("find seeded job: %v", err)
+	}
+	// The job is claimable before deletion.
+	if jobs, err := remindersStore.ClaimDue(ctx, due, 5, "tok", due.Add(30*time.Second), []string{owner}); err != nil || len(jobs) != 1 {
+		t.Fatalf("claim before delete = %+v, %v", jobs, err)
+	}
+
+	found, err := store.Delete(ctx, owner, appID)
+	if err != nil || !found {
+		t.Fatalf("delete application = %v, %v", found, err)
+	}
+	job, err := remindersStore.Get(ctx, owner, jobID)
+	if err != nil || job.DeliveryState != reminders.StateSuppressed || job.SuppressReason != reminders.SuppressDeleted {
+		t.Fatalf("job after delete = %+v, %v", job, err)
+	}
+	if jobs, err := remindersStore.ClaimDue(ctx, due, 5, "tok2", due.Add(30*time.Second), []string{owner}); err != nil || len(jobs) != 0 {
+		t.Fatalf("claim after delete = %+v, %v", jobs, err)
+	}
 }

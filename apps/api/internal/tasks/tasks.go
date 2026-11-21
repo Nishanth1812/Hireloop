@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"hireloop/api/internal/applications"
+	"hireloop/api/internal/reminders"
 
 	// Embed the IANA database so an instant's original zone can be validated and
 	// rendered on hosts (including Windows) with no system tzdata installed.
@@ -558,27 +559,106 @@ func renderInstant(instant time.Time, zone string) (string, string) {
 	return utc.Format(time.RFC3339Nano), derived
 }
 
-type PostgresStore struct{ DB *sql.DB }
+// PostgresStore is the SQL store. Jobs schedules reminder jobs for this
+// store's tasks; nil means job scheduling is off (older callers).
+type PostgresStore struct {
+	DB *sql.DB
+	// Jobs is the reminders store that owns reminder jobs; nil skips
+	// scheduling, suppressing and reschedule handling.
+	Jobs *reminders.Store
+}
+
+// dueAtForSchedule reports the instant a task should schedule its reminder
+// for: only exact-instant deadlines get a job; date-only deadlines never
+// invent a time and get none.
+func dueAtForSchedule(deadline resolvedDeadline) (time.Time, bool) {
+	if deadline.precision != PrecisionInstant || deadline.instant == nil {
+		return time.Time{}, false
+	}
+	dueAt, ok := deadline.instant.(time.Time)
+	return dueAt, ok
+}
+
+// syncReminderJobs maintains the durable-reminder invariants after a task
+// patch, inside the same transaction as the task update: a finished task
+// suppresses unsent reminders, and a rescheduled instant deadline reactivates
+// the job or suppresses it when the deadline is cleared or made date-only.
+func (s PostgresStore) syncReminderJobs(ctx context.Context, tx *sql.Tx, userID, taskID string, current Task, status string, deadline resolvedDeadline) error {
+	if s.Jobs == nil {
+		return nil
+	}
+	if trimmed := strings.TrimSpace(status); trimmed != StatusOpen {
+		reason := reminders.SuppressCompleted
+		if trimmed == StatusCancelled {
+			reason = reminders.SuppressCancelled
+		}
+		return s.Jobs.Suppress(ctx, tx, userID, taskID, reason)
+	}
+	if dueAt, ok := dueAtForSchedule(deadline); ok {
+		// Only move the job when the stored instant actually changed: a
+		// patch that leaves the deadline alone must not reset an in-flight job.
+		if current.DuePrecision != PrecisionInstant || !instantsEqual(current.DueAt, dueAt) {
+			return s.Jobs.Schedule(ctx, tx, userID, taskID, dueAt)
+		}
+		return nil
+	}
+	// Open with no instant deadline: a previous instant job is now obsolete.
+	if current.DuePrecision == PrecisionInstant && current.DueAt != "" {
+		return s.Jobs.Suppress(ctx, tx, userID, taskID, reminders.SuppressRescheduled)
+	}
+	return nil
+}
+
+// instantsEqual compares the stored RFC 3339 UTC instant with a resolved one.
+func instantsEqual(stored string, want time.Time) bool {
+	got, err := time.Parse(time.RFC3339Nano, stored)
+	return err == nil && got.Equal(want)
+}
 
 func (s PostgresStore) Create(ctx context.Context, userID string, in Input) (Task, error) {
 	precision, deadline, ok := in.resolve()
 	if !ok {
 		return Task{}, ErrInvalid
 	}
-	// The INSERT selects only when the linked application belongs to this
-	// owner, so a guessed application id cannot attach a task to another
-	// account's record. No row means 404, never a database error.
-	row := s.DB.QueryRowContext(ctx, `INSERT INTO tasks
-		(user_id, application_id, title, status, due_precision, due_date, due_at, time_zone)
-		SELECT $1, $2, $3, '`+StatusOpen+`', $4, $5, $6, $7
-		WHERE EXISTS (SELECT 1 FROM applications WHERE id = $2 AND user_id = $1)
-		RETURNING `+taskColumns,
-		userID, in.ApplicationID, in.Title, precision, deadline.date, deadline.instant, deadline.zone)
-	task, err := scanTask(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Task{}, ErrNotFound
+	insert := func(q reminders.Executor) (Task, error) {
+		// The INSERT selects only when the linked application belongs to this
+		// owner, so a guessed application id cannot attach a task to another
+		// account's record. No row means 404, never a database error.
+		row := q.QueryRowContext(ctx, `INSERT INTO tasks
+			(user_id, application_id, title, status, due_precision, due_date, due_at, time_zone)
+			SELECT $1, $2, $3, '`+StatusOpen+`', $4, $5, $6, $7
+			WHERE EXISTS (SELECT 1 FROM applications WHERE id = $2 AND user_id = $1)
+			RETURNING `+taskColumns,
+			userID, in.ApplicationID, in.Title, precision, deadline.date, deadline.instant, deadline.zone)
+		task, err := scanTask(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Task{}, ErrNotFound
+		}
+		return task, err
 	}
-	return task, err
+	if s.Jobs == nil {
+		return insert(s.DB)
+	}
+	// Schedule the reminder inside the same transaction as the task write so
+	// the job and the task cannot disagree.
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, err
+	}
+	defer tx.Rollback()
+	task, err := insert(tx)
+	if err != nil {
+		return Task{}, err
+	}
+	if dueAt, ok := dueAtForSchedule(deadline); ok {
+		if err := s.Jobs.Schedule(ctx, tx, userID, task.ID, dueAt); err != nil {
+			return Task{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Task{}, err
+	}
+	return task, nil
 }
 
 func (s PostgresStore) List(ctx context.Context, userID string, filter Filter) (ListResult, error) {
@@ -747,6 +827,9 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 		userID, id, merged.Title, strings.TrimSpace(status), precision,
 		deadline.date, deadline.instant, deadline.zone))
 	if err != nil {
+		return Task{}, err
+	}
+	if err := s.syncReminderJobs(ctx, tx, userID, id, current, status, deadline); err != nil {
 		return Task{}, err
 	}
 	if err := tx.Commit(); err != nil {
