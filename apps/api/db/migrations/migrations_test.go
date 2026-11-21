@@ -331,6 +331,41 @@ func TestReminderRetentionCleanupMigrationIsAdditive(t *testing.T) {
 	}
 }
 
+// TestReminderRetentionFixesMigrationIsAdditive pins the Phase 4 retention
+// cleanup fixes (followup to 011): the cleanup function is replaced to fix
+// DELETE RETURNING INTO, add superseded-version payload cleanup, and add
+// uncorrelated pending event cleanup. No data columns are removed.
+func TestReminderRetentionFixesMigrationIsAdditive(t *testing.T) {
+	applied := migrationStatements(t, 12)
+	for _, fragment := range []string{
+		"CREATE OR REPLACE FUNCTION public.cleanup_reminder_retention",
+		"RETURNS TABLE(deleted_payloads int, deleted_pending_events int)",
+		"dp.delivery_version < rj.delivery_version", // superseded version cleanup
+		"ee.job_id IS NULL",                        // uncorrelated event cleanup
+		"GET DIAGNOSTICS payload_count = ROW_COUNT", // no RETURNING INTO
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 012 is missing %q", fragment)
+		}
+	}
+	// The migration replaces the cleanup function; no top-level DROP/DELETE.
+	raw := rawMigration(t, 12)
+	for _, forbidden := range []string{
+		"DROP TABLE",
+		"DROP COLUMN",
+	} {
+		if strings.Contains(raw, forbidden) {
+			t.Errorf("migration 012 must not contain top-level %q", forbidden)
+		}
+	}
+	if idx := strings.Index(raw, "DELETE FROM"); idx >= 0 && idx < strings.Index(raw, "$$") {
+		t.Error("migration 012 must not contain top-level DELETE FROM")
+	}
+	if !strings.Contains(raw, "Rollback:") {
+		t.Error("migration 012 must document how to reverse it")
+	}
+}
+
 func TestApplyIsIdempotentAgainstConfiguredDatabase(t *testing.T) {
 	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
 	if databaseURL == "" {
