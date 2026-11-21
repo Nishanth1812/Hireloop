@@ -96,18 +96,18 @@ func stateRank(state string) int {
 	case StateLeased:
 		return 1
 	case StateAccepted:
-		return 2
-	case StateFailed:
-		return 3
-	case StateUncertain:
-		return 4
-	case StateDelivered:
-		return 5
-	case StateExhausted:
 		return 6
+	case StateFailed:
+		return 2
+	case StateUncertain:
+		return 3
+	case StateExhausted:
+		return 4
 	case StateSuppressed:
-		return 7
+		return 5
 	case StatePermanentFailed:
+		return 7
+	case StateDelivered:
 		return 8
 	}
 	return -1
@@ -136,10 +136,10 @@ func transitionAllowed(current, target string) bool {
 // included: leaving it out would make its CASE value -1 and allow an
 // equal-rank transition to overwrite a terminal permanent failure.
 const stateRankSQL = `CASE delivery_state
-	WHEN 'scheduled' THEN 0 WHEN 'leased' THEN 1 WHEN 'accepted' THEN 2
-	WHEN 'failed' THEN 3 WHEN 'uncertain' THEN 4 WHEN 'delivered' THEN 5
-	WHEN 'exhausted' THEN 6 WHEN 'suppressed' THEN 7
-	WHEN 'permanent_failed' THEN 8 ELSE -1 END`
+	WHEN 'scheduled' THEN 0 WHEN 'leased' THEN 1 WHEN 'failed' THEN 2
+	WHEN 'uncertain' THEN 3 WHEN 'exhausted' THEN 4 WHEN 'suppressed' THEN 5
+	WHEN 'accepted' THEN 6 WHEN 'permanent_failed' THEN 7
+	WHEN 'delivered' THEN 8 ELSE -1 END`
 
 // providerRetryBackoff is the bounded delay used when a provider event
 // schedules a retry. It uses the documented worker defaults (30s, doubling,
@@ -966,7 +966,7 @@ func TransitionForEvent(eventType resend.EventType) (Transition, bool) {
 	case resend.EventDelivered:
 		return Transition{State: StateDelivered, Note: "provider confirmed delivery"}, true
 	case resend.EventDeliverySlow:
-		return Transition{State: StateUncertain, Note: "provider reported a delayed delivery"}, true
+		return Transition{State: StateAccepted, Note: "provider accepted the send; delivery is delayed"}, true
 	case resend.EventFailed:
 		return Transition{State: StateFailed, Note: "provider reported a send failure", ScheduleRetry: true}, true
 	case resend.EventBounced:
