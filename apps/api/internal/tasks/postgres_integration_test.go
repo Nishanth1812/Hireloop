@@ -92,6 +92,33 @@ func seedApplication(ctx context.Context, t *testing.T, db *sql.DB, owner string
 	return id
 }
 
+func TestPostgresLegacyAmbiguousInstantCanBeUpdated(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	appID := seedApplication(ctx, t, db, owner)
+	var id string
+	err := db.QueryRowContext(ctx, `INSERT INTO tasks (user_id, application_id, title, status, due_precision, due_at, time_zone)
+		VALUES ($1, $2, 'Legacy task', 'open', 'instant', '2026-11-01T05:30:00Z', 'America/New_York') RETURNING id`, owner, appID).Scan(&id)
+	if err != nil {
+		t.Fatalf("seed legacy task: %v", err)
+	}
+	status := StatusDone
+	updated, err := store.Patch(ctx, owner, id, PatchInput{Status: &status})
+	if err != nil || updated.Status != StatusDone || updated.DueAt != "2026-11-01T05:30:00Z" {
+		t.Fatalf("status update: %+v, %v", updated, err)
+	}
+	title, precision, local, zone := "Updated", PrecisionInstant, "2026-11-01T01:30", "America/New_York"
+	updated, err = store.Patch(ctx, owner, id, PatchInput{Title: &title, DuePrecision: &precision, DueLocal: &local, TimeZone: &zone})
+	if err != nil || updated.Title != title || updated.DueAt != "2026-11-01T05:30:00Z" {
+		t.Fatalf("unchanged legacy deadline: %+v, %v", updated, err)
+	}
+	local = "2026-11-01T01:45"
+	if _, err := store.Patch(ctx, owner, id, PatchInput{DueLocal: &local}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("new ambiguous deadline: got %v, want ErrInvalid", err)
+	}
+}
+
 func TestPostgresTaskDeadlinePrecisionRoundTrip(t *testing.T) {
 	store, db, owner := openIntegrationStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -329,7 +356,7 @@ func TestPostgresTaskListIsBoundedAndContinues(t *testing.T) {
 	}
 	// A cursor past the last row is an empty page with no continuation.
 	filter.After = &Cursor{Day: "2026-12-05", At: noInstantAt,
-		CreatedAt: time.Date(2026, 12, 5, 0, 0, 0, 0, time.UTC), ID: "ffffffff-ffff-4fff-8fff-ffffffffffff"}
+		CreatedAt: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), ID: "00000000-0000-4000-8000-000000000000"}
 	past, err := store.List(ctx, owner, filter)
 	if err != nil || len(past.Items) != 0 || past.NextCursor != "" || past.Total != 5 {
 		t.Fatalf("past-last page = %+v, err = %v", past, err)

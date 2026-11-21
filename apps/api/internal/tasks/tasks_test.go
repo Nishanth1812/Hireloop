@@ -1,6 +1,7 @@
 package tasks
 
 import (
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -8,6 +9,25 @@ import (
 )
 
 const appID = "11111111-1111-4111-8111-111111111111"
+
+type pageScanner struct{ created time.Time }
+
+func (s pageScanner) Scan(dest ...any) error {
+	if len(dest) != 10 {
+		return fmt.Errorf("expected 10 scan destinations, got %d", len(dest))
+	}
+	*dest[8].(*time.Time) = s.created
+	*dest[9].(*string) = "infinity"
+	return nil
+}
+
+func TestScanTaskPageUsesCreatedAtAsCursorKey(t *testing.T) {
+	created := time.Date(2026, 11, 1, 1, 2, 3, 456, time.UTC)
+	page, err := scanTaskPage(pageScanner{created: created})
+	if err != nil || !page.CreatedAt.Equal(created) || page.Day != "infinity" {
+		t.Fatalf("page = %+v, error = %v", page, err)
+	}
+}
 
 func TestDeadlinePrecisionIsValidatedAndKeptDistinct(t *testing.T) {
 	tests := []struct {

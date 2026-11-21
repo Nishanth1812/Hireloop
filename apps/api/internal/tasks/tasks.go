@@ -533,11 +533,12 @@ func scanTaskPage(row scanner) (taskPageRow, error) {
 	var raw taskRow
 	var page taskPageRow
 	err := row.Scan(&raw.ID, &raw.ApplicationID, &raw.Title, &raw.Status, &raw.Precision,
-		&raw.Date, &raw.At, &raw.Zone, &raw.CreatedAt, &page.Day, &page.CreatedAt)
+		&raw.Date, &raw.At, &raw.Zone, &raw.CreatedAt, &page.Day)
 	if err != nil {
 		return taskPageRow{}, err
 	}
 	page.Task = taskFromRow(raw)
+	page.CreatedAt = raw.CreatedAt
 	page.At = noInstantAt
 	if raw.At.Valid {
 		page.At = raw.At.Time.UTC().Format(time.RFC3339Nano)
@@ -609,8 +610,8 @@ func (s PostgresStore) List(ctx context.Context, userID string, filter Filter) (
 	pageSQL := `SELECT ` + taskPageColumns + ` FROM tasks WHERE ` + where
 	args := []any{userID}
 	if filter.After != nil {
+		n := len(args) + 1
 		args = append(args, filter.After.Day, filter.After.At, filter.After.CreatedAt, filter.After.ID)
-		n := len(args)
 		key := `COALESCE(due_date, (due_at AT TIME ZONE 'UTC')::date, 'infinity'::date)`
 		at := `COALESCE(due_at, '-infinity'::timestamptz)`
 		pageSQL += fmt.Sprintf(` AND ((%s, %s) > ($%d::date, $%d::timestamptz)
@@ -726,6 +727,16 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 		status = *input.Status
 	}
 	precision, deadline, ok := merged.resolve()
+	// Preserve an existing instant when its wall time and zone are unchanged.
+	// Older records may have been saved during an ambiguous clock transition.
+	if !ok && target == PrecisionInstant && current.DuePrecision == PrecisionInstant &&
+		strings.TrimSpace(merged.DueLocal) == current.DueLocal && strings.TrimSpace(merged.TimeZone) == current.TimeZone &&
+		applications.ValidID(merged.ApplicationID) && validTitle(strings.TrimSpace(merged.Title)) {
+		if instant, err := time.Parse(time.RFC3339, current.DueAt); err == nil {
+			merged.Title = strings.TrimSpace(merged.Title)
+			precision, deadline, ok = PrecisionInstant, resolvedDeadline{precision: PrecisionInstant, instant: instant, zone: current.TimeZone}, true
+		}
+	}
 	if !ok || !validStatus(strings.TrimSpace(status)) {
 		return Task{}, ErrInvalid
 	}

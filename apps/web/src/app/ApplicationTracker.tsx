@@ -422,13 +422,15 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         setError("Choose a date and time for this deadline.");
         return;
       }
-      const issue = localDeadlineIssue(fields.due_local, fields.time_zone);
+      const unchanged = taskDraft.task?.due_precision === "instant" &&
+        fields.due_local === taskDraft.task.due_local && fields.time_zone === taskDraft.task.time_zone;
+      const issue = unchanged ? null : localDeadlineIssue(fields.due_local, fields.time_zone);
       if (issue === "gap") {
         setError("That local time does not exist in the chosen zone because the clocks jump forward. Choose another time.");
         return;
       }
       if (issue === "ambiguous") {
-        setError("That local time happens twice when the clocks go back. Choose another time or state the offset explicitly.");
+        setError("That local time happens twice when the clocks go back. Choose another time.");
         return;
       }
     }

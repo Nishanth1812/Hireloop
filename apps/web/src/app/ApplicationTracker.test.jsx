@@ -578,6 +578,23 @@ test("Today steps back when a later page is emptied by another write", async () 
   expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
 });
 
+test("an unchanged legacy ambiguous deadline can be edited", async () => {
+  const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved" };
+  const task = openTask({ due_precision: "instant", due_date: "", due_local: "2026-11-01T01:30", due_at: "2026-11-01T05:30:00Z", time_zone: "America/New_York" });
+  let patch;
+  globalThis.fetch = async (url, options) => {
+    if (options.method === "PATCH") { patch = JSON.parse(options.body); return Response.json(task); }
+    if (url.startsWith("/api/tasks")) return taskResponse([task]);
+    return Response.json(page({ items: [app], total: 1 }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onEditTask(task, app); });
+  await act(async () => { await dashboardProps.onSaveTask({ preventDefault() {}, currentTarget: formWith({ title: "Updated", due_precision: "instant", due_local: task.due_local, time_zone: task.time_zone }) }, task.id); });
+  expect(patch.title).toBe("Updated");
+  expect(dashboardProps.taskDraft).toBeNull();
+});
+
 test("an ambiguous fall-back deadline is rejected before any request", async () => {
   const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved" };
   let writes = 0;
