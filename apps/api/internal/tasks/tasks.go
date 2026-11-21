@@ -555,7 +555,7 @@ func renderInstant(instant time.Time, zone string) (string, string) {
 	if loc, err := time.LoadLocation(zone); err == nil {
 		derived = utc.In(loc).Format("2006-01-02T15:04")
 	}
-	return utc.Format(time.RFC3339), derived
+	return utc.Format(time.RFC3339Nano), derived
 }
 
 type PostgresStore struct{ DB *sql.DB }

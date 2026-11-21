@@ -99,18 +99,18 @@ func TestPostgresLegacyAmbiguousInstantCanBeUpdated(t *testing.T) {
 	appID := seedApplication(ctx, t, db, owner)
 	var id string
 	err := db.QueryRowContext(ctx, `INSERT INTO tasks (user_id, application_id, title, status, due_precision, due_at, time_zone)
-		VALUES ($1, $2, 'Legacy task', 'open', 'instant', '2026-11-01T05:30:00Z', 'America/New_York') RETURNING id`, owner, appID).Scan(&id)
+		VALUES ($1, $2, 'Legacy task', 'open', 'instant', '2026-11-01T05:30:00.123456Z', 'America/New_York') RETURNING id`, owner, appID).Scan(&id)
 	if err != nil {
 		t.Fatalf("seed legacy task: %v", err)
 	}
 	status := StatusDone
 	updated, err := store.Patch(ctx, owner, id, PatchInput{Status: &status})
-	if err != nil || updated.Status != StatusDone || updated.DueAt != "2026-11-01T05:30:00Z" {
+	if err != nil || updated.Status != StatusDone || updated.DueAt != "2026-11-01T05:30:00.123456Z" {
 		t.Fatalf("status update: %+v, %v", updated, err)
 	}
 	title, precision, local, zone := "Updated", PrecisionInstant, "2026-11-01T01:30", "America/New_York"
 	updated, err = store.Patch(ctx, owner, id, PatchInput{Title: &title, DuePrecision: &precision, DueLocal: &local, TimeZone: &zone})
-	if err != nil || updated.Title != title || updated.DueAt != "2026-11-01T05:30:00Z" {
+	if err != nil || updated.Title != title || updated.DueAt != "2026-11-01T05:30:00.123456Z" {
 		t.Fatalf("unchanged legacy deadline: %+v, %v", updated, err)
 	}
 	local = "2026-11-01T01:45"
