@@ -38,12 +38,14 @@ const (
 // dispatch are byte-stable and a rescheduled job dispatches under a new
 // version.
 type Notification struct {
-	ID     string
-	UserID string
-	TaskID string
-	DueAt  time.Time
-	Title  string
-	Version int
+	ID             string
+	UserID         string
+	TaskID         string
+	DueAt          time.Time        // The reminder time (when this advance reminder fires)
+	TrueDeadline   time.Time        // The task's actual deadline (for email rendering and dispatch guard)
+	ReminderTiming ReminderTiming   // Which advance reminder this is (24h_before, 2h_before, at_deadline)
+	Title          string
+	Version        int
 }
 
 // Payload is the complete outbound message for one (job, version). It is

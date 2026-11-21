@@ -14,9 +14,10 @@ import (
 // security_store_regression_test.go.
 
 func securityNotification(version int, title string) Notification {
+	dueAt := time.Date(2026, 11, 21, 9, 30, 0, 0, time.UTC)
 	return Notification{
 		ID: "job-1", UserID: "owner-1", TaskID: "task-1",
-		DueAt: time.Date(2026, 11, 21, 9, 30, 0, 0, time.UTC),
+		DueAt: dueAt, TrueDeadline: dueAt, ReminderTiming: TimingAtDeadline,
 		Title: title, Version: version,
 	}
 }

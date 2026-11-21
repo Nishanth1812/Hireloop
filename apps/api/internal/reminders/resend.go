@@ -9,6 +9,24 @@ import (
 	"hireloop/api/internal/resend"
 )
 
+// buildReminderText constructs the email body for an advance reminder.
+// It shows the true deadline and indicates which advance reminder this is.
+// Date-only deadlines are not supported for reminders (no instant = no job).
+func buildReminderText(title string, trueDeadline time.Time, timing ReminderTiming) string {
+	var timingLine string
+	switch timing {
+	case Timing24hBefore:
+		timingLine = "This reminder fires 24 hours before your deadline."
+	case Timing2hBefore:
+		timingLine = "This reminder fires 2 hours before your deadline."
+	case TimingAtDeadline:
+		timingLine = "This reminder fires at your deadline."
+	default:
+		timingLine = "This is a reminder for your upcoming deadline."
+	}
+	return fmt.Sprintf("Hireloop reminder: %s\nDue: %s\n%s\n", title, trueDeadline.UTC().Format(time.RFC3339), timingLine)
+}
+
 // dispatcherStore is the store surface the Resend dispatcher uses. *Store
 // implements it; tests inject in-memory fakes.
 type dispatcherStore interface {
@@ -80,7 +98,7 @@ func (d *ResendDispatcher) Send(ctx context.Context, n Notification) Outcome {
 		p = Payload{
 			Recipient: to,
 			Subject:   "Hireloop reminder: " + n.Title,
-			Text:      "Hireloop reminder: " + n.Title + "\nDue: " + n.DueAt.UTC().Format(time.RFC3339) + "\n",
+			Text:      buildReminderText(n.Title, n.TrueDeadline, n.ReminderTiming),
 		}
 		p, err = d.store.SaveDeliveryPayload(ctx, job.ID, job.DeliveryVersion, p)
 		if err != nil {

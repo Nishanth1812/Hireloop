@@ -201,9 +201,24 @@ func (w *Worker) dispatchOne(ctx context.Context, job Job) error {
 			State: StateSuppressed, Reason: SuppressDisabled, Note: "reminders disabled",
 		})
 	}
+	// Deadline guard: never send a reminder past the true deadline.
+	// This handles retries, worker downtime, and any delay between
+	// claim and dispatch. The true deadline is stored on the job.
+	now := w.now()
+	if !current.TrueDeadline.IsZero() && now.After(current.TrueDeadline) {
+		return w.store.RecordDelivery(ctx, current.ID, current.LeaseToken, Transition{
+			State: StateSuppressed, Reason: SuppressDeadlinePassed, Note: "deadline passed before dispatch",
+		})
+	}
 	outcome := w.dispatcher.Send(ctx, Notification{
-		ID: current.ID, UserID: current.UserID, TaskID: current.TaskID, DueAt: current.DueAt,
-		Title: title, Version: current.DeliveryVersion,
+		ID:             current.ID,
+		UserID:         current.UserID,
+		TaskID:         current.TaskID,
+		DueAt:          current.DueAt,
+		TrueDeadline:   current.TrueDeadline,
+		ReminderTiming: current.ReminderTiming,
+		Title:          title,
+		Version:        current.DeliveryVersion,
 	})
 	return w.store.RecordDelivery(ctx, current.ID, current.LeaseToken, w.applyOutcome(current, outcome))
 }

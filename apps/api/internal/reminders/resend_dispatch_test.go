@@ -114,11 +114,12 @@ func (s *captureSender) calls() int {
 }
 
 func newDispatchStore(owner string) *dispatchStore {
+	dueAt := time.Date(2026, 11, 21, 9, 30, 0, 0, time.UTC)
 	return &dispatchStore{
 		payloads:     map[string]Payload{},
 		payloadTimes: map[string]time.Time{},
 		jobs: map[string]Job{
-			"job-1": {ID: "job-1", UserID: owner, TaskID: "task-1", DueAt: time.Date(2026, 11, 21, 9, 30, 0, 0, time.UTC), DeliveryVersion: 1},
+			"job-1": {ID: "job-1", UserID: owner, TaskID: "task-1", DueAt: dueAt, TrueDeadline: dueAt, ReminderTiming: TimingAtDeadline, DeliveryVersion: 1},
 		},
 	}
 }
@@ -135,9 +136,11 @@ func TestResendDispatcherAcceptsAndPersistsProviderEmailID(t *testing.T) {
 		return "student@example.com", nil
 	})
 
+	dueAt := store.jobs["job-1"].DueAt
 	outcome := dispatcher.Send(context.Background(), Notification{
 		ID: "job-1", UserID: "owner-1", TaskID: "task-1",
-		DueAt: store.jobs["job-1"].DueAt, Title: "Interview", Version: 1,
+		DueAt: dueAt, TrueDeadline: dueAt, ReminderTiming: TimingAtDeadline,
+		Title: "Interview", Version: 1,
 	})
 	if outcome != OutcomeAccepted {
 		t.Fatalf("outcome = %q, want accepted", outcome)
@@ -162,7 +165,7 @@ func TestResendDispatcherAcceptsAndPersistsProviderEmailID(t *testing.T) {
 	if msg.Subject != "Hireloop reminder: Interview" {
 		t.Fatalf("subject = %q", msg.Subject)
 	}
-	wantText := "Hireloop reminder: Interview\nDue: 2026-11-21T09:30:00Z\n"
+	wantText := "Hireloop reminder: Interview\nDue: 2026-11-21T09:30:00Z\nThis reminder fires at your deadline.\n"
 	if msg.Text != wantText {
 		t.Fatalf("text = %q, want %q", msg.Text, wantText)
 	}
@@ -177,7 +180,8 @@ func TestResendDispatcherPayloadIsByteStableAcrossRetries(t *testing.T) {
 	}}
 	dispatcher := NewResendDispatcher(store, sender, "hireloop@example.com",
 		func(_ context.Context, _ string) (string, error) { return "student@example.com", nil })
-	n := Notification{ID: "job-1", UserID: "owner-1", TaskID: "task-1", DueAt: store.jobs["job-1"].DueAt, Title: "Interview", Version: 1}
+	dueAt := store.jobs["job-1"].DueAt
+	n := Notification{ID: "job-1", UserID: "owner-1", TaskID: "task-1", DueAt: dueAt, TrueDeadline: dueAt, ReminderTiming: TimingAtDeadline, Title: "Interview", Version: 1}
 
 	for i, want := range []Outcome{OutcomeFailed, OutcomeFailed, OutcomeAccepted} {
 		if outcome := dispatcher.Send(context.Background(), n); outcome != want {
@@ -209,7 +213,8 @@ func TestResendDispatcherMapsProviderStatuses(t *testing.T) {
 			sender := &captureSender{queue: []captureSenderEntry{{result: resend.Result{Status: tc.status}}}}
 			dispatcher := NewResendDispatcher(store, sender, "hireloop@example.com",
 				func(_ context.Context, _ string) (string, error) { return "student@example.com", nil })
-			outcome := dispatcher.Send(context.Background(), Notification{ID: "job-1", UserID: "owner-1", Version: 1})
+			dueAt := store.jobs["job-1"].DueAt
+			outcome := dispatcher.Send(context.Background(), Notification{ID: "job-1", UserID: "owner-1", DueAt: dueAt, TrueDeadline: dueAt, ReminderTiming: TimingAtDeadline, Version: 1})
 			if outcome != tc.want {
 				t.Fatalf("outcome = %q, want %q", outcome, tc.want)
 			}
@@ -222,13 +227,14 @@ func TestResendDispatcherResolverFailures(t *testing.T) {
 	sender := &captureSender{}
 	dispatcher := NewResendDispatcher(store, sender, "hireloop@example.com",
 		func(_ context.Context, _ string) (string, error) { return "", ErrNoVerifiedEmail })
-	if outcome := dispatcher.Send(context.Background(), Notification{ID: "job-1", UserID: "owner-1", Version: 1}); outcome != OutcomePermanent {
+	dueAt := store.jobs["job-1"].DueAt
+	if outcome := dispatcher.Send(context.Background(), Notification{ID: "job-1", UserID: "owner-1", DueAt: dueAt, TrueDeadline: dueAt, ReminderTiming: TimingAtDeadline, Version: 1}); outcome != OutcomePermanent {
 		t.Fatalf("no verified email: outcome = %q, want %q", outcome, OutcomePermanent)
 	}
 
 	dispatcher = NewResendDispatcher(store, sender, "hireloop@example.com",
 		func(_ context.Context, _ string) (string, error) { return "", errors.New("clerk: backend request failed") })
-	if outcome := dispatcher.Send(context.Background(), Notification{ID: "job-1", UserID: "owner-1", Version: 1}); outcome != OutcomeFailed {
+	if outcome := dispatcher.Send(context.Background(), Notification{ID: "job-1", UserID: "owner-1", DueAt: dueAt, TrueDeadline: dueAt, ReminderTiming: TimingAtDeadline, Version: 1}); outcome != OutcomeFailed {
 		t.Fatalf("backend failure: outcome = %q, want %q", outcome, OutcomeFailed)
 	}
 	if sender.calls() != 0 {
@@ -243,7 +249,8 @@ func TestResendDispatcherRejectsStaleVersion(t *testing.T) {
 		func(_ context.Context, _ string) (string, error) { return "student@example.com", nil })
 	// The job's current version is 1; a dispatch claimed at version 0 must
 	// not reuse the old version's key.
-	outcome := dispatcher.Send(context.Background(), Notification{ID: "job-1", UserID: "owner-1", Version: 0})
+	dueAt := store.jobs["job-1"].DueAt
+	outcome := dispatcher.Send(context.Background(), Notification{ID: "job-1", UserID: "owner-1", DueAt: dueAt, TrueDeadline: dueAt, ReminderTiming: TimingAtDeadline, Version: 0})
 	if outcome != OutcomeFailed {
 		t.Fatalf("outcome = %q, want %q", outcome, OutcomeFailed)
 	}
@@ -307,8 +314,8 @@ func TestResendDispatcherIdempotencyExpiry(t *testing.T) {
 	dispatcher := NewResendDispatcher(store, sender, "hireloop@example.com",
 		func(_ context.Context, _ string) (string, error) { return "student@example.com", nil })
 
-	// First attempt succeeds (retryable, simulating a transient failure)
-	n := Notification{ID: "job-1", UserID: "owner-1", TaskID: "task-1", DueAt: store.jobs["job-1"].DueAt, Title: "Interview", Version: 1}
+	dueAt := store.jobs["job-1"].DueAt
+	n := Notification{ID: "job-1", UserID: "owner-1", TaskID: "task-1", DueAt: dueAt, TrueDeadline: dueAt, ReminderTiming: TimingAtDeadline, Title: "Interview", Version: 1}
 	if outcome := dispatcher.Send(context.Background(), n); outcome != OutcomeFailed {
 		t.Fatalf("first attempt = %q, want failed (retryable)", outcome)
 	}

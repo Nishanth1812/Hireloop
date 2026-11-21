@@ -151,13 +151,27 @@ func providerRetryBackoff(attempt int) time.Duration {
 	return d
 }
 
+// ReminderTiming identifies when an advance reminder fires relative to
+// the true deadline.
+type ReminderTiming string
+
+const (
+	Timing24hBefore ReminderTiming = "24h_before"
+	Timing2hBefore  ReminderTiming = "2h_before"
+	// TimingAtDeadline is the legacy single-job behavior: the reminder
+// fires at the exact deadline. Kept for forward-compatible migration
+// of existing jobs; new scheduling never creates this timing.
+TimingAtDeadline ReminderTiming = "at_deadline"
+)
+
 // Suppression reasons recorded on a job when it must not fire.
 const (
-	SuppressCompleted   = "completed"
-	SuppressCancelled   = "cancelled"
-	SuppressDeleted     = "deleted"
-	SuppressRescheduled = "rescheduled"
-	SuppressDisabled    = "disabled"
+	SuppressCompleted      = "completed"
+	SuppressCancelled      = "cancelled"
+	SuppressDeleted        = "deleted"
+	SuppressRescheduled    = "rescheduled"
+	SuppressDisabled       = "disabled"
+	SuppressDeadlinePassed = "deadline_passed"
 )
 
 var ErrNotFound = errors.New("reminder job not found")
@@ -176,7 +190,15 @@ type Job struct {
 	ID             string
 	UserID         string
 	TaskID         string
+	// DueAt is the reminder time (when this advance reminder should fire).
+	// For 24h_before: true_deadline - 24h. For 2h_before: true_deadline - 2h.
+	// For legacy at_deadline: equals true_deadline.
 	DueAt          time.Time
+	// TrueDeadline is the task's actual instant deadline. Used for the
+	// dispatch guard (never send past deadline) and rendered in the email.
+	TrueDeadline   time.Time
+	// ReminderTiming identifies which advance reminder this job is.
+	ReminderTiming ReminderTiming
 	DeliveryState  string
 	SuppressReason string
 	LeaseToken     string
@@ -214,31 +236,63 @@ type Transition struct {
 // Store reads and writes reminder_jobs and user_notification_settings.
 type Store struct{ DB *sql.DB }
 
-// Schedule activates or reactivates the job for a task: one job per task,
-// reactivated with the new instant deadline when the task is rescheduled, or
-// created when the task gains an instant deadline. Date-only deadlines never
-// get a job (no time is invented). Every reactivation bumps delivery_version
-// and clears the provider mapping and callback bookkeeping, so the next
-// dispatch uses a fresh per-version idempotency key and old provider events
-// for previous versions cannot overwrite the reactivated job.
-func (s *Store) Schedule(ctx context.Context, w Executor, userID, taskID string, dueAt time.Time) error {
-	res, err := w.ExecContext(ctx, `INSERT INTO reminder_jobs (user_id, task_id, due_at, delivery_version)
-		VALUES ($1, $2, $3, 1)
-		ON CONFLICT (task_id) DO UPDATE SET
+// Schedule activates or reactivates the two advance reminder jobs for a
+// task: one at 24h before the true deadline, one at 2h before. Date-only
+// deadlines never get a job (no time is invented). Only future-eligible
+// slots are scheduled: if the true deadline is less than 24h away, only the
+// 2h reminder is scheduled (if still in the future); if less than 2h away,
+// no advance reminders are scheduled. Every reactivation bumps
+// delivery_version and clears the provider mapping and callback bookkeeping,
+// so the next dispatch uses a fresh per-version idempotency key and old
+// provider events for previous versions cannot overwrite the reactivated job.
+func (s *Store) Schedule(ctx context.Context, w Executor, userID, taskID string, trueDeadline time.Time) error {
+	now := time.Now()
+	// Suppress any existing jobs for this task first (handles reschedule,
+	// completion, etc.). The unique index on (task_id, reminder_timing)
+	// allows us to upsert each timing independently.
+	_, err := w.ExecContext(ctx, `UPDATE reminder_jobs
+		SET delivery_state = '`+StateSuppressed+`', suppress_reason = '`+SuppressRescheduled+`',
+			lease_token = NULL, lease_until = NULL, retry_at = NULL,
+			provider_email_id = NULL, provider_version = NULL, updated_at = now()
+		WHERE user_id = $1 AND task_id = $2 AND delivery_state IN ('scheduled','leased','failed','uncertain')`,
+		userID, taskID)
+	if err != nil {
+		return err
+	}
+
+	// Schedule 24h before reminder if eligible.
+	if d24 := trueDeadline.Add(-24 * time.Hour); d24.After(now) {
+		if err := s.scheduleOne(ctx, w, userID, taskID, trueDeadline, d24, Timing24hBefore); err != nil {
+			return err
+		}
+	}
+	// Schedule 2h before reminder if eligible.
+	if d2 := trueDeadline.Add(-2 * time.Hour); d2.After(now) {
+		if err := s.scheduleOne(ctx, w, userID, taskID, trueDeadline, d2, Timing2hBefore); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// scheduleOne inserts or reactivates a single advance reminder job.
+func (s *Store) scheduleOne(ctx context.Context, w Executor, userID, taskID string, trueDeadline, dueAt time.Time, timing ReminderTiming) error {
+	res, err := w.ExecContext(ctx, `INSERT INTO reminder_jobs (user_id, task_id, due_at, true_deadline, reminder_timing, delivery_version)
+		VALUES ($1, $2, $3, $4, $5, 1)
+		ON CONFLICT (task_id, reminder_timing) DO UPDATE SET
 			delivery_state = '`+StateScheduled+`',
 			due_at = $3,
+			true_deadline = $4,
 			delivery_version = reminder_jobs.delivery_version + 1,
 			lease_token = NULL, lease_until = NULL,
 			retry_count = 0, retry_at = NULL, callback_key = NULL,
 			delivery_note = NULL, suppress_reason = NULL,
 			provider_email_id = NULL, provider_version = NULL,
 			updated_at = now()
-		WHERE reminder_jobs.user_id = $4`, userID, taskID, dueAt, userID)
+		WHERE reminder_jobs.user_id = $6`, userID, taskID, dueAt, trueDeadline, timing, userID)
 	if err != nil {
 		return err
 	}
-	// A task id already owned by someone else is a cross-owner conflict:
-	// never reactivate or take over that owner's job.
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return err
@@ -282,11 +336,12 @@ func (s *Store) Get(ctx context.Context, userID, id string) (Job, error) {
 	var suppress, leaseToken, callbackKey, note, providerEmailID sql.NullString
 	var leaseUntil, retryAt sql.NullTime
 	var providerVersion sql.NullInt64
-	err := s.DB.QueryRowContext(ctx, `SELECT id, user_id, task_id, due_at, delivery_state,
+	var reminderTiming, trueDeadline sql.NullString
+	err := s.DB.QueryRowContext(ctx, `SELECT id, user_id, task_id, due_at, true_deadline, reminder_timing, delivery_state,
 			suppress_reason, lease_token, lease_until, retry_count, retry_at, callback_key,
 			delivery_note, delivery_version, provider_email_id, provider_version, updated_at
 		FROM reminder_jobs WHERE user_id = $1 AND id = $2`, userID, id).
-		Scan(&job.ID, &job.UserID, &job.TaskID, &job.DueAt, &job.DeliveryState,
+		Scan(&job.ID, &job.UserID, &job.TaskID, &job.DueAt, &trueDeadline, &reminderTiming, &job.DeliveryState,
 			&suppress, &leaseToken, &leaseUntil, &job.RetryCount, &retryAt,
 			&callbackKey, &note, &job.DeliveryVersion, &providerEmailID,
 			&providerVersion, &job.UpdatedAt)
@@ -309,6 +364,12 @@ func (s *Store) Get(ctx context.Context, userID, id string) (Job, error) {
 		at := retryAt.Time
 		job.RetryAt = &at
 	}
+	if trueDeadline.Valid {
+		if parsed, err := time.Parse(time.RFC3339Nano, trueDeadline.String); err == nil {
+			job.TrueDeadline = parsed
+		}
+	}
+	job.ReminderTiming = ReminderTiming(reminderTiming.String)
 	return job, nil
 }
 

@@ -102,13 +102,62 @@ func seedInstantTask(ctx context.Context, t *testing.T, db *sql.DB, owner string
 	return taskID
 }
 
-func jobIDForTask(ctx context.Context, t *testing.T, db *sql.DB, taskID string) string {
+func jobIDsForTask(ctx context.Context, t *testing.T, db *sql.DB, taskID string) []string {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, `SELECT id FROM reminder_jobs WHERE task_id = $1 ORDER BY reminder_timing`, taskID)
+	if err != nil {
+		t.Fatalf("find jobs for task: %v", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan job id: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows error: %v", err)
+	}
+	return ids
+}
+
+// jobIDForTaskTiming returns the job ID for a specific timing.
+func jobIDForTaskTiming(ctx context.Context, t *testing.T, db *sql.DB, taskID string, timing ReminderTiming) string {
 	t.Helper()
 	var jobID string
-	if err := db.QueryRowContext(ctx, `SELECT id FROM reminder_jobs WHERE task_id = $1`, taskID).Scan(&jobID); err != nil {
-		t.Fatalf("find job for task: %v", err)
+	err := db.QueryRowContext(ctx, `SELECT id FROM reminder_jobs WHERE task_id = $1 AND reminder_timing = $2`, taskID, timing).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("find job for task timing: %v", err)
 	}
 	return jobID
+}
+
+// jobIDForTask returns the 2h_before job ID (or the first job if 2h_before
+// doesn't exist). This is a backward-compatible helper for tests that expect
+// a single job per task.
+func jobIDForTask(ctx context.Context, t *testing.T, db *sql.DB, taskID string) string {
+	t.Helper()
+	// Try 2h_before first, then 24h_before, then any.
+	for _, timing := range []ReminderTiming{Timing2hBefore, Timing24hBefore, TimingAtDeadline} {
+		if id := jobIDForTaskTiming(ctx, t, db, taskID, timing); id != "" {
+			return id
+		}
+	}
+	t.Fatalf("no job found for task %s", taskID)
+	return ""
+}
+
+// setJobDueAt sets the due_at (reminder time) for a job to a specific time.
+func setJobDueAt(ctx context.Context, t *testing.T, db *sql.DB, jobID string, dueAt time.Time) {
+	t.Helper()
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET due_at = $1 WHERE id = $2`, dueAt, jobID); err != nil {
+		t.Fatalf("set job due_at: %v", err)
+	}
 }
 
 type fakeDispatcher struct {
@@ -134,37 +183,62 @@ func TestWorkerDispatchesDueInstantDeadline(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Hour)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+
+	// Use a deadline far enough in the future that both reminders are eligible.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatalf("schedule job: %v", err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+
+	// Get both job IDs and set their due_at (reminder time) to be in the past
+	// so the worker will claim them.
+	jobID24 := jobIDForTaskTiming(ctx, t, db, taskID, Timing24hBefore)
+	jobID2 := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID24 == "" || jobID2 == "" {
+		t.Fatalf("expected two jobs, got 24h=%q 2h=%q", jobID24, jobID2)
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID24, past)
+	setJobDueAt(ctx, t, db, jobID2, past)
 
 	disp := &fakeDispatcher{outcome: OutcomeDelivered}
 	w := NewWorker(store, Config{Dispatcher: disp, Scope: []string{owner}, BatchSize: 5})
 	n, err := w.poll(ctx, 5)
-	if err != nil || n != 1 {
+	if err != nil || n != 2 {
 		t.Fatalf("poll = %d, %v", n, err)
 	}
-	if disp.count() != 1 {
-		t.Fatalf("dispatches = %d, want 1", disp.count())
+	if disp.count() != 2 {
+		t.Fatalf("dispatches = %d, want 2", disp.count())
 	}
-	call := disp.calls[0]
-	if call.ID != jobID || call.UserID != owner || call.TaskID != taskID || call.Title != "Interview" {
-		t.Fatalf("notification = %+v", call)
+
+	// Verify both jobs were dispatched with correct notification fields.
+	for _, call := range disp.calls {
+		if call.UserID != owner || call.TaskID != taskID || call.Title != "Interview" {
+			t.Fatalf("notification = %+v", call)
+		}
+		// DueAt should be the reminder time (past), TrueDeadline should be the true deadline.
+		if diff := call.DueAt.Sub(past); diff < -time.Millisecond || diff > time.Millisecond {
+			t.Fatalf("notification due_at = %v, want %v", call.DueAt, past)
+		}
+		if diff := call.TrueDeadline.Sub(trueDeadline); diff < -time.Millisecond || diff > time.Millisecond {
+			t.Fatalf("notification true_deadline = %v, want %v", call.TrueDeadline, trueDeadline)
+		}
+		if call.ReminderTiming != Timing24hBefore && call.ReminderTiming != Timing2hBefore {
+			t.Fatalf("notification reminder_timing = %v, want 24h_before or 2h_before", call.ReminderTiming)
+		}
 	}
-	// The database stores timestamps at microsecond precision, so compare
-	// against the instant with a small tolerance rather than exactly.
-	if diff := call.DueAt.Sub(past); diff < -time.Millisecond || diff > time.Millisecond {
-		t.Fatalf("notification due_at = %v, want %v", call.DueAt, past)
+
+	// Both jobs should be terminal.
+	for _, jid := range []string{jobID24, jobID2} {
+		job, err := store.Get(ctx, owner, jid)
+		if err != nil || job.DeliveryState != StateDelivered || job.LeaseToken != "" {
+			t.Fatalf("job %s = %+v, %v", jid, job, err)
+		}
 	}
-	job, err := store.Get(ctx, owner, jobID)
-	if err != nil || job.DeliveryState != StateDelivered || job.LeaseToken != "" {
-		t.Fatalf("job = %+v, %v", job, err)
-	}
-	// The job is terminal: a second poll does not dispatch again.
-	if n, err := w.poll(ctx, 5); err != nil || n != 0 || disp.count() != 1 {
+
+	// Second poll dispatches nothing.
+	if n, err := w.poll(ctx, 5); err != nil || n != 0 || disp.count() != 2 {
 		t.Fatalf("second poll = %d, %v, dispatches = %d", n, err, disp.count())
 	}
 }
@@ -173,12 +247,20 @@ func TestWorkerRetriesUncertainUntilExhaustedWithStableIdentity(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+
+	// Use the 2h reminder job for this test.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID, past)
 
 	disp := &fakeDispatcher{outcome: OutcomeUncertain}
 	w := NewWorker(store, Config{Dispatcher: disp, Scope: []string{owner}, BatchSize: 5, MaxRetries: 2})
@@ -225,12 +307,20 @@ func TestWorkerFailedRetriesAndExhausts(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+
+	// Use the 2h reminder job for this test.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID, past)
 
 	disp := &fakeDispatcher{outcome: OutcomeFailed}
 	w := NewWorker(store, Config{Dispatcher: disp, Scope: []string{owner}, BatchSize: 5, MaxRetries: 2})
@@ -274,12 +364,20 @@ func TestWorkerRecoversExpiredLease(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Hour)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+
+	// Use the 2h reminder job for this test.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID, past)
 
 	// A worker claims the job and stops before dispatching: the lease expires.
 	if _, err := store.ClaimDue(ctx, time.Now(), 5, "dead-worker", time.Now().Add(30*time.Second), []string{owner}); err != nil {
@@ -304,14 +402,20 @@ func TestWorkerSuppressesWhenTaskIsDeleted(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Hour)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
 
-	// Account deletion cascades the task row away while the job remains.
+	// Get both job IDs.
+	jobIDs := jobIDsForTask(ctx, t, db, taskID)
+	if len(jobIDs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobIDs))
+	}
+
+	// Account deletion cascades the task row away while the jobs remain.
 	if _, err := db.ExecContext(ctx, `DELETE FROM tasks WHERE id = $1`, taskID); err != nil {
 		t.Fatal(err)
 	}
@@ -324,9 +428,12 @@ func TestWorkerSuppressesWhenTaskIsDeleted(t *testing.T) {
 	if disp.count() != 0 {
 		t.Fatal("worker dispatched a job for a deleted task")
 	}
-	job, err := store.Get(ctx, owner, jobID)
-	if err != nil || job.DeliveryState != StateSuppressed || job.SuppressReason != SuppressDeleted {
-		t.Fatalf("job = %+v, %v", job, err)
+	// Both jobs should be suppressed.
+	for _, jobID := range jobIDs {
+		job, err := store.Get(ctx, owner, jobID)
+		if err != nil || job.DeliveryState != StateSuppressed || job.SuppressReason != SuppressDeleted {
+			t.Fatalf("job %s = %+v, %v", jobID, job, err)
+		}
 	}
 }
 
@@ -334,12 +441,18 @@ func TestWorkerSuppressesWhenUserDisabled(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Hour)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+
+	// Get both job IDs.
+	jobIDs := jobIDsForTask(ctx, t, db, taskID)
+	if len(jobIDs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobIDs))
+	}
 
 	if err := store.SetRemindersEnabled(ctx, owner, false); err != nil {
 		t.Fatal(err)
@@ -352,11 +465,14 @@ func TestWorkerSuppressesWhenUserDisabled(t *testing.T) {
 	if disp.count() != 0 {
 		t.Fatal("worker dispatched for a disabled user")
 	}
-	job, err := store.Get(ctx, owner, jobID)
-	if err != nil || job.DeliveryState != StateSuppressed || job.SuppressReason != SuppressDisabled {
-		t.Fatalf("job = %+v, %v", job, err)
+	// Both jobs should be suppressed.
+	for _, jobID := range jobIDs {
+		job, err := store.Get(ctx, owner, jobID)
+		if err != nil || job.DeliveryState != StateSuppressed || job.SuppressReason != SuppressDisabled {
+			t.Fatalf("job %s = %+v, %v", jobID, job, err)
+		}
 	}
-	// Re-enabling does not resurrect the suppressed job.
+	// Re-enabling does not resurrect the suppressed jobs.
 	if err := store.SetRemindersEnabled(ctx, owner, true); err != nil {
 		t.Fatal(err)
 	}
@@ -374,8 +490,17 @@ func TestStoreClaimDueRequiresDueAndIsScoped(t *testing.T) {
 
 	// A future-due job is not claimable.
 	future := time.Now().Add(time.Hour)
-	taskA := seedInstantTask(ctx, t, db, owner, future)
-	if err := store.Schedule(ctx, db, owner, taskA, future); err != nil {
+	trueDeadlineA := future.Add(24 * time.Hour) // true deadline far in future
+	taskA := seedInstantTask(ctx, t, db, owner, trueDeadlineA)
+	if err := store.Schedule(ctx, db, owner, taskA, trueDeadlineA); err != nil {
+		t.Fatal(err)
+	}
+	// Manually set the 2h reminder to be due now.
+	jobID2h := jobIDForTaskTiming(ctx, t, db, taskA, Timing2hBefore)
+	if jobID2h == "" {
+		t.Fatal("expected 2h job")
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET due_at = $1 WHERE id = $2`, future, jobID2h); err != nil {
 		t.Fatal(err)
 	}
 	jobs, err := store.ClaimDue(ctx, time.Now(), 5, "tok", time.Now().Add(30*time.Second), []string{owner})
@@ -385,8 +510,16 @@ func TestStoreClaimDueRequiresDueAndIsScoped(t *testing.T) {
 
 	// A due job is claimable for its owner only.
 	due := time.Now().Add(-time.Minute)
-	taskB := seedInstantTask(ctx, t, db, owner, due)
-	if err := store.Schedule(ctx, db, owner, taskB, due); err != nil {
+	trueDeadlineB := due.Add(2 * time.Hour) // true deadline 2h in future
+	taskB := seedInstantTask(ctx, t, db, owner, trueDeadlineB)
+	if err := store.Schedule(ctx, db, owner, taskB, trueDeadlineB); err != nil {
+		t.Fatal(err)
+	}
+	jobID2hB := jobIDForTaskTiming(ctx, t, db, taskB, Timing2hBefore)
+	if jobID2hB == "" {
+		t.Fatal("expected 2h job for B")
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET due_at = $1 WHERE id = $2`, due, jobID2hB); err != nil {
 		t.Fatal(err)
 	}
 	jobs, err = store.ClaimDue(ctx, due, 5, "tok", due.Add(30*time.Second), []string{ownerB})
@@ -407,9 +540,19 @@ func TestStoreClaimDueIsAtomicBetweenWorkers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	now := time.Now()
-	past := now.Add(-time.Hour)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+
+	trueDeadline := now.Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use the 2h reminder job and set it to be due now.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET due_at = $1 WHERE id = $2`, now, jobID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -441,26 +584,35 @@ func TestStoreSuppressIsOwnerScoped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	past := time.Now().Add(-time.Hour)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+	jobIDs := jobIDsForTask(ctx, t, db, taskID)
+	if len(jobIDs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobIDs))
+	}
 
 	if err := store.Suppress(ctx, db, ownerB, taskID, SuppressCompleted); err != nil {
 		t.Fatal(err)
 	}
-	job, err := store.Get(ctx, owner, jobID)
-	if err != nil || job.DeliveryState != StateScheduled {
-		t.Fatalf("other owner's suppress took effect: job = %+v, %v", job, err)
+	// Neither job should be suppressed by other owner.
+	for _, jobID := range jobIDs {
+		job, err := store.Get(ctx, owner, jobID)
+		if err != nil || job.DeliveryState != StateScheduled {
+			t.Fatalf("other owner's suppress took effect: job %s = %+v, %v", jobID, job, err)
+		}
 	}
 	if err := store.Suppress(ctx, db, owner, taskID, SuppressCompleted); err != nil {
 		t.Fatal(err)
 	}
-	job, err = store.Get(ctx, owner, jobID)
-	if err != nil || job.DeliveryState != StateSuppressed || job.SuppressReason != SuppressCompleted {
-		t.Fatalf("job = %+v, %v", job, err)
+	// Both jobs should be suppressed by owner.
+	for _, jobID := range jobIDs {
+		job, err := store.Get(ctx, owner, jobID)
+		if err != nil || job.DeliveryState != StateSuppressed || job.SuppressReason != SuppressCompleted {
+			t.Fatalf("job %s = %+v, %v", jobID, job, err)
+		}
 	}
 }
 
@@ -471,17 +623,23 @@ func TestStoreGetReturnsNotFoundForOtherOwners(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	past := time.Now().Add(-time.Hour)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
-	if _, err := store.Get(ctx, ownerB, jobID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("other owner's get = %v, want ErrNotFound", err)
+	jobIDs := jobIDsForTask(ctx, t, db, taskID)
+	if len(jobIDs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobIDs))
 	}
-	if _, err := store.Get(ctx, owner, jobID); err != nil {
-		t.Fatalf("owner get: %v", err)
+
+	for _, jobID := range jobIDs {
+		if _, err := store.Get(ctx, ownerB, jobID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("other owner's get = %v, want ErrNotFound", err)
+		}
+		if _, err := store.Get(ctx, owner, jobID); err != nil {
+			t.Fatalf("owner get: %v", err)
+		}
 	}
 }
 
@@ -519,12 +677,16 @@ func TestRecordCallbackDeduplicatesAndApplies(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	past := time.Now().Add(-time.Hour)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+	// Use the 2h reminder job.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
 	w := NewWorker(store, Config{Scope: []string{owner}, MaxRetries: 3})
 
 	applied, err := w.RecordCallback(ctx, owner, jobID, OutcomeDelivered)
@@ -550,11 +712,14 @@ func TestRecordCallbackDeduplicatesAndApplies(t *testing.T) {
 	}
 
 	// A callback on a non-terminal job applies the retry transition.
-	taskID2 := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID2, past); err != nil {
+	taskID2 := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID2, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID2 := jobIDForTask(ctx, t, db, taskID2)
+	jobID2 := jobIDForTaskTiming(ctx, t, db, taskID2, Timing2hBefore)
+	if jobID2 == "" {
+		t.Fatal("expected 2h job for task2")
+	}
 	if applied, err := w.RecordCallback(ctx, owner, jobID2, OutcomeFailed); err != nil || !applied {
 		t.Fatalf("callback on scheduled job = %v, %v", applied, err)
 	}
