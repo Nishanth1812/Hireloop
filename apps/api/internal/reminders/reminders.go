@@ -276,11 +276,13 @@ func (s *Store) Schedule(ctx context.Context, w Executor, userID, taskID string,
 }
 
 // scheduleOne inserts or reactivates a single advance reminder job.
-// It only reactivates non-terminal jobs; delivered, exhausted, suppressed,
-// and permanent_failed jobs are left alone (they have already had their
-// effect or been deliberately silenced). A new job row is not created for
-// these timings because the unique index would conflict, but the WHERE
-// clause prevents the UPDATE from firing on terminal states.
+// It reactivates any existing job for this task/timing/owner when Schedule
+// is called, because Schedule is only invoked when the deadline genuinely
+// changed (or on initial create). The delivery_version bump and provider
+// mapping clear ensure a fresh idempotency key. Terminal states are not
+// excluded: a delivered/exhausted/permanent_failed job from an old deadline
+// becomes a new logical send for the new deadline. Suppressed jobs from the
+// initial suppression in Schedule (reason='rescheduled') are also reactivated.
 func (s *Store) scheduleOne(ctx context.Context, w Executor, userID, taskID string, trueDeadline, dueAt time.Time, timing ReminderTiming) error {
 	res, err := w.ExecContext(ctx, `INSERT INTO reminder_jobs (user_id, task_id, due_at, true_deadline, reminder_timing, delivery_version)
 		VALUES ($1, $2, $3, $4, $5, 1)
@@ -294,8 +296,7 @@ func (s *Store) scheduleOne(ctx context.Context, w Executor, userID, taskID stri
 			delivery_note = NULL, suppress_reason = NULL,
 			provider_email_id = NULL, provider_version = NULL,
 			updated_at = now()
-		WHERE reminder_jobs.user_id = $6
-		  AND reminder_jobs.delivery_state NOT IN ('`+StateDelivered+`','`+StateExhausted+`','`+StateSuppressed+`','`+StatePermanentFailed+`')`, userID, taskID, dueAt, trueDeadline, timing, userID)
+		WHERE reminder_jobs.user_id = $6`, userID, taskID, dueAt, trueDeadline, timing, userID)
 	if err != nil {
 		return err
 	}
@@ -304,7 +305,7 @@ func (s *Store) scheduleOne(ctx context.Context, w Executor, userID, taskID stri
 		return err
 	}
 	if affected == 0 {
-		return errors.New("reminders: task id belongs to another owner or job is terminal")
+		return errors.New("reminders: task id belongs to another owner")
 	}
 	return nil
 }

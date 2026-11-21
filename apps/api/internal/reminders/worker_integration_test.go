@@ -1319,38 +1319,33 @@ func TestWorkerCleanupDoesNotBlockPolling(t *testing.T) {
 // TestLegacyAtDeadlineJobDispatchesAtDeadline verifies that a legacy
 // at_deadline job (created before migration 013) dispatches at its due_at
 // which equals true_deadline, and is NOT suppressed by the deadline guard.
-// This simulates a pre-migration job that was migrated with reminder_timing
-// = 'at_deadline' and true_deadline = due_at.
+// The unified deadline guard allows dispatch when now == true_deadline
+// (not strictly after), so a job claimed exactly at its deadline fires.
 func TestLegacyAtDeadlineJobDispatchesAtDeadline(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	// Create a task with an instant deadline
+	// Create a task (deadline doesn't matter for the legacy job itself)
 	trueDeadline := time.Now().Add(48 * time.Hour)
 	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
 
-	// Manually insert a legacy at_deadline job (as migration 013 would create)
-	// due_at = true_deadline = the exact deadline instant
+	// Manually insert a legacy at_deadline job with due_at = true_deadline = NOW
+	// This simulates a migrated job whose deadline is the current instant.
+	now := time.Now()
 	var jobID string
 	err := db.QueryRowContext(ctx,
 		`INSERT INTO reminder_jobs (user_id, task_id, due_at, true_deadline, reminder_timing, delivery_state, delivery_version)
 		 VALUES ($1, $2, $3, $4, 'at_deadline', 'scheduled', 1) RETURNING id`,
-		owner, taskID, trueDeadline, trueDeadline).Scan(&jobID)
+		owner, taskID, now, now).Scan(&jobID)
 	if err != nil {
 		t.Fatalf("insert legacy job: %v", err)
-	}
-
-	// Set due_at to now (simulating the deadline has arrived)
-	now := time.Now()
-	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET due_at = $1 WHERE id = $2`, now, jobID); err != nil {
-		t.Fatalf("set due_at: %v", err)
 	}
 
 	disp := &fakeDispatcher{outcome: OutcomeDelivered}
 	w := NewWorker(store, Config{Dispatcher: disp, Scope: []string{owner}, BatchSize: 5, LeaseTTL: 30 * time.Second})
 
-	// Poll - the job should be claimed and dispatched
+	// Poll - the job should be claimed and dispatched (now == true_deadline, not after)
 	n, err := w.poll(ctx, 5)
 	if err != nil || n != 1 {
 		t.Fatalf("poll = %d, %v", n, err)
@@ -1376,8 +1371,8 @@ func TestLegacyAtDeadlineJobDispatchesAtDeadline(t *testing.T) {
 	if diff := call.DueAt.Sub(now); diff < -time.Second || diff > time.Second {
 		t.Fatalf("notification due_at = %v, want %v", call.DueAt, now)
 	}
-	if diff := call.TrueDeadline.Sub(trueDeadline); diff < -time.Second || diff > time.Second {
-		t.Fatalf("notification true_deadline = %v, want %v", call.TrueDeadline, trueDeadline)
+	if diff := call.TrueDeadline.Sub(now); diff < -time.Second || diff > time.Second {
+		t.Fatalf("notification true_deadline = %v, want %v", call.TrueDeadline, now)
 	}
 }
 
@@ -1426,10 +1421,14 @@ func TestLegacyAtDeadlineJobStaleClaimSuppressed(t *testing.T) {
 	}
 }
 
-// TestScheduleDoesNotReactivateTerminalJobs verifies that Schedule's
-// ON CONFLICT upsert does not reactivate jobs in terminal states
-// (delivered, exhausted, suppressed, permanent_failed).
-func TestScheduleDoesNotReactivateTerminalJobs(t *testing.T) {
+// TestScheduleReactivatesTerminalJobsForNewDeadline verifies that
+// Schedule's ON CONFLICT upsert DOES reactivate jobs in terminal states
+// (delivered, exhausted, suppressed, permanent_failed) when the deadline
+// genuinely changes. This is the correct behavior because syncReminderJobs
+// only calls Schedule when the deadline actually changed, so the existing
+// job row should be updated to reflect the new deadline with a bumped
+// delivery_version and cleared provider mapping.
+func TestScheduleReactivatesTerminalJobsForNewDeadline(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1477,30 +1476,33 @@ func TestScheduleDoesNotReactivateTerminalJobs(t *testing.T) {
 			t.Fatalf("iteration %d: reschedule: %v", i, err)
 		}
 
-		// The terminal job should NOT have been reactivated
+		// The terminal job SHOULD have been reactivated for the new deadline
 		job, err := store.Get(ctx, owner, jobID2h)
 		if err != nil {
 			t.Fatalf("iteration %d: get job: %v", i, err)
 		}
-		if job.DeliveryState != tc.state {
-			t.Fatalf("iteration %d: job state changed from %s to %s (was reactivated)", i, tc.state, job.DeliveryState)
+		if job.DeliveryState != StateScheduled {
+			t.Fatalf("iteration %d: job not reactivated, state = %s, want scheduled", i, job.DeliveryState)
 		}
-		if job.DeliveryVersion != versionBefore {
-			t.Fatalf("iteration %d: delivery_version changed from %d to %d (was reactivated)", i, versionBefore, job.DeliveryVersion)
+		if job.DeliveryVersion != versionBefore+1 {
+			t.Fatalf("iteration %d: delivery_version = %d, want %d (bumped for new deadline)", i, job.DeliveryVersion, versionBefore+1)
+		}
+		if job.TrueDeadline.Equal(newDeadline) == false {
+			t.Fatalf("iteration %d: true_deadline not updated to new deadline: got %v want %v", i, job.TrueDeadline, newDeadline)
+		}
+		if job.ProviderEmailID != "" || job.ProviderVersion != 0 {
+			t.Fatalf("iteration %d: provider mapping not cleared on reactivation: email_id=%q version=%d", i, job.ProviderEmailID, job.ProviderVersion)
+		}
+		if job.SuppressReason != "" {
+			t.Fatalf("iteration %d: suppress_reason not cleared: %q", i, job.SuppressReason)
 		}
 
-		// A NEW job should have been created for the new deadline version
-		// with timing 2h_before and version = versionBefore + 1
-		var newJobID string
+		// No NEW job row should exist (unique index on task_id, reminder_timing)
+		var count int
 		err = db.QueryRowContext(ctx,
-			`SELECT id FROM reminder_jobs WHERE task_id = $1 AND reminder_timing = '2h_before' AND delivery_version = $2`,
-			taskID, versionBefore+1).Scan(&newJobID)
-		if err != nil {
-			t.Fatalf("iteration %d: new job not created: %v", i, err)
-		}
-		newJob, err := store.Get(ctx, owner, newJobID)
-		if err != nil || newJob.DeliveryState != StateScheduled {
-			t.Fatalf("iteration %d: new job = %+v, %v, want scheduled", i, newJob, err)
+			`SELECT count(*) FROM reminder_jobs WHERE task_id = $1 AND reminder_timing = '2h_before'`, taskID).Scan(&count)
+		if err != nil || count != 1 {
+			t.Fatalf("iteration %d: job count for task/timing = %d, want 1 (unique index prevents duplicates)", i, count)
 		}
 	}
 }
