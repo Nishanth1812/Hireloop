@@ -58,6 +58,15 @@ func openIntegrationStore(t *testing.T) (PostgresStore, *sql.DB, string) {
 	}
 
 	owner := randomOwner(t)
+	cleanupOwner(t, db, owner)
+	return PostgresStore{DB: db}, db, owner
+}
+
+// cleanupOwner registers removal of every row a random test owner can create,
+// including a second owner used by isolation tests. It never touches another
+// owner's data.
+func cleanupOwner(t *testing.T, db *sql.DB, owner string) {
+	t.Helper()
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cleanupCancel()
@@ -68,7 +77,6 @@ func openIntegrationStore(t *testing.T) (PostgresStore, *sql.DB, string) {
 			t.Errorf("cleanup applications for test owner: %v", err)
 		}
 	})
-	return PostgresStore{DB: db}, db, owner
 }
 
 func seedApplication(ctx context.Context, t *testing.T, db *sql.DB, owner string) string {
@@ -184,6 +192,7 @@ func TestPostgresTaskDeadlineEditsSwitchPrecision(t *testing.T) {
 func TestPostgresTasksAreOwnerScoped(t *testing.T) {
 	store, db, ownerA := openIntegrationStore(t)
 	ownerB := randomOwner(t)
+	cleanupOwner(t, db, ownerB)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	appA := seedApplication(ctx, t, db, ownerA)
