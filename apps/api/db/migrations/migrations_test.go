@@ -159,6 +159,109 @@ func TestTasksMigrationIsAdditive(t *testing.T) {
 	}
 }
 
+// migrationStatements returns the migration body with comment lines
+// removed, so policy prose about DROP/DELETE cannot trip the additive-schema
+// checks the way the rollback notes legitimately do.
+func migrationStatements(t *testing.T, version uint) string {
+	t.Helper()
+	source, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	reader, _, err := source.ReadUp(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := make([]string, 0)
+	for _, line := range strings.Split(string(data), "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" && !strings.HasPrefix(trimmed, "--") {
+			statements = append(statements, trimmed)
+		}
+	}
+	return strings.Join(statements, "\n")
+}
+
+func rawMigration(t *testing.T, version uint) string {
+	t.Helper()
+	source, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	reader, _, err := source.ReadUp(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// TestReminderJobsMigrationIsAdditive pins the Phase 4 durable-reminder core
+// schema: one new owner-scoped table with an explicit delivery state machine
+// and one job per task, both documented as reversible, and no change to any
+// existing table or row.
+func TestReminderJobsMigrationIsAdditive(t *testing.T) {
+	applied := migrationStatements(t, 7)
+	for _, fragment := range []string{
+		"CREATE TABLE public.reminder_jobs",
+		"user_id text",
+		"task_id uuid",
+		"due_at timestamptz",
+		"delivery_state text",
+		"'scheduled'", "'leased'", "'accepted'", "'delivered'", "'uncertain'",
+		"'failed'", "'exhausted'", "'suppressed'",
+		"CREATE UNIQUE INDEX reminder_jobs_task_idx",
+		"ENABLE ROW LEVEL SECURITY",
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 007 is missing %q", fragment)
+		}
+	}
+	if strings.Contains(applied, "ALTER TABLE public.applications") ||
+		strings.Contains(applied, "ALTER TABLE public.tasks") ||
+		strings.Contains(applied, "DROP ") || strings.Contains(applied, "DELETE FROM") {
+		t.Error("migration 007 must not change or remove existing data")
+	}
+	if !strings.Contains(rawMigration(t, 7), "Rollback:") {
+		t.Error("migration 007 must document how to reverse it")
+	}
+}
+
+// TestUserNotificationSettingsMigrationIsAdditive pins the Phase 4 notification
+// control schema: one new owner-scoped table, defaulting reminders on,
+// forward-only and reversible by dropping the table.
+func TestUserNotificationSettingsMigrationIsAdditive(t *testing.T) {
+	applied := migrationStatements(t, 8)
+	for _, fragment := range []string{
+		"CREATE TABLE public.user_notification_settings",
+		"user_id text PRIMARY KEY",
+		"reminders_enabled boolean NOT NULL DEFAULT true",
+		"ENABLE ROW LEVEL SECURITY",
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 008 is missing %q", fragment)
+		}
+	}
+	if strings.Contains(applied, "ALTER TABLE public.applications") ||
+		strings.Contains(applied, "ALTER TABLE public.tasks") ||
+		strings.Contains(applied, "DROP ") || strings.Contains(applied, "DELETE FROM") {
+		t.Error("migration 008 must not change or remove existing data")
+	}
+	if !strings.Contains(rawMigration(t, 8), "Rollback:") {
+		t.Error("migration 008 must document how to reverse it")
+	}
+}
+
 func TestApplyIsIdempotentAgainstConfiguredDatabase(t *testing.T) {
 	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
 	if databaseURL == "" {
