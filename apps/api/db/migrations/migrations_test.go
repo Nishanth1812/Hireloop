@@ -445,6 +445,39 @@ func TestTasksUserAppIndexMigrationIsAdditive(t *testing.T) {
 	}
 }
 
+// TestDateApproxRemindersMigrationIsAdditive pins migration 015: it stores the
+// browser zone for date-only tasks and the day/zone for approximate jobs, and
+// widens the timing/true-deadline checks without rewriting or dropping data.
+func TestDateApproxRemindersMigrationIsAdditive(t *testing.T) {
+	applied := migrationStatements(t, 15)
+	for _, fragment := range []string{
+		"ADD COLUMN reminder_zone text",
+		"tasks_reminder_zone_shape_check",
+		"reminder_zone IS NULL OR due_precision = 'date'",
+		"day_before_approx",
+		"morning_of_approx",
+		"ADD COLUMN due_day date",
+		"due_day IS NOT NULL AND reminder_zone IS NOT NULL AND true_deadline IS NULL",
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 015 is missing %q", fragment)
+		}
+	}
+	raw := rawMigration(t, 15)
+	for _, forbidden := range []string{
+		"DROP TABLE",
+		"DELETE FROM",
+		"UPDATE public.",
+	} {
+		if strings.Contains(raw, forbidden) {
+			t.Errorf("migration 015 must not contain top-level %q", forbidden)
+		}
+	}
+	if !strings.Contains(raw, "Rollback:") {
+		t.Error("migration 015 must document how to reverse it")
+	}
+}
+
 func TestApplyIsIdempotentAgainstConfiguredDatabase(t *testing.T) {
 	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
 	if databaseURL == "" {
