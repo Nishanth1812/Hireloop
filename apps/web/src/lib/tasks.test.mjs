@@ -68,6 +68,24 @@ test("an invalid instant is reported rather than shown as a wrong time", () => {
   assert.match(result.when, /needs attention/i);
 });
 
+test("ambiguous fall-back and nonexistent spring-forward local times are caught", () => {
+  assert.ok(tasks, "task display helpers are missing");
+  assert.equal(tasks.localDeadlineIssue("2026-11-01T01:30", "America/New_York"), "ambiguous");
+  assert.equal(tasks.localDeadlineIssue("2026-03-08T02:30", "America/New_York"), "gap");
+  // Lord Howe changes by 30 minutes, so neither boundary is on the hour.
+  assert.equal(tasks.localDeadlineIssue("2026-04-05T01:45", "Australia/Lord_Howe"), "ambiguous");
+  assert.equal(tasks.localDeadlineIssue("2026-10-04T02:15", "Australia/Lord_Howe"), "gap");
+});
+
+test("valid wall times are not flagged, including non-hour zones and date-only deadlines", () => {
+  assert.ok(tasks, "task display helpers are missing");
+  assert.equal(tasks.localDeadlineIssue("2026-11-01T00:30", "America/New_York"), null);
+  assert.equal(tasks.localDeadlineIssue("2026-11-01T02:30", "America/New_York"), null);
+  assert.equal(tasks.localDeadlineIssue("2026-04-05T01:15", "Australia/Lord_Howe"), null);
+  assert.equal(tasks.localDeadlineIssue("2026-11-12T18:00", "Asia/Kolkata"), null);
+  assert.equal(tasks.localDeadlineIssue("2026-11-12", ""), null);
+});
+
 test("an edited task's zone stays available in the choice list", () => {
   assert.ok(tasks.TIME_ZONE_CHOICES.includes("Asia/Kolkata"));
   assert.deepEqual(tasks.zoneChoices("Pacific/Fiji").slice(0, 1), ["Pacific/Fiji"]);

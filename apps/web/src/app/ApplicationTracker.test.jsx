@@ -17,7 +17,7 @@ mock.module("@clerk/nextjs", () => ({
 mock.module("./_components/ApplicationDashboard", () => ({
   ApplicationDashboard: (props) => {
     dashboardProps = props;
-    const { email, result, filters, page, error, loading, loadError, tasks } = props;
+    const { email, result, filters, page, error, loading, loadError, taskPage } = props;
     return <div>
       <span>{email}</span>
       <span>{loading ? "Loading" : "Ready"}</span>
@@ -26,7 +26,7 @@ mock.module("./_components/ApplicationDashboard", () => ({
       {loadError && <p data-testid="load-error">Load failed</p>}
       {error && <p role="alert">{error}</p>}
       {result.items.map((item) => <p key={item.id}>{item.company}</p>)}
-      <div data-testid="today">{tasks.map((task) => <p key={task.id}>{task.title}</p>)}</div>
+      <div data-testid="today">{taskPage.items.map((task) => <p key={task.id}>{task.title}</p>)}</div>
     </div>;
   },
 }));
@@ -501,6 +501,103 @@ test("completing and cancelling tasks remove them from open Today and persist af
   const all = requests.find((request) => request.url === "/api/tasks?filter=all");
   expect(all).toBeDefined();
   expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
+});
+
+test("Today walks keyset pages without repeating rows and previous returns to the earlier cursor", async () => {
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(url);
+    if (url === "/api/tasks") {
+      return Response.json({ items: [openTask({ id: "task-1" })], page_size: 1, total: 2, next_cursor: "tasks-2" });
+    }
+    if (url.includes("cursor=tasks-2")) {
+      return Response.json({ items: [openTask({ id: "task-2", title: "Second" })], page_size: 1, total: 2, next_cursor: null });
+    }
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
+  expect(dashboardProps.taskPage.total).toBe(2);
+  expect(dashboardProps.taskHasNext).toBe(true);
+
+  await act(async () => { dashboardProps.onTaskNext(); });
+  expect(urls.at(-1)).toBe("/api/tasks?cursor=tasks-2");
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Second");
+  expect(dashboardProps.taskHasNext).toBe(false);
+
+  await act(async () => { dashboardProps.onTaskPrevious(); });
+  expect(urls.at(-1)).toBe("/api/tasks");
+  expect(dashboardProps.taskPageIndex).toBe(0);
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
+});
+
+test("showing finished restarts Today at the first page without moving the application list", async () => {
+  const taskURLs = [];
+  globalThis.fetch = async (url) => {
+    if (url === "/api/tasks" || url.startsWith("/api/tasks?")) {
+      taskURLs.push(url);
+      return Response.json({ items: [], page_size: 25, total: 0, next_cursor: null });
+    }
+    if (url.includes("cursor=app-2")) {
+      return Response.json(page({ items: [{ id: "app-2", company: "Globex", role: "Engineer", status: "saved" }] }));
+    }
+    return Response.json(page({ items: [{ id: "app-1", company: "Acme", role: "Engineer", status: "saved" }], next_cursor: "app-2" }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onNext(); });
+  // No task cursor existed, so the toggle below is the next task request.
+  const beforeToggle = taskURLs.length;
+  await act(async () => { dashboardProps.onToggleFinished(); });
+  expect(taskURLs.length).toBeGreaterThan(beforeToggle);
+  expect(taskURLs.at(-1)).toBe("/api/tasks?filter=all");
+  expect(dashboardProps.tasksShowAll).toBe(true);
+  expect(dashboardProps.taskPageIndex).toBe(0);
+  // The application position is independent and unchanged.
+  expect(container.querySelector('[data-testid="page"]').textContent).toBe("2");
+});
+
+test("Today steps back when a later page is emptied by another write", async () => {
+  let cursorRequest = 0;
+  globalThis.fetch = async (url) => {
+    if (url.includes("cursor=tasks-2")) {
+      cursorRequest++;
+      return Response.json({ items: [], page_size: 1, total: 1, next_cursor: null });
+    }
+    if (url === "/api/tasks") {
+      return Response.json({ items: [openTask()], page_size: 1, total: 2, next_cursor: "tasks-2" });
+    }
+    return Response.json(page());
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onTaskNext(); });
+  expect(cursorRequest).toBe(1);
+  expect(dashboardProps.taskPageIndex).toBe(0);
+  expect(container.querySelector('[data-testid="today"]').textContent).toContain("Submit assessment");
+});
+
+test("an ambiguous fall-back deadline is rejected before any request", async () => {
+  const app = { id: "app-1", company: "Acme", role: "Engineer", status: "saved" };
+  let writes = 0;
+  globalThis.fetch = async (url, options) => {
+    if (options.method === "POST" || options.method === "PATCH") writes++;
+    if (url === "/api/tasks" || url.startsWith("/api/tasks?")) return taskResponse();
+    return Response.json(page({ items: [app], total: 1 }));
+  };
+  session = account("a");
+  await render();
+  await act(async () => { dashboardProps.onAddTask(app); });
+  await act(async () => {
+    await dashboardProps.onSaveTask({
+      preventDefault() {},
+      currentTarget: formWith({ application_id: "app-1", title: "Interview", due_precision: "instant", due_local: "2026-11-01T01:30", time_zone: "America/New_York" }),
+    });
+  });
+  expect(writes).toBe(0);
+  expect(container.querySelector('[role="alert"]').textContent).toMatch(/happens twice/i);
+  expect(dashboardProps.taskDraft).not.toBeNull();
 });
 
 test("a delayed task response from a previous account cannot leak into the next one", async () => {
