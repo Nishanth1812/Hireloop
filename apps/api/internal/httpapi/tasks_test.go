@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -61,17 +62,53 @@ func (s *fakeTaskStore) Create(_ context.Context, owner string, input tasks.Inpu
 	return task, nil
 }
 
-func (s *fakeTaskStore) List(_ context.Context, owner string, filter tasks.Filter) ([]tasks.Task, error) {
+func (s *fakeTaskStore) List(_ context.Context, owner string, filter tasks.Filter) (tasks.ListResult, error) {
 	if s.err != nil {
-		return nil, s.err
+		return tasks.ListResult{}, s.err
 	}
-	result := []tasks.Task{}
+	filter.Normalize()
+	matching := []tasks.Task{}
 	for _, task := range s.records[owner] {
 		if filter.ShowAll || task.Status == tasks.StatusOpen {
-			result = append(result, task)
+			matching = append(matching, task)
 		}
 	}
+	result := tasks.ListResult{PageSize: filter.PageSize, Total: len(matching), Items: []tasks.Task{}}
+	start := 0
+	if filter.After != nil {
+		// IDs are sequential in this fake, so the cursor's ID identifies the
+		// position exactly; real tie-breaking is covered by the SQL tests.
+		for i, task := range matching {
+			if task.ID == filter.After.ID {
+				start = i + 1
+				break
+			}
+			start = i + 1
+		}
+	}
+	for i := start; i < len(matching) && i < start+filter.PageSize; i++ {
+		result.Items = append(result.Items, matching[i])
+	}
+	if start+filter.PageSize < len(matching) {
+		last := result.Items[len(result.Items)-1]
+		created, _ := time.Parse(time.RFC3339, last.CreatedAt)
+		result.NextCursor = tasks.EncodeCursor(filter, deadlineDay(last), deadlineAt(last), created, last.ID)
+	}
 	return result, nil
+}
+
+func deadlineDay(task tasks.Task) string {
+	if task.DuePrecision == tasks.PrecisionDate {
+		return task.DueDate
+	}
+	return "infinity"
+}
+
+func deadlineAt(task tasks.Task) string {
+	if task.DuePrecision == tasks.PrecisionInstant && task.DueAt != "" {
+		return task.DueAt
+	}
+	return "-infinity"
 }
 
 func (s *fakeTaskStore) Get(_ context.Context, owner, id string) (tasks.Task, error) {
@@ -288,6 +325,9 @@ func TestTaskValidationAndQueryAreBounded(t *testing.T) {
 		"date with a zone":  fmt.Sprintf(`{"application_id":%q,"title":"x","due_precision":"date","due_date":"2026-11-12","time_zone":"Asia/Kolkata"}`, taskAppID),
 		"instant no zone":   fmt.Sprintf(`{"application_id":%q,"title":"x","due_precision":"instant","due_local":"2026-11-12T18:00"}`, taskAppID),
 		"nonexistent local": fmt.Sprintf(`{"application_id":%q,"title":"x","due_precision":"instant","due_local":"2026-03-08T02:30","time_zone":"America/New_York"}`, taskAppID),
+		"ambiguous local":   fmt.Sprintf(`{"application_id":%q,"title":"x","due_precision":"instant","due_local":"2026-11-01T01:30","time_zone":"America/New_York"}`, taskAppID),
+		"half-hour gap":     fmt.Sprintf(`{"application_id":%q,"title":"x","due_precision":"instant","due_local":"2026-10-04T02:15","time_zone":"Australia/Lord_Howe"}`, taskAppID),
+		"half-hour overlap": fmt.Sprintf(`{"application_id":%q,"title":"x","due_precision":"instant","due_local":"2026-04-05T01:45","time_zone":"Australia/Lord_Howe"}`, taskAppID),
 		"oversized title":   fmt.Sprintf(`{"application_id":%q,"title":"%s"}`, taskAppID, strings.Repeat("x", 201)),
 		"nul in title":      fmt.Sprintf(`{"application_id":%q,"title":"x\u0000y"}`, taskAppID),
 	}
@@ -314,9 +354,14 @@ func TestTaskValidationAndQueryAreBounded(t *testing.T) {
 		}
 	}
 	for name, query := range map[string]string{
-		"unknown filter": "?filter=today",
-		"unknown param":  "?status=open",
-		"empty filter":   "?filter=",
+		"unknown filter":  "?filter=today",
+		"unknown param":   "?status=open",
+		"empty filter":    "?filter=",
+		"empty cursor":    "?cursor=",
+		"broken cursor":   "?cursor=not-a-token",
+		"zero page size":  "?page_size=0",
+		"oversized page":  "?page_size=51",
+		"nonnumeric page": "?page_size=many",
 	} {
 		if w := h.request(h.token, http.MethodGet, "", "/api/tasks"+query); w.Code != http.StatusBadRequest {
 			t.Errorf("query %s: %d", name, w.Code)
@@ -334,6 +379,83 @@ func TestTaskValidationAndQueryAreBounded(t *testing.T) {
 	h.store.err = nil
 	if w := h.request(h.token, http.MethodGet, "", path); w.Code != http.StatusNotFound {
 		t.Fatalf("missing task: %d, want 404", w.Code)
+	}
+}
+
+func TestTaskListIsBoundedAndContinuesWithOwnerIsolation(t *testing.T) {
+	h := newTaskHarness(t)
+	for i := 0; i < 5; i++ {
+		body := fmt.Sprintf(`{"application_id":%q,"title":"Task %d","due_precision":"date","due_date":"2026-12-%02d"}`, taskAppID, i, i+1)
+		if w := h.request(h.token, http.MethodPost, body, "/api/tasks"); w.Code != http.StatusCreated {
+			t.Fatalf("create task %d: %d %s", i, w.Code, w.Body.String())
+		}
+	}
+	other := fmt.Sprintf(`{"application_id":%q,"title":"B task","due_precision":"date","due_date":"2026-12-01"}`, taskAppID)
+	if w := h.request(h.tokenB, http.MethodPost, other, "/api/tasks"); w.Code != http.StatusCreated {
+		t.Fatalf("create B task: %d %s", w.Code, w.Body.String())
+	}
+
+	type envelope struct {
+		Items      []tasks.Task `json:"items"`
+		PageSize   int          `json:"page_size"`
+		Total      int          `json:"total"`
+		NextCursor *string      `json:"next_cursor"`
+	}
+	read := func(token, path string) envelope {
+		t.Helper()
+		w := h.request(token, http.MethodGet, "", path)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: %d %s", path, w.Code, w.Body.String())
+		}
+		var result envelope
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	seen := map[string]bool{}
+	cursor := ""
+	for page, wantCount := range []int{2, 2, 1} {
+		path := "/api/tasks?page_size=2"
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		result := read(h.token, path)
+		if result.PageSize != 2 || result.Total != 5 || len(result.Items) != wantCount {
+			t.Fatalf("page %d = %+v", page, result)
+		}
+		for _, task := range result.Items {
+			if seen[task.ID] {
+				t.Fatalf("page %d repeated task %s", page, task.ID)
+			}
+			seen[task.ID] = true
+		}
+		if page == 2 {
+			if result.NextCursor != nil {
+				t.Fatal("last page still has a continuation cursor")
+			}
+		} else if result.NextCursor == nil || *result.NextCursor == "" {
+			t.Fatalf("page %d has no continuation cursor", page)
+		} else {
+			cursor = *result.NextCursor
+		}
+	}
+	if len(seen) != 5 {
+		t.Fatalf("walked %d distinct tasks, want 5", len(seen))
+	}
+
+	theirs := read(h.tokenB, "/api/tasks?page_size=2")
+	if theirs.Total != 1 || len(theirs.Items) != 1 || theirs.NextCursor != nil || seen[theirs.Items[0].ID] {
+		t.Fatalf("owner B page = %+v", theirs)
+	}
+
+	// Page size is capped and a cursor is bound to the view that minted it.
+	if w := h.request(h.token, http.MethodGet, "", "/api/tasks?page_size=51"); w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized page: %d", w.Code)
+	}
+	if w := h.request(h.token, http.MethodGet, "", "/api/tasks?filter=all&cursor="+url.QueryEscape(cursor)); w.Code != http.StatusBadRequest {
+		t.Fatalf("cursor from another view: %d", w.Code)
 	}
 }
 
