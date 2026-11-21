@@ -208,6 +208,10 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
 
   async function changeNotificationSetting(enabled: boolean) {
     if (!session) return;
+    // Guard against same-session GET/PATCH race: do not send a PATCH while the
+    // initial GET is still in flight. The checkbox is disabled during loading,
+    // but this provides a second line of defense.
+    if (notificationLoading) return;
     setNotificationSaving(true);
     setNotificationError("");
     setNotificationNotice("");

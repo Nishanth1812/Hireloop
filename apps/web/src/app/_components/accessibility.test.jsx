@@ -599,8 +599,9 @@ test("the notification control marks itself busy and disables the checkbox while
 test("the notification control announces load errors and saved confirmations", async () => {
   await render(<NotificationControl {...notificationProps({ enabled: null, error: "Settings unavailable." })} />);
   expect(container.querySelector('[role="alert"]').textContent).toBe("Settings unavailable.");
-  expect(container.querySelector(".notification-state").textContent).toBe("");
+  expect(container.querySelector(".notification-state").textContent).toBe("Your reminder preference is unknown.");
   expect(container.querySelector(".notification-control").getAttribute("aria-busy")).toBe("false");
+  expect(container.querySelector("#notifications-enabled").disabled).toBe(true);
 
   await render(<NotificationControl {...notificationProps({ notice: "Reminders turned off." })} />);
   const confirmation = container.querySelector(".success-message");

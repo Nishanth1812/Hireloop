@@ -13,8 +13,20 @@ type Props = {
 
 export function NotificationControl({ enabled, loading, saving, error, notice, onChange }: Props) {
   const busy = loading || saving;
-  const preference = enabled === null ? "" : enabled ? "Your reminder preference is on." : "Your reminder preference is off.";
-  const status = loading ? "Loading notification settings…" : saving ? "Saving your preference…" : preference;
+  const isUnknown = enabled === null;
+  const preference = isUnknown
+    ? "Your reminder preference is unknown."
+    : enabled
+      ? "Your reminder preference is on."
+      : "Your reminder preference is off.";
+  const status = loading
+    ? "Loading notification settings…"
+    : saving
+      ? "Saving your preference…"
+      : preference;
+  // Disable the checkbox when the value is unknown (not yet loaded or failed to load)
+  // or when a request is in flight.
+  const disabled = busy || isUnknown;
 
   return (
     <section className="notification-control" aria-labelledby="notifications-title" aria-busy={busy}>
@@ -28,9 +40,11 @@ export function NotificationControl({ enabled, loading, saving, error, notice, o
           id="notifications-enabled"
           type="checkbox"
           checked={enabled ?? false}
-          disabled={busy}
+          disabled={disabled}
           aria-describedby="notifications-state notifications-detail"
-          onChange={(event) => onChange(event.target.checked)}
+          onChange={(event) => {
+            if (!disabled) onChange(event.target.checked);
+          }}
         />
         <label htmlFor="notifications-enabled">Email deadline reminders</label>
       </div>
@@ -42,7 +56,8 @@ export function NotificationControl({ enabled, loading, saving, error, notice, o
 
       <p id="notifications-detail" className="muted notification-detail">
         Turning this on only records your preference. It does not guarantee a reminder will be delivered,
-        and it does not activate the reminder worker if one has not been configured.
+        and it does not activate the reminder worker if one has not been configured. The default is
+        reminders enabled; your choice overrides the default.
       </p>
     </section>
   );
