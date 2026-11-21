@@ -9,6 +9,7 @@ Hireloop is a job application and deadline tracker under active local developmen
 - **Today — open actions.** Each application can carry tasks with an `open` / `done` / `cancelled` lifecycle. The default Today view lists open actions soonest deadline first, with deadline-free actions last; a `filter=all` view also shows finished actions. Deadlines have an explicit `due_precision`: `none`, a date-only `date`, or an exact `instant` given as a local wall time plus a full IANA `time_zone`, resolved to a UTC instant. Date-only deadlines are displayed as a day with "cutoff time unspecified" — no time is invented. A local time that does not exist (spring-forward gap) or is ambiguous (fall-back overlap, including 30-minute shifts such as `Australia/Lord_Howe`) is rejected with 400 instead of silently choosing one; abbreviations like `IST` and server-local `Local` are never accepted.
 - **Deadlines.** Today shows the stored deadline on each task. Date-only deadlines have no invented time; no notification or alarm is sent.
 - **Per-task calendar export.** Each task can be exported as a `.ics` calendar entry (`GET /api/tasks/{id}/ics`): a date-only deadline becomes `DUE;VALUE=DATE` with no time or zone, an exact deadline becomes a UTC `DUE` value preserving the stored instant, and a task without a deadline has no `DUE`. Exports are owner-scoped, and invalid or empty deadline fields are rejected rather than exported as invented facts.
+- **Durable reminders.** Confirmed instant deadlines get a reminder job in PostgreSQL (`reminder_jobs`). A worker claims due jobs with leases, retries failed dispatches with backoff, records explicit delivery states (`scheduled`, `leased`, `accepted`, `delivered`, `uncertain`, `failed`, `exhausted`, `suppressed`) and deduplicates provider callbacks. Jobs are suppressed when a task completes, is cancelled, is deleted or is rescheduled; jobs survive worker restarts and are re-claimed when leases expire with the same notification identity. No delivery is implied until a provider confirms it — the null dispatcher reports failure so jobs land in `exhausted` rather than claiming to be delivered. A per-owner `reminders_enabled` preference (default on) can be read and set through the notification-settings routes.
 
 ## Repository layout
 
@@ -44,6 +45,8 @@ bun run start     # loads the root .env and apps/web/.env.local, then runs the G
 go test ./...
 go vet ./...
 ```
+
+The reminder worker runs from `apps/api/cmd/worker` against the same `DATABASE_URL`; until a mail provider is integrated it uses the null dispatcher, so no delivery is implied.
 
 `bun run start` is the API's only script. If `DATABASE_URL` is set, startup applies only pending embedded migrations before opening the listener; a migration failure stops startup. Use the Supabase **session pooler, not transaction pooling**. Migrations are ordered SQL files guarded by an advisory lock and a history table: an up-to-date database is a no-op. Review pending migrations before starting against an existing database. If a migration fails, inspect the history and database state and take a backup before any repair; do not blindly reset the history or drop data. An existing hand-created `applications` table is not adopted automatically.
 
@@ -83,6 +86,8 @@ All `/api/*` routes except `/health` require `Authorization: Bearer <Clerk sessi
 | `GET /api/tasks/{id}` | Read one task (200/404). |
 | `PATCH /api/tasks/{id}` | Update a task, including status and the whole deadline shape (200/404). |
 | `GET /api/tasks/{id}/ics` | Export one task as a single-task calendar entry (`text/calendar`). |
+| `GET /api/notification-settings` | Read the caller's notification controls: `{"reminders_enabled": true\|false}` (default `true`). |
+| `PATCH /api/notification-settings` | Set the caller's `reminders_enabled` boolean. |
 
 Missing or invalid tokens return 401; a transient verification failure returns 503. Missing or other-owner rows return 404 without revealing ownership. Malformed IDs, unknown fields or query parameters, and invalid or out-of-range values return 400; unavailable database/configuration returns 503. Applications list parameters are `q` (case-insensitive over company, role and job ID, max 100 characters), `status`, `channel`, `cursor` and `page_size`; task list parameters are `filter`, `cursor` and `page_size`.
 
