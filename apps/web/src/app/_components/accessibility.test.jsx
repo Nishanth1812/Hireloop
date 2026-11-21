@@ -332,14 +332,21 @@ function taskFormProps(overrides = {}) {
 }
 
 function todayProps(overrides = {}) {
+  const tasks = overrides.tasks ?? [dateTask];
   return {
-    tasks: [dateTask],
+    tasks,
     applications: [taskApplication],
+    total: overrides.total ?? tasks.length,
+    page: 1,
+    hasPrevious: false,
+    hasNext: false,
     loading: false,
     loadError: false,
     showAll: false,
     busyId: "",
     onToggleFinished: noop,
+    onPrevious: noop,
+    onNext: noop,
     onEdit: noop,
     onComplete: noop,
     onCancel: noop,
@@ -433,6 +440,34 @@ test("Today announces loading, empty and failed states and shows finished only o
   await render(<TodayPanel {...todayProps({ tasks: [finished], showAll: true })} />);
   expect(container.querySelectorAll(".task-row").length).toBe(1);
   expect(container.textContent).toMatch(/Status: done/i);
+});
+
+test("Today names its page controls, disables them at the bounds and reports the honest total", async () => {
+  await render(<TodayPanel {...todayProps({ total: 42, hasNext: true })} />);
+  const summary = container.querySelector(".today-panel .results-summary");
+  expect(summary.getAttribute("role")).toBe("status");
+  expect(summary.textContent).toMatch(/Showing 1 on this page · 42 total/);
+  let nav = container.querySelector("nav.today-pagination");
+  expect(nav).not.toBeNull();
+  expect(nav.getAttribute("aria-label")).toMatch(/today pages/i);
+  let buttons = [...nav.querySelectorAll("button")];
+  expect(buttons.map((button) => button.textContent.trim())).toEqual(["Previous", "Next"]);
+  for (const button of buttons) assertFocusableWithName(button);
+  expect(buttons[0].disabled).toBe(true);
+  expect(buttons[1].disabled).toBe(false);
+
+  await render(<TodayPanel {...todayProps({
+    total: 42, page: 2, hasPrevious: true, hasNext: false,
+    tasks: [{ ...dateTask, id: "t2", title: "Second" }],
+  })} />);
+  nav = container.querySelector("nav.today-pagination");
+  expect(nav.textContent).toMatch(/Page 2/);
+  buttons = [...nav.querySelectorAll("button")];
+  expect(buttons[0].disabled).toBe(false);
+  expect(buttons[1].disabled).toBe(true);
+
+  await render(<TodayPanel {...todayProps({ total: 1 })} />);
+  expect(container.querySelector("nav.today-pagination")).toBeNull();
 });
 
 test("a busy task disables only its own action buttons", async () => {

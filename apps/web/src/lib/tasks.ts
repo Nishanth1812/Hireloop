@@ -68,3 +68,65 @@ export function zoneChoices(current?: string): string[] {
     ? [current, ...TIME_ZONE_CHOICES]
     : TIME_ZONE_CHOICES;
 }
+
+// offsetMinutes reads the IANA zone's offset at an instant from the platform's
+// own tzdata. "longOffset" gives values such as GMT+05:30 or GMT-04:00.
+function offsetMinutes(instant: Date, zone: string): number | null {
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", { timeZone: zone, timeZoneName: "longOffset" })
+      .formatToParts(instant);
+    const name = parts.find((part) => part.type === "timeZoneName")?.value ?? "";
+    if (name === "GMT") return 0;
+    const match = /^GMT([+-])(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(name);
+    if (!match) return null;
+    const minutes = Number(match[2]) * 60 + Number(match[3]) + Number(match[4] ?? 0);
+    return match[1] === "-" ? -minutes : minutes;
+  } catch {
+    return null;
+  }
+}
+
+function localParts(instant: Date, zone: string): string | null {
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).formatToParts(instant);
+    const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value ?? "";
+    return `${part("year")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}`;
+  } catch {
+    return null;
+  }
+}
+
+// localDeadlineIssue mirrors the API's wall-time resolution so the form can
+// reject a nonexistent (spring-forward gap) or twice-existing (fall-back
+// overlap) local time before sending it. The API remains authoritative; this
+// only turns its 400 into an early, specific, accessible message. Offsets are
+// probed a day on either side, which covers non-hour shifts like Lord Howe's.
+export function localDeadlineIssue(dueLocal: string, zone: string): "gap" | "ambiguous" | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(dueLocal.trim());
+  if (!match) return null; // shape and calendar checks belong to the API
+  const [year, month, day, hour, minute] = match.slice(1).map(Number);
+  const naive = Date.UTC(year, month - 1, day, hour, minute);
+  const probe = new Date(naive);
+  if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month - 1 ||
+      probe.getUTCDate() !== day || probe.getUTCHours() !== hour || probe.getUTCMinutes() !== minute) {
+    return null;
+  }
+  const center = offsetMinutes(probe, zone);
+  if (center === null) return null; // an unknown zone is rejected by the API
+  const offsets = new Set<number>([center]);
+  for (const delta of [-24 * 60 * 60 * 1000, 24 * 60 * 60 * 1000]) {
+    const other = offsetMinutes(new Date(naive + delta), zone);
+    if (other !== null) offsets.add(other);
+  }
+  const instants = new Set<string>();
+  for (const offset of offsets) {
+    const candidate = new Date(naive - offset * 60 * 1000);
+    if (localParts(candidate, zone) === dueLocal.trim()) instants.add(candidate.toISOString());
+  }
+  if (instants.size === 0) return "gap";
+  if (instants.size > 1) return "ambiguous";
+  return null;
+}

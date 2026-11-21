@@ -219,20 +219,31 @@ test("task client exposes the supported operations", () => {
   assert.equal(typeof api.patchTask, "function");
 });
 
-test("listTasks sends the token and requests open actions by default", async () => {
+test("listTasks sends the token, the view and the cursor, and reads the page envelope", async () => {
   const originalFetch = globalThis.fetch;
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url, options };
-    return Response.json({ items: [{ id: "t1", title: "Apply", due_precision: "date", due_date: "2026-11-12" }] });
+    return Response.json({
+      items: [{ id: "t1", title: "Apply", due_precision: "date", due_date: "2026-11-12" }],
+      page_size: 25, total: 42, next_cursor: "task-cursor-1",
+    });
   };
   try {
     const result = await api.listTasks("access-token");
     assert.equal(request.url, "/api/tasks");
     assert.equal(request.options.headers.Authorization, "Bearer access-token");
     assert.equal(result.items.length, 1);
+    assert.equal(result.total, 42);
+    assert.equal(result.next_cursor, "task-cursor-1");
+
     await api.listTasks("access-token", true);
     assert.equal(request.url, "/api/tasks?filter=all");
+
+    await api.listTasks("access-token", true, "task-cursor-1");
+    const url = new URL(request.url, "http://localhost");
+    assert.equal(url.searchParams.get("filter"), "all");
+    assert.equal(url.searchParams.get("cursor"), "task-cursor-1");
   } finally {
     globalThis.fetch = originalFetch;
   }

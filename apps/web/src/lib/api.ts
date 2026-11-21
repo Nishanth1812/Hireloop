@@ -136,12 +136,25 @@ export type TaskInput = {
 
 export type TaskPatch = Partial<Pick<Task, "title" | "status" | "due_precision" | "due_date" | "due_local" | "time_zone">>;
 
-export type TaskPage = { items: Task[] };
+// TaskPage is the API's bounded keyset page. total counts every row matching
+// the view (open only by default), so the Today panel never treats one page
+// as the whole list. next_cursor is an opaque position or null on the last page.
+export type TaskPage = {
+  items: Task[];
+  page_size: number;
+  total: number;
+  next_cursor: string | null;
+};
 
-// Tasks are a small personal queue, so the list is not paginated. showAll
-// includes finished tasks; the default view is open actions only.
-export function listTasks(token: string, showAll = false): Promise<TaskPage> {
-  return request(`/api/tasks${showAll ? "?filter=all" : ""}`, token);
+// listTasks fetches one page. The cursor is the API's opaque next_cursor;
+// null (or omitted) requests the first page. The view is sent with the cursor
+// so the API can reject a token minted for a different filter set.
+export function listTasks(token: string, showAll = false, cursor: string | null = null): Promise<TaskPage> {
+  const params = new URLSearchParams();
+  if (cursor) params.set("cursor", cursor);
+  if (showAll) params.set("filter", "all");
+  const query = params.toString();
+  return request(`/api/tasks${query ? `?${query}` : ""}`, token);
 }
 
 export function createTask(token: string, input: TaskInput): Promise<Task> {

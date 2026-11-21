@@ -35,14 +35,20 @@ function TaskCard({ task, application, busy, onEdit, onComplete, onCancel }: {
   );
 }
 
-export function TodayPanel({ tasks, applications, loading, loadError, showAll, busyId, onToggleFinished, onEdit, onComplete, onCancel }: {
+export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasNext, loading, loadError, showAll, busyId, onToggleFinished, onPrevious, onNext, onEdit, onComplete, onCancel }: {
   tasks: Task[];
   applications: Application[];
+  total: number;
+  page: number;
+  hasPrevious: boolean;
+  hasNext: boolean;
   loading: boolean;
   loadError: boolean;
   showAll: boolean;
   busyId: string;
   onToggleFinished: () => void;
+  onPrevious: () => void;
+  onNext: () => void;
   onEdit: (task: Task, application?: Application) => void;
   onComplete: (task: Task) => void;
   onCancel: (task: Task) => void;
@@ -50,13 +56,16 @@ export function TodayPanel({ tasks, applications, loading, loadError, showAll, b
   const open = tasks.filter((task) => task.status === "open");
   const finished = tasks.filter((task) => task.status !== "open");
   const applicationsByID = new Map(applications.map((application) => [application.id, application]));
+  // The API's total counts every matching row, not just this page. A bounded
+  // page is always labelled as such instead of hiding the remaining tasks.
+  const shown = open.length + finished.length;
 
   return (
     <section className="today-panel" aria-labelledby="today-title" aria-busy={loading}>
       <div className="section-heading">
         <div>
           <p className="eyebrow">What needs attention</p>
-          <h2 id="today-title">Today <span className="count">{open.length}</span></h2>
+          <h2 id="today-title">Today {!showAll && <span className="count">{total}</span>}</h2>
         </div>
         <button className="button quiet" type="button" aria-pressed={showAll} onClick={onToggleFinished}>
           {showAll ? "Hide finished" : "Show finished"}
@@ -67,9 +76,11 @@ export function TodayPanel({ tasks, applications, loading, loadError, showAll, b
           ? "Loading actions…"
           : loadError
             ? "Your actions could not be loaded."
-            : open.length === 0
-              ? "Nothing open right now. Add a task from any application."
-              : `${open.length} open action${open.length === 1 ? "" : "s"}`}
+            : total === 0
+              ? showAll
+                ? "No actions recorded yet. Add one from any application."
+                : "Nothing open right now. Add a task from any application."
+              : `Showing ${shown} on this page · ${total} total`}
       </p>
       {!loading && !loadError && open.length > 0 && (
         <ul className="task-list">
@@ -93,6 +104,13 @@ export function TodayPanel({ tasks, applications, loading, loadError, showAll, b
             </ul>
           )}
         </div>
+      )}
+      {!loading && !loadError && (hasPrevious || hasNext) && (
+        <nav className="pagination today-pagination" aria-label="Today pages">
+          <button className="button quiet" type="button" onClick={onPrevious} disabled={!hasPrevious}>Previous</button>
+          <span className="page-indicator">Page {page}</span>
+          <button className="button quiet" type="button" onClick={onNext} disabled={!hasNext}>Next</button>
+        </nav>
       )}
     </section>
   );

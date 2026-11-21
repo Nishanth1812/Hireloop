@@ -14,8 +14,9 @@ import {
   toChannel,
 } from "@/lib/api";
 import type {
-  Application, ApplicationFilters, ApplicationPage, ApplicationPatch, Task, TaskInput, TaskPatch, TaskStatus,
+  Application, ApplicationFilters, ApplicationPage, ApplicationPatch, Task, TaskInput, TaskPage, TaskPatch, TaskStatus,
 } from "@/lib/api";
+import { localDeadlineIssue } from "@/lib/tasks";
 import { ApplicationDashboard } from "./_components/ApplicationDashboard";
 import type { TaskDraft } from "./_components/ApplicationDashboard";
 import { SignInPanel } from "./_components/SignInPanel";
@@ -29,6 +30,8 @@ const firstPage: ApplicationPage = {
   counts: { saved: 0, applied: 0 },
   next_cursor: null,
 };
+
+const firstTaskPage: TaskPage = { items: [], page_size: 25, total: 0, next_cursor: null };
 
 function messageFrom(error: unknown) {
   return error instanceof Error ? error.message : "Something went wrong. Please try again.";
@@ -65,7 +68,12 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   const [editing, setEditing] = useState<Application | null>(null);
   // Tasks reload on their own key: writing a task must not refetch the whole
   // application list, and paging applications must not disturb the Today feed.
-  const [tasks, setTasks] = useState<Task[]>([]);
+  // Today is a bounded keyset page too; a cursor is bound to the view that
+  // minted it, so toggling "finished" restarts at the first page.
+  const [taskPage, setTaskPage] = useState<TaskPage>(firstTaskPage);
+  const [taskHistory, setTaskHistory] = useState<Array<string | null>>([null]);
+  const [taskPageIndex, setTaskPageIndex] = useState(0);
+  const taskCursor = taskHistory[taskPageIndex] ?? null;
   const [taskLoading, setTaskLoading] = useState(session !== null);
   const [taskLoadError, setTaskLoadError] = useState(false);
   const [tasksShowAll, setTasksShowAll] = useState(false);
@@ -125,6 +133,9 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   useEffect(() => {
     if (!session) return;
     let cancelled = false;
+    // A cursor page emptied by a concurrent completion steps back instead of
+    // showing a dead page while loading the previous position.
+    let steppingBack = false;
     void (async () => {
       setTaskLoading(true);
       setTaskLoadError(false);
@@ -132,24 +143,29 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         const token = await session.getToken();
         if (cancelled) return;
         if (!token) throw new Error("Your session is unavailable. Please sign in again.");
-        const next = await listTasks(token, tasksShowAll);
+        const next = await listTasks(token, tasksShowAll, taskCursor);
         if (cancelled) return;
-        setTasks(next.items);
+        if (next.items.length === 0 && taskPageIndex > 0) {
+          steppingBack = true;
+          setTaskPageIndex(taskPageIndex - 1);
+          return;
+        }
+        setTaskPage(next);
       } catch (caught: unknown) {
         if (!cancelled) {
           // Never leave a previous account's actions on screen after a failure.
-          setTasks([]);
+          setTaskPage(firstTaskPage);
           setTaskLoadError(true);
           setError(messageFrom(caught));
         }
       } finally {
-        if (!cancelled) setTaskLoading(false);
+        if (!cancelled && !steppingBack) setTaskLoading(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [session, tasksShowAll, taskReloadKey]);
+  }, [session, tasksShowAll, taskCursor, taskPageIndex, taskReloadKey]);
 
   function reload() {
     setReloadKey((key) => key + 1);
@@ -173,6 +189,31 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     if (!next) return;
     setHistory((previous) => [...previous.slice(0, pageIndex + 1), next]);
     setPageIndex(pageIndex + 1);
+  }
+
+  // Today keeps its own cursor trail so paging actions never disturbs the
+  // application list's position, and a new view starts at the first page.
+  function toggleFinished() {
+    setTaskHistory([null]);
+    setTaskPageIndex(0);
+    setTasksShowAll((value) => !value);
+  }
+
+  function goPreviousTask() {
+    if (taskPageIndex === 0) return;
+    setTaskPageIndex(taskPageIndex - 1);
+  }
+
+  function goNextTask() {
+    const next = taskPage.next_cursor;
+    if (!next) return;
+    setTaskHistory((previous) => [...previous.slice(0, taskPageIndex + 1), next]);
+    setTaskPageIndex(taskPageIndex + 1);
+  }
+
+  function restartTasks() {
+    setTaskHistory([null]);
+    setTaskPageIndex(0);
   }
 
   async function addApplication(event: FormEvent<HTMLFormElement>) {
@@ -381,6 +422,15 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         setError("Choose a date and time for this deadline.");
         return;
       }
+      const issue = localDeadlineIssue(fields.due_local, fields.time_zone);
+      if (issue === "gap") {
+        setError("That local time does not exist in the chosen zone because the clocks jump forward. Choose another time.");
+        return;
+      }
+      if (issue === "ambiguous") {
+        setError("That local time happens twice when the clocks go back. Choose another time or state the offset explicitly.");
+        return;
+      }
     }
     setSaving(true);
     setError("");
@@ -400,6 +450,9 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
         await createTask(token, input);
       }
       setTaskDraft(null);
+      // A new task can sort onto any page, so start from the first one; an
+      // edit keeps the current keyset position.
+      if (!id) restartTasks();
       setTaskReloadKey((key) => key + 1);
       setNotice(id ? "Task updated." : "Task added to Today.");
     } catch (caught) {
@@ -446,7 +499,10 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     saving={saving}
     busyId={busyId}
     editingApplication={editingApplication}
-    tasks={tasks}
+    taskPage={taskPage}
+    taskPageIndex={taskPageIndex}
+    taskHasPrevious={taskPageIndex > 0}
+    taskHasNext={taskPage.next_cursor !== null}
     taskLoading={taskLoading}
     taskLoadError={taskLoadError}
     tasksShowAll={tasksShowAll}
@@ -465,7 +521,9 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     onClearFilters={() => applyFilters(noFilters)}
     onPrevious={goPrevious}
     onNext={goNext}
-    onToggleFinished={() => setTasksShowAll((value) => !value)}
+    onToggleFinished={toggleFinished}
+    onTaskPrevious={goPreviousTask}
+    onTaskNext={goNextTask}
     onEditTask={(task, application) => openTaskForm(applicationForTask(task, application), task)}
     onSaveTask={(event, id) => void saveTask(event, id)}
     onCancelTaskEdit={() => setTaskDraft(null)}

@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
 import type { FormEvent } from "react";
 import Link from "next/link";
 import { SignOutButton } from "@clerk/nextjs";
-import type { Application, ApplicationFilters, ApplicationPage, Task } from "@/lib/api";
+import type { Application, ApplicationFilters, ApplicationPage, Task, TaskPage } from "@/lib/api";
 import { ApplicationCaptureForm } from "./ApplicationCaptureForm";
 import { ApplicationEditForm } from "./ApplicationEditForm";
 import { ApplicationFilterBar } from "./ApplicationFilterBar";
@@ -27,7 +27,10 @@ type Props = {
   saving: boolean;
   busyId: string;
   editingApplication: Application | null;
-  tasks: Task[];
+  taskPage: TaskPage;
+  taskPageIndex: number;
+  taskHasPrevious: boolean;
+  taskHasNext: boolean;
   taskLoading: boolean;
   taskLoadError: boolean;
   tasksShowAll: boolean;
@@ -47,6 +50,8 @@ type Props = {
   onPrevious: () => void;
   onNext: () => void;
   onToggleFinished: () => void;
+  onTaskPrevious: () => void;
+  onTaskNext: () => void;
   onEditTask: (task: Task, application?: Application) => void;
   onSaveTask: (event: FormEvent<HTMLFormElement>, id?: string) => void;
   onCancelTaskEdit: () => void;
@@ -56,9 +61,9 @@ type Props = {
 
 export function ApplicationDashboard({
   email, result, filters, page, hasPrevious, hasNext, loading, loadError, saving, busyId, editingApplication,
-  tasks, taskLoading, taskLoadError, tasksShowAll, taskBusyId, taskDraft, error, notice,
+  taskPage, taskPageIndex, taskHasPrevious, taskHasNext, taskLoading, taskLoadError, tasksShowAll, taskBusyId, taskDraft, error, notice,
   onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onAddTask, onApplyFilters, onClearFilters,
-  onPrevious, onNext, onToggleFinished, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask,
+  onPrevious, onNext, onToggleFinished, onTaskPrevious, onTaskNext, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask,
 }: Props) {
   // Counts come from the API for every matching row, never from the current
   // page, so the summary stays honest while paging or filtering.
@@ -103,13 +108,19 @@ export function ApplicationDashboard({
       {notice && <p className="message success-message" role="status">{notice}</p>}
 
       <TodayPanel
-        tasks={tasks}
+        tasks={taskPage.items}
         applications={result.items}
+        total={taskPage.total}
+        page={taskPageIndex + 1}
+        hasPrevious={taskHasPrevious}
+        hasNext={taskHasNext}
         loading={taskLoading}
         loadError={taskLoadError}
         showAll={tasksShowAll}
         busyId={taskBusyId}
         onToggleFinished={onToggleFinished}
+        onPrevious={onTaskPrevious}
+        onNext={onTaskNext}
         onEdit={onEditTask}
         onComplete={onCompleteTask}
         onCancel={onCancelTask}
