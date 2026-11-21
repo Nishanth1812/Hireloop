@@ -1,63 +1,88 @@
 # Hireloop
 
-Hireloop is a job application and deadline tracker. The product roadmap is maintained locally under `docs/`.
+Hireloop is a job application and deadline tracker under active local development. It is a modular monolith with a Go API backed by PostgreSQL (Supabase) and a Next.js web app; Clerk provides sign-in. This is a working prototype, not a released product.
 
-## API development
+## Features
 
-Requires Bun and Go 1.25 or later. Put server settings such as `DATABASE_URL`, `CLERK_ISSUER`, and `CLERK_JWKS_URL` in the root `.env`. From `apps/api`, start the API with:
+- **Clerk authentication.** Sign in with Google through Clerk. The API verifies the session JWT against Clerk's JWKS (signature, issuer, expiry, and optional `azp` authorized parties) and scopes every row to the verified owner, never to a value from the request body.
+- **Application tracker.** Manually create, read, search/filter, update and delete applications. Required fields are `company` and `role`; `status` is `saved` or `applied`. Optional fields are `source`, `address`, `url`, `channel` (`campus` or `off-campus`), `job_id`, `applied_on` (date-only) and `notes`.
+- **Today — open actions.** Each application can carry tasks with an `open` / `done` / `cancelled` lifecycle. The default Today view lists open actions soonest deadline first, with deadline-free actions last; a `filter=all` view also shows finished actions. Deadlines have an explicit `due_precision`: `none`, a date-only `date`, or an exact `instant` given as a local wall time plus a full IANA `time_zone`, resolved to a UTC instant. Date-only deadlines are displayed as a day with "cutoff time unspecified" — no time is invented. A local time that does not exist (spring-forward gap) or is ambiguous (fall-back overlap, including 30-minute shifts such as `Australia/Lord_Howe`) is rejected with 400 instead of silently choosing one; abbreviations like `IST` and server-local `Local` are never accepted.
+
+## Repository layout
+
+- `apps/api/` — Go 1.25 HTTP API: `cmd/api` (startup), `internal/` (Clerk verification, identity mapping, applications, tasks, HTTP handlers), `db/migrations/` (ordered SQL migrations embedded into the binary).
+- `apps/web/` — Next.js 16 app: `src/app` (screens, components, tests), `src/lib` (typed API client).
+- `apps/web/.env.example` — tracked template for web environment variables.
+- The root `.env`, `apps/web/.env.local`, and local planning documents are ignored by Git; they are not part of the tracked source.
+
+## Prerequisites
+
+- Bun 1.4+ and Go 1.25+.
+- A Clerk instance (Frontend API origin and JWKS URL) for sign-in.
+- Optional: a PostgreSQL/Supabase **session-pooler** connection string for persistence. The API starts without it for local checks, but application and task routes then have no storage and return 503.
+
+## Configuration
+
+Variables are loaded per file; there is no global dotenv.
+
+- Root `.env` (ignored, read by the API): `DATABASE_URL`, `CLERK_ISSUER`, `CLERK_JWKS_URL`, optional `CLERK_AUTHORIZED_PARTIES` (comma-separated allowed origins), optional `HIRELOOP_API_ADDR` (default `127.0.0.1:8080`).
+- `apps/web/.env.local` (ignored, read by the web app and by `bun run start`): `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, optional `HIRELOOP_API_URL` (default `http://127.0.0.1:8080`).
+- `HIRELOOP_TEST_DATABASE_URL` — test only, never a runtime setting (see [Tests](#tests-and-data-safety)).
+
+`CLERK_ISSUER` and `CLERK_JWKS_URL` must be set together, both over HTTPS and sharing a host; `CLERK_JWKS_URL` points at the instance's `/.well-known/jwks.json`. Without Clerk configuration, authenticated requests fail closed with 503. Next.js rewrites `/api/*` to `HIRELOOP_API_URL`, so browser calls keep the app's origin; when changing the port, set `HIRELOOP_API_ADDR` and `HIRELOOP_API_URL` to the same address.
+
+Never commit a `.env` file, Clerk secret key, service-role key, database password or access token.
+
+## Start and checks
+
+From `apps/api`:
 
 ```sh
-bun run start
-```
-
-This command loads the root `.env` and `apps/web/.env.local`, then starts the API. If `DATABASE_URL` is set, startup applies only pending embedded migrations before opening the listener. Migration failure stops startup; migrations use the existing advisory lock and history table and never reset schema or data.
-
-The API listens on `http://127.0.0.1:8080`. If that port belongs to another service, set `HIRELOOP_API_ADDR` (for example `127.0.0.1:8081`) for the API and the matching `HIRELOOP_API_URL` (`http://127.0.0.1:8081`) for the web app. `GET /health` returns `{"status":"ok"}` when the API process is responding. This endpoint does not check the database.
-
-Run checks from `apps/api`:
-
-```sh
+bun run start     # loads the root .env and apps/web/.env.local, then runs the Go API
 go test ./...
 go vet ./...
 ```
 
-## Authentication API
+`bun run start` is the API's only script. If `DATABASE_URL` is set, startup applies only pending embedded migrations before opening the listener; a migration failure stops startup. Use the Supabase **session pooler, not transaction pooling**. Migrations are ordered SQL files guarded by an advisory lock and a history table: an up-to-date database is a no-op. Review pending migrations before starting against an existing database. If a migration fails, inspect the history and database state and take a backup before any repair; do not blindly reset the history or drop data. An existing hand-created `applications` table is not adopted automatically.
 
-`GET /api/me` accepts a Clerk session JWT in an `Authorization: Bearer <token>` header. The API verifies the token's signature, issuer, expiry, and authorized party against Clerk's JWKS, then resolves the Clerk subject to its explicitly bound Supabase owner (an unbound Clerk subject is treated as a new signup that owns itself). Missing or invalid tokens receive 401; a transient verification failure receives 503.
+The API listens on `127.0.0.1:8080` by default. `GET /health` returns `{"status":"ok"}` while the process is up; it does not check the database.
 
-To configure the API for Clerk, set `CLERK_JWKS_URL` to your instance's `/.well-known/jwks.json` endpoint and `CLERK_ISSUER` to its Frontend API origin (both HTTPS and sharing the same host). Optionally set `CLERK_AUTHORIZED_PARTIES` to a comma-separated list of origins matched against the token's `azp` claim. Without Clerk configuration, authenticated requests fail closed with 503. Supabase is used for PostgreSQL persistence only.
+From `apps/web`:
 
-Never put a service-role key, database password or access token in source control.
+```sh
+bun install
+bun run dev
+bun run test
+bun run lint
+bun run build
+```
 
-## Application APIs
+`bun run build` needs `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` set for prerendering. See [apps/web/README.md](apps/web/README.md) for web-specific setup.
 
-All routes require the Clerk session JWT described above. The owner is taken from the verified identity, never from the request body.
+## Tests and data safety
 
-- `POST /api/applications` accepts JSON such as `{"company":"Acme","role":"Engineer","status":"saved"}`. `company` and `role` are required and `status` must be `saved` or `applied`. Optional fields are `source`, `address`, `url`, `channel` (`campus` or `off-campus`), `job_id`, `applied_on` (date-only, `YYYY-MM-DD`) and `notes`. It returns the created application with status 201; invalid input returns 400.
-- `GET /api/applications` returns a bounded keyset page of the current user's applications, newest first, as `{"items":[...],"page_size":25,"total":42,"counts":{"saved":40,"applied":2},"next_cursor":"..."}`. `total` and `counts` describe every matching row, so a single page never misstates the size of the list; `counts` ignores the `status` filter so the summary stays truthful while filtering. `next_cursor` is `null` on the last page. Supported parameters are `q` (case-insensitive search over company, role and job ID, max 100 characters), `status`, `channel`, `cursor` (the opaque `next_cursor` from the previous page) and `page_size` (1–50, default 25). `cursor` is bound to the normalized filters, so a token minted for one query is rejected with 400 if the filters change; the client must restart at the first page after changing them. A cursor stays valid even if the row it points at was deleted. Unknown parameters, malformed or oversized cursors, and out-of-range values return 400 rather than being ignored or clamped.
-- `GET /api/applications/{id}` returns a specific application by ID with status 200 if it exists and belongs to the authenticated user. Malformed IDs return 400; missing or other-user records return 404 without revealing ownership; database errors return 503.
-- `PATCH /api/applications/{id}` accepts one or more valid fields from the same set as `POST` and returns the updated application with status 200. An explicit empty string clears an optional field. Malformed IDs or input return 400; missing or other-user records return 404 without revealing ownership; database errors return 503.
-- `DELETE /api/applications/{id}` deletes a specific application and returns 204. Malformed IDs return 400; missing or other-user records return 404 without revealing ownership; database errors return 503.
+`go test ./...` and `bun run test` use local mocks and need no database. Two Go test groups are opt-in through `HIRELOOP_TEST_DATABASE_URL`: the migration idempotence test and the SQL-backed `PostgresStore` integration tests. **Both apply pending migrations to the configured database**, so point that variable only at a disposable test database — never production. Integration tests write only temporary rows under freshly generated random owners and delete exactly those rows in cleanup; they never read or write another owner's data and never create or delete auth users. Use a dedicated test database to avoid affecting user data. Web component tests use Happy DOM and need no browser.
 
-Application routes return 503 if database configuration or access is unavailable. Configure `DATABASE_URL` with your Supabase session-pooler connection string only when ready. Do not commit it. Migrations are ordered SQL files embedded from `apps/api/db/migrations/`; `migrate.Up` applies only pending versions and treats an up-to-date database as success. The initial migration creates the applications table, enables row-level security, and grants no direct client policies; the backend database role must have appropriate access, and backend queries enforce the authenticated owner.
+## API
 
-Migrations use an advisory lock and a migration history table; use the Supabase session pooler, not transaction pooling. If a migration fails, inspect the migration history and database state before repairing it; do not blindly reset the history or drop data. An existing manually created applications table is not automatically adopted. Use a backup and a reviewed corrective migration when needed. API routes previously prefixed `/api/v1/` have moved to `/api/`.
+All `/api/*` routes except `/health` require `Authorization: Bearer <Clerk session JWT>`. The owner always comes from the verified token. The old `/api/v1/` prefix is gone; routes are under `/api/`.
 
-Default authentication and API tests use local mocks. Temporary Clerk development users have also completed signed-in browser CRUD against PostgreSQL, including reload persistence and cross-account GET/PATCH/DELETE denial through the web proxy; those users and their test records were removed afterward. Google OAuth sign-in and a signed-in application create and reload have also been verified. Live visual, keyboard and screen-reader checks were deferred by the project owner. No database is required to run the default tests. Two groups of tests are opt-in through `HIRELOOP_TEST_DATABASE_URL` (point it at a test database; these tests apply pending migrations): the migration idempotence test, and SQL-backed store integration tests that run the real migrations and `PostgresStore` against the configured database using temporary rows under random owners that they delete afterward. `GET /api/applications` uses bounded keyset (seek) pagination ordered by `created_at DESC, id DESC`: the cursor carries the last row's `(created_at, id)` pair, and one look-ahead row decides whether another page exists. The count and the page share one read-only `REPEATABLE READ` snapshot, so the total and the rows describe one consistent view. Because each page starts strictly after the cursor position, concurrent inserts and deletes between separate requests cannot repeat or skip a row, and a cursor stays usable even if the row it points at is deleted. Rows that share a `created_at` are tie-broken by `id`, so the order is deterministic. The page is bounded: `page_size` is capped at 50, a cursor past the last row returns an empty page with `next_cursor: null`, and a cursor is rejected with 400 when it is malformed, oversized, or was minted for a different filter set.
+| Method & path | Purpose |
+| --- | --- |
+| `GET /health` | Liveness check; no authentication or database check. |
+| `GET /api/me` | Current user (`id`, `email`) resolved from the Clerk subject. |
+| `POST /api/applications` | Create an application (201). |
+| `GET /api/applications` | List the caller's applications as a bounded page. |
+| `GET /api/applications/{id}` | Read one application (200/404). |
+| `PATCH /api/applications/{id}` | Update one or more fields (200/404); an explicit empty string clears an optional field. |
+| `DELETE /api/applications/{id}` | Delete an application (204/404). |
+| `POST /api/tasks` | Create a task on the caller's own application (201/404). |
+| `GET /api/tasks` | List tasks as a bounded page (`filter=open` by default; `filter=all` includes `done` and `cancelled`). |
+| `GET /api/tasks/{id}` | Read one task (200/404). |
+| `PATCH /api/tasks/{id}` | Update a task, including status and the whole deadline shape (200/404). |
 
-## Task APIs
+Missing or invalid tokens return 401; a transient verification failure returns 503. Missing or other-owner rows return 404 without revealing ownership. Malformed IDs, unknown fields or query parameters, and invalid or out-of-range values return 400; unavailable database/configuration returns 503. Applications list parameters are `q` (case-insensitive over company, role and job ID, max 100 characters), `status`, `channel`, `cursor` and `page_size`; task list parameters are `filter`, `cursor` and `page_size`.
 
-All task routes require the Clerk session JWT and scope every row to the verified owner.
+**Pagination contract.** Both list endpoints return bounded keyset pages of the shape `{"items":[…],"page_size":25,"total":N,"next_cursor":"…"|null}`; applications also include `counts` with `saved` and `applied` totals that ignore the `status` filter. `total` and `counts` describe every matching row, not just the page, so a page is never presented as the whole list and filtering never misstates the summary. `page_size` is 1–50 (default 25) and is rejected, not clamped, when out of range. Applications are ordered by `created_at DESC, id DESC`; tasks by deadline day, `due_at`, `created_at`, `id`, with deadline-free actions last. `next_cursor` is null on the last page and is passed back as `cursor`; it is bound to the filters/view that minted it and is rejected with 400 when they change (restart at page one). Unknown parameters and malformed or oversized cursors also return 400. Count and page share one read-only `REPEATABLE READ` snapshot, and seeking after the cursor avoids offset shifts when rows are inserted or deleted before it; updates that change a task’s sort key can still move it between pages; a cursor remains usable even if its anchor row was deleted, and a cursor past the end yields an empty page with a null cursor.
 
-- `POST /api/tasks` accepts `{"application_id":"<uuid>","title":"Submit the assessment","due_precision":"date","due_date":"2026-11-12"}`. `application_id` must be the caller's own application. `title` is required (1–200 characters). `due_precision` is `none` (the default when omitted), `date` or `instant`. A `date` deadline accepts only `due_date` (`YYYY-MM-DD`) and stores no time or zone. An `instant` deadline accepts `due_local` (`YYYY-MM-DDTHH:MM`) and `time_zone` (a full IANA name such as `Asia/Kolkata` or `UTC`); the API resolves that wall time in that zone to a UTC instant and keeps the original zone. A nonexistent local time (a spring-forward gap) and an ambiguous one (a fall-back overlap, including 30-minute shifts such as `Australia/Lord_Howe`) are both rejected with 400 instead of silently picking an instant the user never chose; date-only deadlines and unambiguous instants are unchanged. The form checks the same cases locally and explains them before sending. `IST`-style abbreviations and server-local `Local` are never accepted. Returns 201 with the task; invalid input returns 400; an application the caller does not own returns 404.
-- `GET /api/tasks` returns a bounded keyset page: `{"items":[...],"page_size":25,"total":42,"next_cursor":"..."}`. The default and `?filter=open` return open actions, soonest deadline first and deadline-free actions last; `?filter=all` also includes `done` and `cancelled` tasks. `total` counts every row matching the view, so one page is never presented as the whole list, and `next_cursor` is `null` on the last page. Supported parameters are `filter`, `cursor` (the opaque `next_cursor` from the previous page) and `page_size` (1–50, default 25). The cursor carries the complete sort key `(deadline day, due_at, created_at, id)`, so rows sharing a deadline or timestamp are tie-broken deterministically and no row is repeated or skipped across pages. It is bound to the filter that produced it and rejected with 400 if the view changes; an explicitly empty or malformed cursor, unknown parameters and out-of-range page sizes also return 400. The count and the page share one read-only `REPEATABLE READ` snapshot.
-- `GET /api/tasks/{id}` returns one task with 200, or 404 if it is missing or belongs to another owner. Malformed IDs return 400.
-- `PATCH /api/tasks/{id}` accepts any of `title`, `status` (`open`, `done`, `cancelled`), `due_precision`, `due_date`, `due_local` and `time_zone`. Changing precision re-validates the whole deadline shape, so an edit cannot leave a date-only deadline with a time or an instant without its zone. Completion and cancellation are ordinary status patches and survive reload. An empty patch, an invalid field or a merged deadline that fails validation (including an ambiguous or nonexistent local time) returns 400; missing or other-owner tasks return 404.
-
-A task's wire record keeps `due_precision`, `due_date` (date-only), `due_at` (UTC RFC3339 instant), `due_local` (the original wall time) and `time_zone` (the original IANA zone) separate. The web app renders date-only deadlines as a day with an explicit "cutoff time unspecified" label and renders exact deadlines in their original zone with the zone and offset visible; it never invents a time for a date-only deadline. Migration 006 adds a new `tasks` table with a deadline-shape CHECK constraint and owner index; it is forward-only and additive, and its rollback (`DROP TABLE public.tasks`) discards only task data.
-
-## Web development
-
-The Next.js app in `apps/web` provides Clerk Google sign-in and the manual application workflow. Set `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` in `apps/web/.env.local`; set `CLERK_ISSUER` and `CLERK_JWKS_URL` for that same instance in the root `.env`. Set `DATABASE_URL` there when enabling Supabase persistence. Start the API as described above, then run `bun install` and `bun run dev` from `apps/web`. The web app proxies `/api/*` to `HIRELOOP_API_URL`, which defaults to `http://127.0.0.1:8080`.
-
-Run web checks from `apps/web` with `bun run test`, `bun run lint`, and `bun run build`. Component tests use Happy DOM to exercise token failures, sign-out, late responses during account changes, filter and pagination reloads, and the labelled form controls. The first screen covers application capture, editing, search/filtering and paginated listing with saved/applied state, plus a Today panel for open actions. The Today panel is also a bounded keyset page: it reports the API's honest total, offers named Previous/Next controls only when another page exists, keeps its own cursor position independent of the application list, restarts at page one when the finished view is toggled, and reports the total rather than hiding rows beyond a cap. Tasks are created from an application row, edited, completed and cancelled from that panel, and finished tasks can be shown after a reload. Component tests cover task form labels, date-only versus exact deadlines, DST offsets (including 30-minute shifts), early rejection of gaps and overlaps, pagination and step-back on emptied pages, validation feedback, completion/cancellation, and cross-account task isolation.
+Database access is restricted at both layers: the applications table has row-level security with no direct client policies, the backend role needs its own grants, and every query filters by the authenticated owner. Task data lives in its own additive table with a deadline-shape constraint; its rollback drops only task rows.
