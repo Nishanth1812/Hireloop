@@ -84,18 +84,20 @@ func TestWebhookRouteAppliesEventsAgainstRealStore(t *testing.T) {
 		`INSERT INTO applications (user_id, company, role, status) VALUES ($1, 'Acme', 'Engineer', 'saved') RETURNING id`, owner).Scan(&appID); err != nil {
 		t.Fatal(err)
 	}
-	past := time.Now().Add(-time.Minute)
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
 	var taskID string
 	if err := db.QueryRowContext(ctx,
 		`INSERT INTO tasks (user_id, application_id, title, status, due_precision, due_at, time_zone)
-		 VALUES ($1, $2, 'Interview', 'open', 'instant', $3, 'UTC') RETURNING id`, owner, appID, past).Scan(&taskID); err != nil {
+		 VALUES ($1, $2, 'Interview', 'open', 'instant', $3, 'UTC') RETURNING id`, owner, appID, trueDeadline).Scan(&taskID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
+	// Get the 2h reminder job (or any job) for testing
 	var jobID string
-	if err := db.QueryRowContext(ctx, `SELECT id FROM reminder_jobs WHERE task_id = $1`, taskID).Scan(&jobID); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT id FROM reminder_jobs WHERE task_id = $1 LIMIT 1`, taskID).Scan(&jobID); err != nil {
 		t.Fatal(err)
 	}
 	var version int

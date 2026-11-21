@@ -558,9 +558,13 @@ func TestPostgresTaskCreateSchedulesInstantReminderJob(t *testing.T) {
 	defer cancel()
 	appID := seedApplication(ctx, t, db, owner)
 
+	// Use a future deadline (48h from now) so both advance reminders are scheduled.
+	futureDeadline := time.Now().Add(48 * time.Hour)
+	futureLocal := futureDeadline.UTC().Format("2006-01-02T15:04")
+
 	instant, err := store.Create(ctx, owner, Input{
 		ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
-		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+		DueLocal: futureLocal, TimeZone: "UTC",
 	})
 	if err != nil {
 		t.Fatalf("create instant task: %v", err)
@@ -572,17 +576,24 @@ func TestPostgresTaskCreateSchedulesInstantReminderJob(t *testing.T) {
 	if job.DeliveryState != reminders.StateScheduled || job.TaskID != instant.ID || job.UserID != owner {
 		t.Fatalf("job = %+v", job)
 	}
+	// The job's TrueDeadline should match the task's DueAt (the true deadline).
+	// The job's DueAt is the reminder time (2h or 24h before), not the true deadline.
 	want, err := time.Parse(time.RFC3339Nano, instant.DueAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !job.DueAt.Equal(want) {
-		t.Fatalf("job due_at = %v, want %v", job.DueAt, want)
+	if !job.TrueDeadline.Equal(want) {
+		t.Fatalf("job true_deadline = %v, want %v", job.TrueDeadline, want)
+	}
+	// The job's DueAt should be either 2h or 24h before the true deadline.
+	if !job.DueAt.Before(want) {
+		t.Fatalf("job due_at = %v, want before true deadline %v", job.DueAt, want)
 	}
 
 	// Date-only and none deadlines never get a reminder job: a time or alarm
 	// is never invented for a day-only deadline.
-	dateTask, err := store.Create(ctx, owner, Input{ApplicationID: appID, Title: "Apply by date", DuePrecision: PrecisionDate, DueDate: "2026-12-01"})
+	futureDate := time.Now().Add(48 * time.Hour).Format("2006-01-02")
+	dateTask, err := store.Create(ctx, owner, Input{ApplicationID: appID, Title: "Apply by date", DuePrecision: PrecisionDate, DueDate: futureDate})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,16 +615,22 @@ func TestPostgresTaskPatchSuppressesJobsOnCompletionAndCancellation(t *testing.T
 	defer cancel()
 	appID := seedApplication(ctx, t, db, owner)
 
+	// Use future deadlines so reminder jobs are scheduled.
+	futureDeadline1 := time.Now().Add(48 * time.Hour)
+	futureLocal1 := futureDeadline1.UTC().Format("2006-01-02T15:04")
+	futureDeadline2 := time.Now().Add(72 * time.Hour)
+	futureLocal2 := futureDeadline2.UTC().Format("2006-01-02T15:04")
+
 	done, err := store.Create(ctx, owner, Input{
 		ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
-		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+		DueLocal: futureLocal1, TimeZone: "UTC",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cancelled, err := store.Create(ctx, owner, Input{
 		ApplicationID: appID, Title: "Submit form", DuePrecision: PrecisionInstant,
-		DueLocal: "2026-12-01T09:00", TimeZone: "UTC",
+		DueLocal: futureLocal2, TimeZone: "UTC",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -641,9 +658,13 @@ func TestPostgresTaskPatchReschedulesAndClearsJobs(t *testing.T) {
 	defer cancel()
 	appID := seedApplication(ctx, t, db, owner)
 
+	// Use a future deadline so reminder jobs are scheduled.
+	futureDeadline := time.Now().Add(48 * time.Hour)
+	futureLocal := futureDeadline.UTC().Format("2006-01-02T15:04")
+
 	task, err := store.Create(ctx, owner, Input{
 		ApplicationID: appID, Title: "Interview", DuePrecision: PrecisionInstant,
-		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+		DueLocal: futureLocal, TimeZone: "UTC",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -655,7 +676,9 @@ func TestPostgresTaskPatchReschedulesAndClearsJobs(t *testing.T) {
 
 	// Moving the deadline keeps the same job identity and reactivates it with
 	// the new instant.
-	moved, err := store.Patch(ctx, owner, task.ID, PatchInput{DueLocal: ptr("2026-11-13T09:00"), TimeZone: ptr("Asia/Kolkata")})
+	newDeadline := time.Now().Add(72 * time.Hour)
+	newLocal := newDeadline.UTC().Format("2006-01-02T15:04")
+	moved, err := store.Patch(ctx, owner, task.ID, PatchInput{DueLocal: ptr(newLocal), TimeZone: ptr("UTC")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,8 +696,12 @@ func TestPostgresTaskPatchReschedulesAndClearsJobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !jobAfter.DueAt.Equal(want) {
-		t.Fatalf("rescheduled job due_at = %v, want %v", jobAfter.DueAt, want)
+	if !jobAfter.TrueDeadline.Equal(want) {
+		t.Fatalf("rescheduled job true_deadline = %v, want %v", jobAfter.TrueDeadline, want)
+	}
+	// The job's DueAt should be either 2h or 24h before the true deadline.
+	if !jobAfter.DueAt.Before(want) {
+		t.Fatalf("rescheduled job due_at = %v, want before true deadline %v", jobAfter.DueAt, want)
 	}
 
 	// A title-only patch leaves the scheduled job alone.
@@ -704,9 +731,13 @@ func TestPostgresTaskPatchJobsAreOwnerScoped(t *testing.T) {
 	defer cancel()
 	appA := seedApplication(ctx, t, db, ownerA)
 
+	// Use a future deadline so reminder jobs are scheduled.
+	futureDeadline := time.Now().Add(48 * time.Hour)
+	futureLocal := futureDeadline.UTC().Format("2006-01-02T15:04")
+
 	taskA, err := store.Create(ctx, ownerA, Input{
 		ApplicationID: appA, Title: "A interview", DuePrecision: PrecisionInstant,
-		DueLocal: "2026-11-12T18:00", TimeZone: "Asia/Kolkata",
+		DueLocal: futureLocal, TimeZone: "UTC",
 	})
 	if err != nil {
 		t.Fatal(err)

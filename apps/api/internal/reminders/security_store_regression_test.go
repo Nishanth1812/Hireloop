@@ -45,9 +45,10 @@ func TestSecurityWebhookLedgerRollsBackWithFailedTransition(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
 	jobID := jobIDForTask(ctx, t, db, taskID)
@@ -92,13 +93,20 @@ func TestSecurityWebhookBeforeMappingIsReconciled(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
-	jobs, err := store.ClaimDue(ctx, time.Now(), 5, "sec-token", time.Now().Add(time.Minute), []string{owner})
+	// Get the 2h reminder job and set its due_at to the past so it's claimable.
+	jobID2h := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID2h == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID2h, past)
+	jobs, err := store.ClaimDue(ctx, past, 5, "sec-token", past.Add(time.Minute), []string{owner})
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("claim = %+v, %v", jobs, err)
 	}
@@ -112,21 +120,21 @@ func TestSecurityWebhookBeforeMappingIsReconciled(t *testing.T) {
 	if resolution != "pending" {
 		t.Fatalf("early event resolution = %q, want pending", resolution)
 	}
-	job, err := store.Get(ctx, owner, jobID)
+	job, err := store.Get(ctx, owner, jobID2h)
 	if err != nil || job.DeliveryState != StateLeased {
 		t.Fatalf("job before mapping = %+v, %v", job, err)
 	}
 
 	// The worker persists the mapping after the provider accepted the send.
-	if err := store.SetProviderEmailID(ctx, jobID, 1, "sec-email-early"); err != nil {
+	if err := store.SetProviderEmailID(ctx, jobID2h, 1, "sec-email-early"); err != nil {
 		t.Fatal(err)
 	}
-	job, err = store.Get(ctx, owner, jobID)
+	job, err = store.Get(ctx, owner, jobID2h)
 	if err != nil || job.DeliveryState != StateDelivered {
 		t.Fatalf("job after reconciliation = %+v, %v", job, err)
 	}
 	resolution, correlatedJob, version := securityLedgerRow(ctx, t, db, "sec-evt-early")
-	if resolution != "applied" || correlatedJob != jobID || version != 1 {
+	if resolution != "applied" || correlatedJob != jobID2h || version != 1 {
 		t.Fatalf("reconciled ledger row = %q/%s/v%d", resolution, correlatedJob, version)
 	}
 }
@@ -138,9 +146,10 @@ func TestSecurityLateEventsAreEvidenceOnlyAfterSuppressionAndReschedule(t *testi
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
 	jobID := jobIDForTask(ctx, t, db, taskID)
@@ -167,7 +176,8 @@ func TestSecurityLateEventsAreEvidenceOnlyAfterSuppressionAndReschedule(t *testi
 
 	// Rescheduling bumps the version and clears the live mapping; an old
 	// event for the same email must still be evidence only.
-	if err := store.Schedule(ctx, db, owner, taskID, past.Add(time.Hour)); err != nil {
+	newDeadline := trueDeadline.Add(time.Hour)
+	if err := store.Schedule(ctx, db, owner, taskID, newDeadline); err != nil {
 		t.Fatal(err)
 	}
 	job, err = store.Get(ctx, owner, jobID)
@@ -195,9 +205,10 @@ func TestSecurityLateDeliveredAfterExhaustionDoesNotRevive(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
 	jobID := jobIDForTask(ctx, t, db, taskID)
@@ -230,9 +241,10 @@ func TestSecurityFailedWebhookPreservesRetryBookkeeping(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
 	jobID := jobIDForTask(ctx, t, db, taskID)
@@ -277,9 +289,10 @@ func TestSecurityDuplicateAndOutOfOrderCallbacks(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
 	jobID := jobIDForTask(ctx, t, db, taskID)
@@ -317,13 +330,14 @@ func TestSecurityOwnerIsolationAndCrossOwnerConflict(t *testing.T) {
 	registerCleanup(t, db, ownerB)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskA := seedInstantTask(ctx, t, db, ownerA, past)
-	if err := store.Schedule(ctx, db, ownerA, taskA, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskA := seedInstantTask(ctx, t, db, ownerA, trueDeadline)
+	if err := store.Schedule(ctx, db, ownerA, taskA, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
 	jobA := jobIDForTask(ctx, t, db, taskA)
-	if err := store.Schedule(ctx, db, ownerB, taskA, past.Add(time.Hour)); err == nil {
+	if err := store.Schedule(ctx, db, ownerB, taskA, trueDeadline.Add(time.Hour)); err == nil {
 		t.Fatal("cross-owner Schedule must be rejected")
 	}
 	job, err := store.Get(ctx, ownerA, jobA)
@@ -337,14 +351,13 @@ func TestSecurityOwnerIsolationAndCrossOwnerConflict(t *testing.T) {
 
 	// A job owned by A that references a task owned by B must be suppressed,
 	// never dispatched with B's title.
-	taskB := seedInstantTask(ctx, t, db, ownerB, past)
+	taskB := seedInstantTask(ctx, t, db, ownerB, trueDeadline)
 	var badID string
+	// Set due_at to past so worker will claim it
+	past := time.Now().Add(-time.Hour)
 	if err := db.QueryRowContext(ctx, `INSERT INTO reminder_jobs
 		(user_id, task_id, due_at, delivery_version) VALUES ($1, $2, $3, 1) RETURNING id`, ownerA, taskB, past).
 		Scan(&badID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET due_at = $1 WHERE id = $2`, time.Now().Add(time.Hour), jobA); err != nil {
 		t.Fatal(err)
 	}
 	disp := &fakeDispatcher{outcome: OutcomeDelivered}
@@ -367,13 +380,20 @@ func TestSecurityStaleVersionMappingIsRejected(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
-	if _, err := store.ClaimDue(ctx, time.Now(), 5, "sec-tok", time.Now().Add(time.Minute), []string{owner}); err != nil {
+	// Get the 2h reminder job and set its due_at to the past so it's claimable.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID, past)
+	if _, err := store.ClaimDue(ctx, past, 5, "sec-tok", past.Add(time.Minute), []string{owner}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SetProviderEmailID(ctx, jobID, 2, "sec-email-stale"); err == nil {
@@ -391,12 +411,19 @@ func TestSecurityNoDispatcherNeverLeasesOrSends(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+	// Get the 2h reminder job and set its due_at to the past so it's claimable.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID, past)
 	w := NewWorker(store, Config{Scope: []string{owner}})
 	if w.Ready() {
 		t.Fatal("worker must not be ready without a dispatcher")

@@ -726,24 +726,30 @@ func TestPostgresDeleteSuppressesQueuedReminderJobs(t *testing.T) {
 	defer cancel()
 
 	appID := insertSeedRow(ctx, t, db, owner, "Acme", "Engineer", "saved", time.Now())
-	due := time.Now().Add(-time.Hour)
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
 	var taskID string
 	if err := db.QueryRowContext(ctx,
 		`INSERT INTO tasks (user_id, application_id, title, due_precision, due_at, time_zone)
 		 VALUES ($1, $2, 'Interview', 'instant', $3, 'UTC') RETURNING id`,
-		owner, appID, due).Scan(&taskID); err != nil {
+		owner, appID, trueDeadline).Scan(&taskID); err != nil {
 		t.Fatalf("seed task: %v", err)
 	}
 	remindersStore := &reminders.Store{DB: db}
-	if err := remindersStore.Schedule(ctx, db, owner, taskID, due); err != nil {
+	if err := remindersStore.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatalf("schedule job: %v", err)
 	}
+	// Get the 2h reminder job and set its due_at to the past so it's claimable.
 	var jobID string
-	if err := db.QueryRowContext(ctx, `SELECT id FROM reminder_jobs WHERE task_id = $1`, taskID).Scan(&jobID); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT id FROM reminder_jobs WHERE task_id = $1 AND reminder_timing = '2h_before'`, taskID).Scan(&jobID); err != nil {
 		t.Fatalf("find seeded job: %v", err)
 	}
+	past := time.Now().Add(-time.Hour)
+	if _, err := db.ExecContext(ctx, `UPDATE reminder_jobs SET due_at = $1 WHERE id = $2`, past, jobID); err != nil {
+		t.Fatalf("set job due_at: %v", err)
+	}
 	// The job is claimable before deletion.
-	if jobs, err := remindersStore.ClaimDue(ctx, due, 5, "tok", due.Add(30*time.Second), []string{owner}); err != nil || len(jobs) != 1 {
+	if jobs, err := remindersStore.ClaimDue(ctx, past, 5, "tok", past.Add(30*time.Second), []string{owner}); err != nil || len(jobs) != 1 {
 		t.Fatalf("claim before delete = %+v, %v", jobs, err)
 	}
 
@@ -755,7 +761,7 @@ func TestPostgresDeleteSuppressesQueuedReminderJobs(t *testing.T) {
 	if err != nil || job.DeliveryState != reminders.StateSuppressed || job.SuppressReason != reminders.SuppressDeleted {
 		t.Fatalf("job after delete = %+v, %v", job, err)
 	}
-	if jobs, err := remindersStore.ClaimDue(ctx, due, 5, "tok2", due.Add(30*time.Second), []string{owner}); err != nil || len(jobs) != 0 {
+	if jobs, err := remindersStore.ClaimDue(ctx, past, 5, "tok2", past.Add(30*time.Second), []string{owner}); err != nil || len(jobs) != 0 {
 		t.Fatalf("claim after delete = %+v, %v", jobs, err)
 	}
 }

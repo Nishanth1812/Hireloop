@@ -45,12 +45,19 @@ func TestWorkerTimeoutProducesUncertainAndRetries(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+	// Get the 2h reminder job and set its due_at to the past so it's claimable.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID, past)
 
 	disp := &scriptedDispatcher{outcomes: []Outcome{OutcomeUncertain, OutcomeAccepted}}
 	w := NewWorker(store, Config{Dispatcher: disp, Scope: []string{owner}, BatchSize: 5})
@@ -88,12 +95,19 @@ func TestWorkerPermanentFailureIsTerminalAndBlocksCallbacks(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+	// Get the 2h reminder job and set its due_at to the past so it's claimable.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID, past)
 
 	disp := &scriptedDispatcher{outcomes: []Outcome{OutcomePermanent}}
 	w := NewWorker(store, Config{Dispatcher: disp, Scope: []string{owner}, BatchSize: 5})
@@ -116,9 +130,10 @@ func TestResendWebhookEventsApplyMonotonicallyAndClearOnReschedule(t *testing.T)
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
 	jobID := jobIDForTask(ctx, t, db, taskID)
@@ -159,7 +174,8 @@ func TestResendWebhookEventsApplyMonotonicallyAndClearOnReschedule(t *testing.T)
 	}
 
 	// Reschedule: the version bumps and the old provider email id is gone.
-	if err := store.Schedule(ctx, db, owner, taskID, past.Add(time.Hour)); err != nil {
+	newDeadline := trueDeadline.Add(time.Hour)
+	if err := store.Schedule(ctx, db, owner, taskID, newDeadline); err != nil {
 		t.Fatal(err)
 	}
 	job, err = store.Get(ctx, owner, jobID)
@@ -197,9 +213,10 @@ func TestResendWebhookEventConcurrentDedup(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
 	jobID := jobIDForTask(ctx, t, db, taskID)
@@ -249,12 +266,19 @@ func TestResendDispatcherWithRealStore(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+	// Get the 2h reminder job and set its due_at to the past so it's claimable.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID, past)
 
 	sender := &captureSender{queue: []captureSenderEntry{{result: resend.Result{Status: resend.StatusAccepted, MessageID: "email-e2e"}}}}
 	dispatcher := NewResendDispatcher(store, sender, "hireloop@example.com",
@@ -296,12 +320,19 @@ func TestWorkerDefaultNoSendWithoutDispatcher(t *testing.T) {
 	store, db, owner := openStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
-	jobID := jobIDForTask(ctx, t, db, taskID)
+	// Get the 2h reminder job and set its due_at to the past so it's claimable.
+	jobID := jobIDForTaskTiming(ctx, t, db, taskID, Timing2hBefore)
+	if jobID == "" {
+		t.Fatal("expected 2h job")
+	}
+	past := time.Now().Add(-time.Hour)
+	setJobDueAt(ctx, t, db, jobID, past)
 
 	w := NewWorker(store, Config{Scope: []string{owner}, BatchSize: 5})
 	if w.Ready() {
@@ -334,9 +365,10 @@ func TestWebhookEventsRespectOwner(t *testing.T) {
 	registerCleanup(t, db, ownerB)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	past := time.Now().Add(-time.Minute)
-	taskID := seedInstantTask(ctx, t, db, owner, past)
-	if err := store.Schedule(ctx, db, owner, taskID, past); err != nil {
+	// Use a future true deadline so Schedule creates the advance reminder jobs.
+	trueDeadline := time.Now().Add(48 * time.Hour)
+	taskID := seedInstantTask(ctx, t, db, owner, trueDeadline)
+	if err := store.Schedule(ctx, db, owner, taskID, trueDeadline); err != nil {
 		t.Fatal(err)
 	}
 	jobID := jobIDForTask(ctx, t, db, taskID)
