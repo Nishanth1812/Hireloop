@@ -16,6 +16,7 @@ type dispatcherStore interface {
 	SetProviderEmailID(ctx context.Context, jobID string, version int, emailID string) error
 	GetDeliveryPayload(ctx context.Context, jobID string, version int) (Payload, bool, error)
 	SaveDeliveryPayload(ctx context.Context, jobID string, version int, p Payload) (Payload, error)
+	GetDeliveryPayloadWithTimestamp(ctx context.Context, jobID string, version int) (Payload, time.Time, bool, error)
 }
 
 // ResendDispatcher implements Dispatcher over the existing resend adapter
@@ -43,6 +44,12 @@ func NewResendDispatcher(store dispatcherStore, sender resendSend, from string, 
 	return &ResendDispatcher{store: store, sender: sender, from: from, resolve: resolve}
 }
 
+// maxIdempotencyAge is Resend's documented idempotency key retention window.
+// If a retry occurs after this window, the key has expired and Resend will
+// generate a new email id, breaking correlation. We treat this as uncertain
+// rather than silently losing correlation or failing.
+const maxIdempotencyAge = 24 * time.Hour
+
 func (d *ResendDispatcher) Send(ctx context.Context, n Notification) Outcome {
 	if d == nil || d.sender == nil || d.resolve == nil {
 		return OutcomePermanent
@@ -57,10 +64,11 @@ func (d *ResendDispatcher) Send(ctx context.Context, n Notification) Outcome {
 	// primary email is resolved once and the message is persisted. Every retry
 	// reuses those exact bytes, so a changed task title or a changed Clerk
 	// recipient cannot turn a same-key retry into an idempotency conflict.
-	p, ok, err := d.store.GetDeliveryPayload(ctx, job.ID, job.DeliveryVersion)
+	p, createdAt, ok, err := d.store.GetDeliveryPayloadWithTimestamp(ctx, job.ID, job.DeliveryVersion)
 	if err != nil {
 		return OutcomeFailed
 	}
+	isRetry := ok
 	if !ok {
 		to, err := d.resolve(ctx, job.UserID)
 		if err != nil {
@@ -78,6 +86,15 @@ func (d *ResendDispatcher) Send(ctx context.Context, n Notification) Outcome {
 		if err != nil {
 			return OutcomeFailed
 		}
+		// First attempt: record the time for idempotency expiry checks on retries.
+		createdAt = time.Now()
+	}
+	// If this is a retry and the first attempt was more than 24h ago, the
+	// Resend idempotency key has likely expired. Retrying with the same key
+	// would generate a new provider email id, breaking correlation. Be honest:
+	// return uncertain so the job stays retryable and a webhook can resolve it.
+	if isRetry && time.Since(createdAt) > maxIdempotencyAge {
+		return OutcomeUncertain
 	}
 	// The id is per version: a reschedule bumps the version, so the
 	// rescheduled job's dispatches use new keys while retries of this

@@ -424,18 +424,28 @@ func (s *Store) SetProviderEmailID(ctx context.Context, jobID string, version in
 // GetDeliveryPayload returns the immutable first-attempt payload for a
 // (job, version), if one was persisted.
 func (s *Store) GetDeliveryPayload(ctx context.Context, jobID string, version int) (Payload, bool, error) {
+	p, _, ok, err := s.GetDeliveryPayloadWithTimestamp(ctx, jobID, version)
+	return p, ok, err
+}
+
+// GetDeliveryPayloadWithTimestamp returns the payload and its creation
+// timestamp for a (job, version), if one was persisted. The timestamp is
+// used to detect when the first attempt was made, for idempotency key
+// expiry checks (Resend retains keys for 24h).
+func (s *Store) GetDeliveryPayloadWithTimestamp(ctx context.Context, jobID string, version int) (Payload, time.Time, bool, error) {
 	var p Payload
+	var createdAt time.Time
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT recipient, subject, text_body FROM reminder_delivery_payloads
+		`SELECT recipient, subject, text_body, created_at FROM reminder_delivery_payloads
 		 WHERE job_id = $1 AND delivery_version = $2`, jobID, version).
-		Scan(&p.Recipient, &p.Subject, &p.Text)
+		Scan(&p.Recipient, &p.Subject, &p.Text, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Payload{}, false, nil
+		return Payload{}, time.Time{}, false, nil
 	}
 	if err != nil {
-		return Payload{}, false, err
+		return Payload{}, time.Time{}, false, err
 	}
-	return p, true, nil
+	return p, createdAt, true, nil
 }
 
 // SaveDeliveryPayload persists p as the first-attempt payload of a

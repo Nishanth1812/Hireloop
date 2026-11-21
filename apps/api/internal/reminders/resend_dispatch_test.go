@@ -12,12 +12,13 @@ import (
 	"hireloop/api/internal/resend"
 )
 
-// dispatchStore implements the two store methods the Resend dispatcher uses
-// (Get and SetProviderEmailID), in memory, without a database.
+// dispatchStore implements the store methods the Resend dispatcher uses
+// in memory, without a database.
 type dispatchStore struct {
-	mu       sync.Mutex
-	jobs     map[string]Job
-	payloads map[string]Payload
+	mu           sync.Mutex
+	jobs         map[string]Job
+	payloads     map[string]Payload
+	payloadTimes map[string]time.Time
 }
 
 func payloadKey(jobID string, version int) string {
@@ -31,6 +32,18 @@ func (s *dispatchStore) GetDeliveryPayload(_ context.Context, jobID string, vers
 	return p, ok, nil
 }
 
+func (s *dispatchStore) GetDeliveryPayloadWithTimestamp(_ context.Context, jobID string, version int) (Payload, time.Time, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := payloadKey(jobID, version)
+	p, ok := s.payloads[k]
+	if !ok {
+		return Payload{}, time.Time{}, false, nil
+	}
+	t, _ := s.payloadTimes[k]
+	return p, t, true, nil
+}
+
 func (s *dispatchStore) SaveDeliveryPayload(_ context.Context, jobID string, version int, p Payload) (Payload, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -39,6 +52,7 @@ func (s *dispatchStore) SaveDeliveryPayload(_ context.Context, jobID string, ver
 		return existing, nil
 	}
 	s.payloads[k] = p
+	s.payloadTimes[k] = time.Now()
 	return p, nil
 }
 
@@ -101,7 +115,8 @@ func (s *captureSender) calls() int {
 
 func newDispatchStore(owner string) *dispatchStore {
 	return &dispatchStore{
-		payloads: map[string]Payload{},
+		payloads:     map[string]Payload{},
+		payloadTimes: map[string]time.Time{},
 		jobs: map[string]Job{
 			"job-1": {ID: "job-1", UserID: owner, TaskID: "task-1", DueAt: time.Date(2026, 11, 21, 9, 30, 0, 0, time.UTC), DeliveryVersion: 1},
 		},
@@ -278,4 +293,39 @@ func TestProviderMappingUniquePerJobVersion(t *testing.T) {
 	// The history table in the in-memory store is not checked here; the
 	// integration test TestProviderMappingUniqueness verifies the database
 	// constraint.
+}
+
+// TestResendDispatcherIdempotencyExpiry verifies that when the first attempt
+// was more than 24h ago (Resend's idempotency key retention window), a retry
+// does not reuse the expired key. Instead, the dispatcher returns OutcomeUncertain
+// to preserve honest uncertain behavior and avoid losing correlation (a retry
+// with an expired key would generate a new provider email id, breaking the
+// correlation between the job and the original send).
+func TestResendDispatcherIdempotencyExpiry(t *testing.T) {
+	store := newDispatchStore("owner-1")
+	sender := &captureSender{queue: []captureSenderEntry{{result: resend.Result{Status: resend.StatusRetryable}}}}
+	dispatcher := NewResendDispatcher(store, sender, "hireloop@example.com",
+		func(_ context.Context, _ string) (string, error) { return "student@example.com", nil })
+
+	// First attempt succeeds (retryable, simulating a transient failure)
+	n := Notification{ID: "job-1", UserID: "owner-1", TaskID: "task-1", DueAt: store.jobs["job-1"].DueAt, Title: "Interview", Version: 1}
+	if outcome := dispatcher.Send(context.Background(), n); outcome != OutcomeFailed {
+		t.Fatalf("first attempt = %q, want failed (retryable)", outcome)
+	}
+
+	// Simulate the payload being created >24h ago by backdating the timestamp
+	k := payloadKey("job-1", 1)
+	store.payloadTimes[k] = time.Now().Add(-25 * time.Hour)
+
+	// Retry with the same key should return Uncertain because the idempotency
+	// key has expired at Resend. Retrying would generate a new email id and
+	// break correlation.
+	if outcome := dispatcher.Send(context.Background(), n); outcome != OutcomeUncertain {
+		t.Fatalf("retry after idempotency expiry = %q, want uncertain", outcome)
+	}
+
+	// The sender should NOT have been called again (we don't retry with expired key)
+	if sender.calls() != 1 {
+		t.Fatalf("sender called %d times, want 1 (no retry with expired key)", sender.calls())
+	}
 }

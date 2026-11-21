@@ -58,6 +58,7 @@ DECLARE
     payload_cutoff timestamptz := now() - interval '7 days';
     event_cutoff timestamptz := now() - interval '7 days';
     payload_count int;
+    superseded_count int;
     event_count int;
 BEGIN
     -- 1. Delete delivery payloads for terminal jobs older than 7 days.
@@ -80,7 +81,8 @@ BEGIN
     WHERE dp.job_id = rj.id
       AND dp.delivery_version < rj.delivery_version;
 
-    GET DIAGNOSTICS payload_count = payload_count + ROW_COUNT;
+    GET DIAGNOSTICS superseded_count = ROW_COUNT;
+    payload_count := payload_count + superseded_count;
 
     -- 3. Delete pending email events older than 7 days that will never
     --    apply to the live job. An event is stuck pending if:

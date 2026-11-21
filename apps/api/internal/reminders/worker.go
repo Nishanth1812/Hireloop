@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"errors"
+	"log"
 	"time"
 )
 
@@ -106,10 +107,8 @@ func (w *Worker) Run(ctx context.Context) error {
 	cleanupTicker := time.NewTicker(w.cfg.CleanupInterval)
 	defer cleanupTicker.Stop()
 
-	// Run cleanup once at startup
-	if err := w.runCleanup(ctx); err != nil {
-		return err
-	}
+	// Run cleanup once at startup (errors logged, not fatal)
+	w.runCleanup(ctx)
 
 	for {
 		select {
@@ -123,20 +122,27 @@ func (w *Worker) Run(ctx context.Context) error {
 				return err
 			}
 		case <-cleanupTicker.C:
-			if err := w.runCleanup(ctx); err != nil {
-				return err
-			}
+			w.runCleanup(ctx)
 		}
 	}
 }
 
 // runCleanup executes the retention cleanup function. It runs regardless of
 // whether a dispatcher is configured, so PII retention bounds are enforced
-// even in no-send deployments.
-func (w *Worker) runCleanup(ctx context.Context) error {
+// even in no-send deployments. Errors are logged but do not stop the worker;
+// transient cleanup failures (e.g., deadlock, lock timeout) are retried on the
+// next interval.
+func (w *Worker) runCleanup(ctx context.Context) {
 	var deletedPayloads, deletedEvents int
 	err := w.store.DB.QueryRowContext(ctx, `SELECT * FROM cleanup_reminder_retention()`).Scan(&deletedPayloads, &deletedEvents)
-	return err
+	if err != nil {
+		// Redact any potential PII from the error message
+		log.Printf("retention cleanup failed (will retry next interval): %v", err)
+		return
+	}
+	if deletedPayloads > 0 || deletedEvents > 0 {
+		log.Printf("retention cleanup: deleted %d payloads, %d pending events", deletedPayloads, deletedEvents)
+	}
 }
 
 // poll claims due jobs (within Config.Scope when set) and dispatches each one.
