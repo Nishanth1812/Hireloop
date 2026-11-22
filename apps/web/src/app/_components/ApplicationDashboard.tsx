@@ -59,6 +59,8 @@ type Props = {
   onToggleFinished: () => void;
   onTaskPrevious: () => void;
   onTaskNext: () => void;
+  onRetryApplications: () => void;
+  onRetryTasks: () => void;
   onEditTask: (task: Task, application?: Application) => void;
   onSaveTask: (event: FormEvent<HTMLFormElement>, id?: string) => void;
   onCancelTaskEdit: () => void;
@@ -72,13 +74,14 @@ export function ApplicationDashboard({
   taskPage, taskPageIndex, taskHasPrevious, taskHasNext, taskLoading, taskLoadError, tasksShowAll, taskBusyId, taskDraft, error, notice,
   notificationEnabled, notificationLoading, notificationSaving, notificationError, notificationNotice, onNotificationChange,
   onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onAddTask, onApplyFilters, onClearFilters,
-  onPrevious, onNext, onToggleFinished, onTaskPrevious, onTaskNext, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask, onExport,
+  onPrevious, onNext, onToggleFinished, onTaskPrevious, onTaskNext, onRetryApplications, onRetryTasks, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask, onExport,
 }: Props) {
   // Counts come from the API for every matching row, never from the current
   // page, so the summary stays honest while paging or filtering.
   const total = result.counts.saved + result.counts.applied;
   const lastEditingId = useRef("");
   const editingId = editingApplication?.id ?? "";
+  const captureUnavailable = saving || !!editingApplication || !!taskDraft;
 
   useEffect(() => {
     if (editingId) {
@@ -111,6 +114,20 @@ export function ApplicationDashboard({
           <div><strong>{result.counts.saved}</strong><span>Saved</span></div>
           <div><strong>{result.counts.applied}</strong><span>Applied</span></div>
         </div>
+        <button
+          className="button primary add-application-cta"
+          type="button"
+          disabled={captureUnavailable}
+          aria-describedby={captureUnavailable ? "add-application-disabled" : undefined}
+          onClick={() => {
+            const company = document.getElementById("company");
+            company?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+            company?.focus();
+          }}
+        >
+          Add application
+        </button>
+        {captureUnavailable && <span id="add-application-disabled" className="visually-hidden">Close the current form before adding an application.</span>}
       </section>
 
       <NotificationControl
@@ -143,6 +160,7 @@ export function ApplicationDashboard({
         onComplete={onCompleteTask}
         onCancel={onCancelTask}
         onExport={onExport}
+        onRetry={onRetryTasks}
       />
 
       <div className="workspace">
@@ -171,6 +189,7 @@ export function ApplicationDashboard({
             onPrevious={onPrevious}
             onNext={onNext}
             onClearFilters={onClearFilters}
+            onRetry={onRetryApplications}
           />
         </div>
         <ApplicationCaptureForm saving={saving} hidden={!!editingApplication || !!taskDraft} onSubmit={onCreate} />

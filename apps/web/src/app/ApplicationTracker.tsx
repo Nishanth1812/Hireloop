@@ -628,6 +628,8 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     onToggleFinished={toggleFinished}
     onTaskPrevious={goPreviousTask}
     onTaskNext={goNextTask}
+    onRetryApplications={reload}
+    onRetryTasks={restartTasks}
     onEditTask={(task, application) => openTaskForm(applicationForTask(task, application), task)}
     onSaveTask={(event, id) => void saveTask(event, id)}
     onCancelTaskEdit={() => setTaskDraft(null)}

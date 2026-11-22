@@ -39,7 +39,7 @@ function TaskCard({ task, application, busy, onEdit, onComplete, onCancel, onExp
   );
 }
 
-export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasNext, loading, loadError, showAll, busyId, onToggleFinished, onPrevious, onNext, onEdit, onComplete, onCancel, onExport }: {
+export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasNext, loading, loadError, showAll, busyId, onToggleFinished, onPrevious, onNext, onEdit, onComplete, onCancel, onExport, onRetry }: {
   tasks: Task[];
   applications: Application[];
   total: number;
@@ -57,6 +57,7 @@ export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasN
   onComplete: (task: Task) => void;
   onCancel: (task: Task) => void;
   onExport: (task: Task) => void;
+  onRetry: () => void;
 }) {
   const open = tasks.filter((task) => task.status === "open");
   const finished = tasks.filter((task) => task.status !== "open");
@@ -87,6 +88,9 @@ export function TodayPanel({ tasks, applications, total, page, hasPrevious, hasN
                 : "Nothing open right now. Add a task from any application."
               : `Showing ${shown} on this page · ${total} total`}
       </p>
+      {!loading && loadError && (
+        <button className="button quiet" type="button" onClick={onRetry}>Try again</button>
+      )}
       {!loading && !loadError && open.length > 0 && (
         <ul className="task-list">
           {open.map((task) => (

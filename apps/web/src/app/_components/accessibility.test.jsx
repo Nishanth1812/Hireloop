@@ -81,6 +81,7 @@ function listProps(overrides = {}) {
     onPrevious: noop,
     onNext: noop,
     onClearFilters: noop,
+    onRetry: noop,
     ...overrides,
   };
 }
@@ -163,11 +164,16 @@ test("a filtered-out list offers a clear action instead of an empty pipeline", a
 });
 
 test("a load failure is announced and does not render stale rows", async () => {
-  await render(<ApplicationList {...listProps({ loadError: true, result: pageOf([]) })} />);
+  let retries = 0;
+  await render(<ApplicationList {...listProps({ loadError: true, result: pageOf([]), onRetry: () => { retries++; } })} />);
   expect(container.querySelectorAll(".application-row").length).toBe(0);
   const status = container.querySelector('[role="status"]');
   expect(status).not.toBeNull();
   expect(status.textContent).toMatch(/could not be loaded/i);
+  const retry = [...container.querySelectorAll("button")].find((button) => button.textContent.trim() === "Try again");
+  assertFocusableWithName(retry);
+  await act(async () => retry.click());
+  expect(retries).toBe(1);
 });
 
 test("the result summary reports the honest total, not the page size", async () => {
@@ -352,9 +358,19 @@ function todayProps(overrides = {}) {
     onComplete: noop,
     onCancel: noop,
     onExport: noop,
+    onRetry: noop,
     ...overrides,
   };
 }
+
+test("Today load failure offers a named retry action", async () => {
+  let retries = 0;
+  await render(<TodayPanel {...todayProps({ loadError: true, onRetry: () => { retries++; } })} />);
+  const retry = [...container.querySelectorAll("button")].find((button) => button.textContent.trim() === "Try again");
+  assertFocusableWithName(retry);
+  await act(async () => retry.click());
+  expect(retries).toBe(1);
+});
 
 test("task form labels every base control and starts with no deadline", async () => {
   await render(<TaskForm {...taskFormProps()} />);

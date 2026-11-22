@@ -12,7 +12,7 @@ function formatDate(value: string) {
   return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 }
 
-export function ApplicationList({ result, filters, page, hasPrevious, hasNext, loading, loadError, busyId, saving, editingId, onStatusChange, onEdit, onRemove, onAddTask, onPrevious, onNext, onClearFilters }: {
+export function ApplicationList({ result, filters, page, hasPrevious, hasNext, loading, loadError, busyId, saving, editingId, onStatusChange, onEdit, onRemove, onAddTask, onPrevious, onNext, onClearFilters, onRetry }: {
   result: ApplicationPage;
   filters: ApplicationFilters;
   page: number;
@@ -30,6 +30,7 @@ export function ApplicationList({ result, filters, page, hasPrevious, hasNext, l
   onPrevious: () => void;
   onNext: () => void;
   onClearFilters: () => void;
+  onRetry: () => void;
 }) {
   const applications = result.items;
   const hasFilters = filters.q !== "" || filters.status !== "" || filters.channel !== "";
@@ -67,7 +68,10 @@ export function ApplicationList({ result, filters, page, hasPrevious, hasNext, l
           )}
         </div>
       ) : loadError ? (
-        <p className="loading" role="status">Your applications could not be loaded. Try again after checking your connection.</p>
+        <div className="empty-state" role="alert">
+          <p>Your applications could not be loaded. Check your connection and try again.</p>
+          <button className="button quiet" type="button" onClick={onRetry}>Try again</button>
+        </div>
       ) : (
         <ul className="application-list">
           {applications.map((application) => (
