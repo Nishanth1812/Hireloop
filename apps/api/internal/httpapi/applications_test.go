@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strings"
 	"testing"
@@ -27,16 +28,24 @@ type testRecord struct {
 	createdAt time.Time
 }
 
+type testEventRecord struct {
+	applications.Event
+	occurredAt time.Time
+}
+
 type testStore struct {
-	records map[string][]testRecord
-	seq     int
-	base    time.Time
-	err     error
+	records  map[string][]testRecord
+	events   map[string][]testEventRecord
+	seq      int
+	eventSeq int
+	base     time.Time
+	err      error
 }
 
 func newTestStore() *testStore {
 	return &testStore{
 		records: make(map[string][]testRecord),
+		events:  make(map[string][]testEventRecord),
 		base:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 }
@@ -88,7 +97,22 @@ func (s *testStore) Create(_ context.Context, userID string, input applications.
 		Application: a,
 		createdAt:   s.base.Add(time.Duration(s.seq) * time.Minute),
 	})
+	s.appendEvent(userID, a.ID, applications.Event{
+		EventType: applications.EventCreated,
+		ToStatus:  a.Status,
+	})
 	return a, nil
+}
+
+func (s *testStore) appendEvent(userID, applicationID string, event applications.Event) {
+	s.eventSeq++
+	event.ID = fmt.Sprintf("33333333-3333-4333-8333-%012d", s.eventSeq)
+	event.ApplicationID = applicationID
+	event.OccurredAt = s.base.Add(time.Duration(s.eventSeq) * time.Second).UTC().Format(time.RFC3339Nano)
+	s.events[applicationID] = append(s.events[applicationID], testEventRecord{
+		Event:      event,
+		occurredAt: s.base.Add(time.Duration(s.eventSeq) * time.Second),
+	})
 }
 
 // List models the Postgres store's contract: newest first, filters applied
@@ -120,10 +144,21 @@ func (s *testStore) List(_ context.Context, userID string, query applications.Qu
 	}
 	result := applications.ListResult{PageSize: query.PageSize, Items: []applications.Application{}}
 	for _, record := range matched {
-		if record.Status == "saved" {
+		switch record.Status {
+		case applications.StatusSaved:
 			result.Counts.Saved++
-		} else {
+		case applications.StatusApplied:
 			result.Counts.Applied++
+		case applications.StatusInterviewing:
+			result.Counts.Interviewing++
+		case applications.StatusOffer:
+			result.Counts.Offer++
+		case applications.StatusAccepted:
+			result.Counts.Accepted++
+		case applications.StatusRejected:
+			result.Counts.Rejected++
+		case applications.StatusWithdrawn:
+			result.Counts.Withdrawn++
 		}
 	}
 	if query.Status != "" {
@@ -214,11 +249,68 @@ func (s *testStore) Patch(_ context.Context, userID, id string, input applicatio
 				app.Notes = *input.Notes
 			}
 			s.records[userID][i].Application = app
+			if input.Status != nil && *input.Status != record.Status {
+				var note string
+				if input.StageNote != nil {
+					note = *input.StageNote
+				}
+				s.appendEvent(userID, id, applications.Event{
+					EventType:  applications.EventStageChanged,
+					FromStatus: record.Status,
+					ToStatus:   *input.Status,
+					Note:       note,
+				})
+			}
 			return app, nil
 		}
 	}
 	return applications.Application{}, nil
 }
+func (s *testStore) Events(_ context.Context, userID, id string, query applications.EventQuery) (applications.EventListResult, error) {
+	if s.err != nil {
+		return applications.EventListResult{}, s.err
+	}
+	owned := false
+	for _, record := range s.records[userID] {
+		if record.ID == id {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		return applications.EventListResult{}, applications.ErrApplicationNotFound
+	}
+	events := append([]testEventRecord(nil), s.events[id]...)
+	sort.SliceStable(events, func(i, j int) bool {
+		if !events[i].occurredAt.Equal(events[j].occurredAt) {
+			return events[i].occurredAt.After(events[j].occurredAt)
+		}
+		return events[i].ID > events[j].ID
+	})
+	result := applications.EventListResult{PageSize: query.PageSize, Items: []applications.Event{}}
+	page := make([]testEventRecord, 0, len(events))
+	for _, event := range events {
+		if query.After != nil {
+			if event.occurredAt.After(query.After.OccurredAt) {
+				continue
+			}
+			if event.occurredAt.Equal(query.After.OccurredAt) && event.ID >= query.After.ID {
+				continue
+			}
+		}
+		page = append(page, event)
+	}
+	if len(page) > query.PageSize {
+		last := page[query.PageSize-1]
+		result.NextCursor = applications.EncodeEventCursor(query, last.occurredAt, last.ID)
+		page = page[:query.PageSize]
+	}
+	for _, event := range page {
+		result.Items = append(result.Items, event.Event)
+	}
+	return result, nil
+}
+
 func (s *testStore) Delete(_ context.Context, userID, id string) (bool, error) {
 	if s.err != nil {
 		return false, s.err
@@ -249,6 +341,191 @@ func clerkStore(t *testing.T, bindings map[string]string) (*testStore, http.Hand
 	verifier.SetNow(func() time.Time { return now })
 	store := newTestStore()
 	return store, NewHandler(verifier, testMapper{bindings: bindings}, store), token
+}
+
+// clerkStoreTwoOwners builds a signed handler with two distinct owners so the
+// history route's isolation can be exercised at the HTTP boundary.
+func clerkStoreTwoOwners(t *testing.T) (*testStore, http.Handler, string, string) {
+	t.Helper()
+	now := time.Now()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenA := signTestRS256WithKey(t, key, now, map[string]any{"sub": "clerk-a"}, "kid")
+	tokenB := signTestRS256WithKey(t, key, now, map[string]any{"sub": "clerk-b"}, "kid")
+	verifier := clerk.NewStaticVerifier("https://clerk.example.com", map[string]*rsa.PublicKey{"kid": &key.PublicKey})
+	verifier.SetNow(func() time.Time { return now })
+	store := newTestStore()
+	handler := NewHandler(verifier, testMapper{bindings: map[string]string{
+		"clerk-a": "owner-a", "clerk-b": "owner-b",
+	}}, store)
+	return store, handler, tokenA, tokenB
+}
+
+func TestApplicationStageAndEventHistoryHTTP(t *testing.T) {
+	_, handler, tokenA, tokenB := clerkStoreTwoOwners(t)
+	request := func(token, method, body, path string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		r.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	if w := request(tokenA, http.MethodPost, `{"company":"Acme","role":"Engineer","status":"saved"}`, "/api/applications"); w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	const id = "00000000-0000-0000-0000-000000000001"
+	const path = "/api/applications/" + id + "/events"
+
+	type eventPage struct {
+		Items      []applications.Event `json:"items"`
+		PageSize   int                  `json:"page_size"`
+		NextCursor *string              `json:"next_cursor"`
+	}
+	events := func(token, path string) eventPage {
+		t.Helper()
+		w := request(token, http.MethodGet, "", path)
+		if w.Code != http.StatusOK {
+			t.Fatalf("events %s: %d %s", path, w.Code, w.Body.String())
+		}
+		var page eventPage
+		if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil {
+			t.Fatalf("decode events: %v %s", err, w.Body.String())
+		}
+		return page
+	}
+
+	created := events(tokenA, path)
+	if len(created.Items) != 1 || created.Items[0].EventType != applications.EventCreated ||
+		created.Items[0].FromStatus != "" || created.Items[0].ToStatus != applications.StatusSaved ||
+		created.Items[0].ApplicationID != id || created.Items[0].OccurredAt == "" {
+		t.Fatalf("creation event = %+v", created.Items)
+	}
+
+	note := "Recruiter call scheduled"
+	if w := request(tokenA, http.MethodPatch, `{"status":"interviewing","stage_note":"Recruiter call scheduled"}`, "/api/applications/"+id); w.Code != http.StatusOK {
+		t.Fatalf("stage change: %d %s", w.Code, w.Body.String())
+	}
+	changed := events(tokenA, path)
+	if len(changed.Items) != 2 || changed.Items[0].EventType != applications.EventStageChanged ||
+		changed.Items[0].FromStatus != applications.StatusSaved || changed.Items[0].ToStatus != applications.StatusInterviewing ||
+		changed.Items[0].Note != note {
+		t.Fatalf("stage event = %+v", changed.Items)
+	}
+
+	// An edit that leaves the stage alone must not add a duplicate event.
+	if w := request(tokenA, http.MethodPatch, `{"status":"interviewing"}`, "/api/applications/"+id); w.Code != http.StatusOK {
+		t.Fatalf("unchanged stage patch: %d", w.Code)
+	}
+	if got := events(tokenA, path); len(got.Items) != 2 {
+		t.Fatalf("unchanged stage added an event: %+v", got.Items)
+	}
+
+	// Terminal outcomes and corrections use the same event path.
+	if w := request(tokenA, http.MethodPatch, `{"status":"offer"}`, "/api/applications/"+id); w.Code != http.StatusOK {
+		t.Fatalf("offer stage: %d", w.Code)
+	}
+	if w := request(tokenA, http.MethodPatch, `{"status":"accepted"}`, "/api/applications/"+id); w.Code != http.StatusOK {
+		t.Fatalf("accepted stage: %d", w.Code)
+	}
+	if got := events(tokenA, path); len(got.Items) != 4 || got.Items[0].ToStatus != applications.StatusAccepted {
+		t.Fatalf("history after two more stages = %+v", got.Items)
+	}
+
+	for name, body := range map[string]string{
+		"unknown stage":      `{"status":"in-review"}`,
+		"overlong note":      `{"status":"offer","stage_note":"` + strings.Repeat("x", 501) + `"}`,
+		"note without stage": `{"stage_note":"hello"}`,
+	} {
+		if w := request(tokenA, http.MethodPatch, body, "/api/applications/"+id); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s", name, w.Code, w.Body.String())
+		}
+	}
+
+	// Page through history with a bounded cursor: no repeats, newest first.
+	firstPage := events(tokenA, path+"?page_size=1")
+	if len(firstPage.Items) != 1 || firstPage.NextCursor == nil {
+		t.Fatalf("first history page = %+v", firstPage)
+	}
+	seen := map[string]bool{firstPage.Items[0].ID: true}
+	secondPage := events(tokenA, path+"?page_size=1&cursor="+*firstPage.NextCursor)
+	if len(secondPage.Items) != 1 || seen[secondPage.Items[0].ID] {
+		t.Fatalf("second history page = %+v", secondPage)
+	}
+
+	// Ownership and cursor binding are enforced at the route.
+	if w := request(tokenB, http.MethodGet, "", path); w.Code != http.StatusNotFound {
+		t.Fatalf("other owner's history = %d, want 404", w.Code)
+	}
+	if w := request(tokenA, http.MethodGet, "", "/api/applications/not-a-uuid/events"); w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid application id = %d, want 400", w.Code)
+	}
+	if w := request(tokenA, http.MethodGet, "", path+"?cursor=abc"); w.Code != http.StatusBadRequest {
+		t.Fatalf("malformed cursor = %d, want 400", w.Code)
+	}
+	if w := request(tokenA, http.MethodGet, "", path+"?cursor="+url.QueryEscape(*firstPage.NextCursor)+"&page_size=0"); w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid page size = %d, want 400", w.Code)
+	}
+
+	// A cursor minted for one application cannot be reused for another.
+	if w := request(tokenA, http.MethodPost, `{"company":"Globex","role":"Designer","status":"saved"}`, "/api/applications"); w.Code != http.StatusCreated {
+		t.Fatalf("second create: %d", w.Code)
+	}
+	otherPath := "/api/applications/00000000-0000-0000-0000-000000000002/events"
+	if w := request(tokenA, http.MethodGet, "", otherPath+"?cursor="+url.QueryEscape(*firstPage.NextCursor)); w.Code != http.StatusBadRequest {
+		t.Fatalf("cross-application cursor = %d, want 400", w.Code)
+	}
+}
+
+func TestApplicationCountsIncludeEveryStageAndStatusFilter(t *testing.T) {
+	_, handler, token := clerkStore(t, map[string]string{"clerk-a": "owner-a"})
+	request := func(method, body, path string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		r.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	for _, status := range []string{"saved", "applied", "interviewing", "offer", "accepted", "rejected", "withdrawn"} {
+		body := fmt.Sprintf(`{"company":"Acme","role":"%s","status":"%s"}`, status, status)
+		if w := request(http.MethodPost, body, "/api/applications"); w.Code != http.StatusCreated {
+			t.Fatalf("create %s: %d %s", status, w.Code, w.Body.String())
+		}
+	}
+	type page struct {
+		Total  int `json:"total"`
+		Counts struct {
+			Saved        int `json:"saved"`
+			Applied      int `json:"applied"`
+			Interviewing int `json:"interviewing"`
+			Offer        int `json:"offer"`
+			Accepted     int `json:"accepted"`
+			Rejected     int `json:"rejected"`
+			Withdrawn    int `json:"withdrawn"`
+		} `json:"counts"`
+	}
+	decode := func(path string) page {
+		t.Helper()
+		w := request(http.MethodGet, "", path)
+		if w.Code != http.StatusOK {
+			t.Fatalf("list %s: %d %s", path, w.Code, w.Body.String())
+		}
+		var p page
+		if err := json.Unmarshal(w.Body.Bytes(), &p); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	all := decode("/api/applications?page_size=50")
+	if all.Total != 7 || all.Counts.Saved != 1 || all.Counts.Applied != 1 || all.Counts.Interviewing != 1 ||
+		all.Counts.Offer != 1 || all.Counts.Accepted != 1 || all.Counts.Rejected != 1 || all.Counts.Withdrawn != 1 {
+		t.Fatalf("per-stage counts = %+v", all)
+	}
+	filtered := decode("/api/applications?status=interviewing")
+	if filtered.Total != 1 || filtered.Counts != all.Counts {
+		t.Fatalf("status filter = %+v, want total 1 and unchanged counts", filtered)
+	}
 }
 
 func TestApplicationsRequireClerkAndEnforceOwnerIsolation(t *testing.T) {

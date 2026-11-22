@@ -273,6 +273,46 @@ func TestParseQueryIsBoundedAndRejectsUnknownInput(t *testing.T) {
 	}
 }
 
+func TestParseQueryBindsApplicationIDToFilter(t *testing.T) {
+	applicationID := "123e4567-e89b-42d3-a456-426614174000"
+	values := url.Values{"application_id": {applicationID}}
+	filter, err := ParseQuery(values)
+	if err != nil || filter.ApplicationID != applicationID {
+		t.Fatalf("application filter = %+v, %v", filter, err)
+	}
+	filter.After = &Cursor{Day: "2026-11-01", At: "-infinity", ID: "123e4567-e89b-42d3-a456-426614174001"}
+	token := filter.encodeCursor(filter.After.Day, filter.After.At, time.Now(), filter.After.ID)
+	if _, err := ParseQuery(url.Values{"application_id": {applicationID}, "cursor": {token}}); err != nil {
+		t.Fatalf("matching application cursor rejected: %v", err)
+	}
+	if _, err := ParseQuery(url.Values{"application_id": {"bad"}}); err == nil {
+		t.Fatal("invalid application ID accepted")
+	}
+	if _, err := ParseQuery(url.Values{"application_id": {""}}); err == nil {
+		t.Fatal("empty application ID accepted")
+	}
+}
+
+func TestApplicationCursorIsBoundToItsFilter(t *testing.T) {
+	appID := "123e4567-e89b-42d3-a456-426614174000"
+	otherID := "123e4567-e89b-42d3-a456-426614174001"
+	created := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	filter := Filter{ApplicationID: appID, PageSize: 2}
+	token := filter.encodeCursor("infinity", "-infinity", created, appID)
+	if _, err := ParseQuery(url.Values{"application_id": {appID}, "cursor": {token}}); err != nil {
+		t.Fatalf("matching application cursor rejected: %v", err)
+	}
+	for name, values := range map[string]url.Values{
+		"other application": {"application_id": {otherID}, "cursor": {token}},
+		"no application":    {"cursor": {token}},
+		"other view":        {"application_id": {appID}, "filter": {"all"}, "cursor": {token}},
+	} {
+		if _, err := ParseQuery(values); err == nil {
+			t.Errorf("%s: expected the cursor to be rejected", name)
+		}
+	}
+}
+
 func TestCursorCarriesEveryTieBreakAndIsFilterBound(t *testing.T) {
 	filter := Filter{PageSize: 2}
 	created := time.Date(2026, 11, 1, 9, 0, 0, 123456789, time.UTC)

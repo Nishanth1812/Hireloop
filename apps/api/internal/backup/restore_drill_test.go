@@ -53,6 +53,7 @@ type drillOwner struct {
 
 type drillCounts struct {
 	applications int
+	events       int
 	tasks        int
 	jobs         int
 	settings     int
@@ -163,6 +164,11 @@ func seedOwner(t *testing.T, ctx context.Context, db *sql.DB, label string) dril
 		o.owner).Scan(&o.appID); err != nil {
 		t.Fatalf("seed application: %v", err)
 	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO public.application_events (user_id, application_id, event_type, to_status)
+		 VALUES ($1, $2, 'created', 'saved')`, o.owner, o.appID); err != nil {
+		t.Fatalf("seed application event: %v", err)
+	}
 	dueAt := time.Now().UTC().Add(48 * time.Hour)
 	if err := db.QueryRowContext(ctx, `
 		INSERT INTO public.tasks (user_id, application_id, title, status, due_precision, due_at, time_zone)
@@ -191,6 +197,7 @@ func countOwner(t *testing.T, ctx context.Context, db *sql.DB, o drillOwner) dri
 		dest  *int
 	}{
 		{`SELECT count(*) FROM public.applications WHERE user_id = $1`, o.owner, &c.applications},
+		{`SELECT count(*) FROM public.application_events WHERE user_id = $1`, o.owner, &c.events},
 		{`SELECT count(*) FROM public.tasks WHERE user_id = $1`, o.owner, &c.tasks},
 		{`SELECT count(*) FROM public.reminder_jobs WHERE user_id = $1`, o.owner, &c.jobs},
 		{`SELECT count(*) FROM public.user_notification_settings WHERE user_id = $1`, o.owner, &c.settings},
@@ -220,6 +227,7 @@ func deleteOwner(t *testing.T, ctx context.Context, db *sql.DB, o drillOwner) {
 		id    any
 	}{
 		{`DELETE FROM public.reminder_jobs WHERE user_id = $1`, o.owner},
+		{`DELETE FROM public.application_events WHERE user_id = $1`, o.owner},
 		{`DELETE FROM public.tasks WHERE user_id = $1`, o.owner},
 		{`DELETE FROM public.applications WHERE user_id = $1`, o.owner},
 		{`DELETE FROM public.user_notification_settings WHERE user_id = $1`, o.owner},
@@ -240,6 +248,7 @@ func requireZero(t *testing.T, phase string, c drillCounts) {
 	t.Helper()
 	nonZero := []string{}
 	if c.applications != 0 { nonZero = append(nonZero, "applications") }
+	if c.events != 0 { nonZero = append(nonZero, "application_events") }
 	if c.tasks != 0 { nonZero = append(nonZero, "tasks") }
 	if c.jobs != 0 { nonZero = append(nonZero, "reminder_jobs") }
 	if c.settings != 0 { nonZero = append(nonZero, "notification_settings") }
@@ -291,7 +300,7 @@ func TestRestoreDrillDeletedAccountDoesNotReturn(t *testing.T) {
 	})
 
 	wantControl := countOwner(t, ctx, source, control)
-	if wantControl.applications == 0 || wantControl.jobs == 0 {
+	if wantControl.applications == 0 || wantControl.events == 0 || wantControl.jobs == 0 {
 		t.Fatalf("control owner was not seeded: %+v", wantControl)
 	}
 

@@ -341,7 +341,7 @@ func TestReminderRetentionFixesMigrationIsAdditive(t *testing.T) {
 		"CREATE OR REPLACE FUNCTION public.cleanup_reminder_retention",
 		"RETURNS TABLE(deleted_payloads int, deleted_pending_events int)",
 		"dp.delivery_version < rj.delivery_version", // superseded version cleanup
-		"ee.job_id IS NULL",                        // uncorrelated event cleanup
+		"ee.job_id IS NULL",                         // uncorrelated event cleanup
 		"GET DIAGNOSTICS payload_count = ROW_COUNT", // no RETURNING INTO
 	} {
 		if !strings.Contains(applied, fragment) {
@@ -475,6 +475,114 @@ func TestDateApproxRemindersMigrationIsAdditive(t *testing.T) {
 	}
 	if !strings.Contains(raw, "Rollback:") {
 		t.Error("migration 015 must document how to reverse it")
+	}
+}
+
+// TestApplicationTrackingMigrationIsAdditive pins migration 016: the status
+// check is widened (existing saved/applied rows map to themselves), and a new
+// owner-scoped event ledger is created with RLS and a cascading FK. No existing
+// row is rewritten and no historical events are fabricated.
+func TestApplicationTrackingMigrationIsAdditive(t *testing.T) {
+	applied := migrationStatements(t, 16)
+	for _, fragment := range []string{
+		"ALTER TABLE public.applications ADD CONSTRAINT applications_status_check",
+		"status IN ('saved', 'applied', 'interviewing', 'offer', 'accepted', 'rejected', 'withdrawn')",
+		"CREATE TABLE public.application_events",
+		"user_id text NOT NULL",
+		"application_id uuid NOT NULL REFERENCES public.applications(id) ON DELETE CASCADE",
+		"event_type text NOT NULL",
+		"'created'", "'stage_changed'",
+		"from_status text",
+		"to_status text",
+		"note text",
+		"length(trim(note)) <= 500",
+		"occurred_at timestamptz NOT NULL DEFAULT now()",
+		"CREATE INDEX application_events_owner_app_time_idx",
+		"ENABLE ROW LEVEL SECURITY",
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 016 is missing %q", fragment)
+		}
+	}
+	raw := rawMigration(t, 16)
+	for _, forbidden := range []string{
+		"DROP TABLE",
+		"DELETE FROM",
+		"UPDATE public.",
+		"INSERT INTO public.application_events",
+	} {
+		if strings.Contains(raw, forbidden) {
+			t.Errorf("migration 016 must not contain %q", forbidden)
+		}
+	}
+	if !strings.Contains(raw, "Rollback:") {
+		t.Error("migration 016 must document how to reverse it")
+	}
+	if !strings.Contains(raw, "data loss") {
+		t.Error("migration 016 must document the rollback data-loss condition")
+	}
+}
+
+// TestApplicationTrackingConstraintsAgainstConfiguredDatabase exercises the
+// real constraints migration 016 installs: the expanded stage check, the
+// bounded event note, and the cascading owner-scoped ledger. It is opt-in and
+// uses only a synthetic owner in a disposable database.
+func TestApplicationTrackingConstraintsAgainstConfiguredDatabase(t *testing.T) {
+	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("set HIRELOOP_TEST_DATABASE_URL to exercise migration 016 against the configured database")
+	}
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal("open configured test database")
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal("connect to configured test database")
+	}
+	if err := Apply(db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	owner := "migration-016-test-" + time.Now().UTC().Format(time.RFC3339Nano)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		if _, err := db.ExecContext(cleanupCtx, `DELETE FROM public.applications WHERE user_id = $1`, owner); err != nil {
+			t.Errorf("cleanup test owner: %v", err)
+		}
+	})
+
+	var appID string
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO public.applications (user_id, company, role, status) VALUES ($1, 'Acme', 'Engineer', 'interviewing') RETURNING id`,
+		owner).Scan(&appID); err != nil {
+		t.Fatalf("expanded status was rejected: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO public.applications (user_id, company, role, status) VALUES ($1, 'Acme', 'Engineer', 'bogus')`,
+		owner); err == nil {
+		t.Fatal("unknown status was accepted")
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO public.application_events (user_id, application_id, event_type, from_status, to_status, note)
+		 VALUES ($1, $2, 'stage_changed', 'saved', 'interviewing', $3)`,
+		owner, appID, strings.Repeat("x", 501)); err == nil {
+		t.Fatal("overlong event note was accepted")
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO public.application_events (user_id, application_id, event_type, from_status, to_status)
+		 VALUES ($1, $2, 'stage_changed', 'saved', 'interviewing')`,
+		owner, appID); err != nil {
+		t.Fatalf("valid stage event was rejected: %v", err)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM public.application_events WHERE user_id = $1 AND application_id = $2`,
+		owner, appID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("events = %d, err = %v", count, err)
 	}
 }
 

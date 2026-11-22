@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -25,6 +26,7 @@ const (
 	maxOptionalTextLength = 200
 	maxURLLength          = 2048
 	maxNotesLength        = 2000
+	maxStageNoteLength    = 500
 
 	maxSearchLength = 100
 	// DefaultPageSize and MaxPageSize bound every list response: the tracker
@@ -46,6 +48,25 @@ const (
 	// unbounded token. A real cursor is a few hundred bytes at most.
 	maxCursorLength = 1024
 )
+
+const (
+	StatusSaved        = "saved"
+	StatusApplied      = "applied"
+	StatusInterviewing = "interviewing"
+	StatusOffer        = "offer"
+	StatusAccepted     = "accepted"
+	StatusRejected     = "rejected"
+	StatusWithdrawn    = "withdrawn"
+)
+
+func validStatus(value string) bool {
+	switch value {
+	case StatusSaved, StatusApplied, StatusInterviewing, StatusOffer, StatusAccepted, StatusRejected, StatusWithdrawn:
+		return true
+	default:
+		return false
+	}
+}
 
 type Input struct {
 	Company   string `json:"company"`
@@ -88,6 +109,7 @@ type PatchInput struct {
 	JobID     *string `json:"job_id"`
 	AppliedOn *string `json:"applied_on"`
 	Notes     *string `json:"notes"`
+	StageNote *string `json:"stage_note"`
 }
 
 func (i *Input) Valid() bool {
@@ -100,7 +122,7 @@ func (i *Input) Valid() bool {
 	i.JobID = strings.TrimSpace(i.JobID)
 	i.AppliedOn = strings.TrimSpace(i.AppliedOn)
 	i.Notes = strings.TrimSpace(i.Notes)
-	return validText(i.Company) && validText(i.Role) && (i.Status == "saved" || i.Status == "applied") &&
+	return validText(i.Company) && validText(i.Role) && validStatus(i.Status) &&
 		validOptionalText(i.Source) && validOptionalText(i.Address) &&
 		validURL(i.URL) && validChannel(i.Channel) && validOptionalText(i.JobID) &&
 		validDate(i.AppliedOn) && validNotes(i.Notes)
@@ -165,7 +187,13 @@ func (i *PatchInput) Valid() bool {
 			return false
 		}
 	}
-	return i.Status == nil || *i.Status == "saved" || *i.Status == "applied"
+	if i.StageNote != nil {
+		*i.StageNote = strings.TrimSpace(*i.StageNote)
+		if i.Status == nil || len(*i.StageNote) > maxStageNoteLength || strings.ContainsRune(*i.StageNote, 0) {
+			return false
+		}
+	}
+	return i.Status == nil || validStatus(*i.Status)
 }
 
 func validText(value string) bool {
@@ -245,8 +273,8 @@ type Cursor struct {
 }
 
 // ListResult carries the page plus honest totals. Counts describes the same
-// filters except status, so the saved/applied summary stays truthful when a
-// status filter is active: total = counts.Saved + counts.Applied.
+// filters except status, so the per-stage summary stays truthful when a status
+// filter is active: total counts only rows the page can return.
 type ListResult struct {
 	Items    []Application
 	PageSize int
@@ -257,9 +285,62 @@ type ListResult struct {
 	NextCursor string
 }
 
+// ErrApplicationNotFound means the application does not belong to the caller.
+// The HTTP layer turns it into a 404 without revealing whether another owner
+// holds the id.
+var ErrApplicationNotFound = errors.New("application not found")
+
+// Event is one immutable history entry. An application always has a `created`
+// event; every actual stage change adds a `stage_changed` event in the same
+// transaction as the update. Absent optional columns render as empty strings,
+// matching the application read projection.
+type Event struct {
+	ID            string `json:"id"`
+	ApplicationID string `json:"application_id"`
+	EventType     string `json:"event_type"`
+	FromStatus    string `json:"from_status"`
+	ToStatus      string `json:"to_status"`
+	Note          string `json:"note"`
+	OccurredAt    string `json:"occurred_at"`
+}
+
+const (
+	EventCreated      = "created"
+	EventStageChanged = "stage_changed"
+)
+
+// EventCursor is a decoded history keyset position: the (occurred_at, id) pair
+// of the last row on the previous page. Both parts are needed because several
+// events can share a timestamp.
+type EventCursor struct {
+	OccurredAt time.Time
+	ID         string
+}
+
+// EventQuery is a validated, bounded history query. ApplicationID is supplied
+// by the route from the verified owner's application id, never by raw input.
+type EventQuery struct {
+	ApplicationID string
+	PageSize      int
+	After         *EventCursor
+}
+
+// EventListResult carries one page of history plus the opaque continuation
+// token. History is a feed, not a counter, so no total is reported.
+type EventListResult struct {
+	Items      []Event
+	PageSize   int
+	NextCursor string
+}
+
 type Counts struct {
-	Saved   int
-	Applied int
+	Saved        int `json:"saved"`
+	Applied      int `json:"applied"`
+	Interviewing int `json:"interviewing"`
+	Offer        int `json:"offer"`
+	Accepted     int `json:"accepted"`
+	Rejected     int `json:"rejected"`
+	Withdrawn    int `json:"withdrawn"`
 }
 
 // ParseQuery validates and normalizes raw list query parameters. Unknown
@@ -308,7 +389,7 @@ func (q *Query) valid() bool {
 	if len(q.Search) > maxSearchLength || strings.ContainsRune(q.Search, 0) {
 		return false
 	}
-	if q.Status != "" && q.Status != "saved" && q.Status != "applied" {
+	if q.Status != "" && !validStatus(q.Status) {
 		return false
 	}
 	if !validChannel(q.Channel) {
@@ -403,11 +484,105 @@ func (q Query) decodeCursor(raw string) (Cursor, error) {
 	return Cursor{CreatedAt: createdAt, ID: token.ID}, nil
 }
 
+// ParseEventQuery validates the bounded history query and binds any cursor to
+// the application in the route. Unknown parameters are rejected rather than
+// ignored, the same rule the application list uses.
+func ParseEventQuery(values url.Values, applicationID string) (EventQuery, error) {
+	if !ValidID(applicationID) {
+		return EventQuery{}, fmt.Errorf("invalid application ID")
+	}
+	for key := range values {
+		switch key {
+		case QueryCursor, QueryPageSize:
+		default:
+			return EventQuery{}, fmt.Errorf("unsupported event query parameter %q", key)
+		}
+	}
+	query := EventQuery{ApplicationID: applicationID}
+	if raw := values.Get(QueryPageSize); raw != "" {
+		pageSize, err := strconv.Atoi(raw)
+		if err != nil || pageSize < 1 || pageSize > MaxPageSize {
+			return EventQuery{}, fmt.Errorf("%s must be between 1 and %d", QueryPageSize, MaxPageSize)
+		}
+		query.PageSize = pageSize
+	}
+	if query.PageSize == 0 {
+		query.PageSize = DefaultPageSize
+	}
+	if values.Has(QueryCursor) {
+		cursor, err := query.decodeEventCursor(values.Get(QueryCursor))
+		if err != nil {
+			return EventQuery{}, err
+		}
+		query.After = &cursor
+	}
+	return query, nil
+}
+
+type eventCursorToken struct {
+	Version     int    `json:"v"`
+	OccurredAt  string `json:"t"`
+	ID          string `json:"i"`
+	Application string `json:"a"`
+}
+
+const eventCursorVersion = 1
+
+func (q EventQuery) encodeEventCursor(occurredAt time.Time, id string) string {
+	payload, err := json.Marshal(eventCursorToken{
+		Version:     eventCursorVersion,
+		OccurredAt:  occurredAt.UTC().Format(time.RFC3339Nano),
+		ID:          id,
+		Application: q.ApplicationID,
+	})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+// EncodeEventCursor builds a continuation token for a history query and
+// position. Tokens are not signed; ownership is enforced by the store query.
+func EncodeEventCursor(query EventQuery, occurredAt time.Time, id string) string {
+	return query.encodeEventCursor(occurredAt, id)
+}
+
+// decodeEventCursor validates a token before it reaches SQL. A cursor minted
+// for one application is rejected for another, so a page walk cannot silently
+// switch to a different application's history.
+func (q EventQuery) decodeEventCursor(raw string) (EventCursor, error) {
+	if raw == "" {
+		return EventCursor{}, fmt.Errorf("%s must not be empty", QueryCursor)
+	}
+	if len(raw) > maxCursorLength {
+		return EventCursor{}, fmt.Errorf("%s is too long", QueryCursor)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return EventCursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	var token eventCursorToken
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&token); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return EventCursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	if token.Version != eventCursorVersion || token.Application != q.ApplicationID || !ValidID(token.ID) {
+		return EventCursor{}, fmt.Errorf("%s does not match these events", QueryCursor)
+	}
+	occurredAt, err := time.Parse(time.RFC3339Nano, token.OccurredAt)
+	if err != nil {
+		return EventCursor{}, fmt.Errorf("%s is not a valid cursor", QueryCursor)
+	}
+	return EventCursor{OccurredAt: occurredAt, ID: token.ID}, nil
+}
+
 type Store interface {
 	Create(context.Context, string, Input) (Application, error)
 	List(context.Context, string, Query) (ListResult, error)
 	Get(context.Context, string, string) (Application, error)
 	Patch(context.Context, string, string, PatchInput) (Application, error)
+	Events(context.Context, string, string, EventQuery) (EventListResult, error)
 	Delete(context.Context, string, string) (bool, error)
 }
 
@@ -419,7 +594,7 @@ type PostgresStore struct {
 }
 
 // applicationColumns is the read projection used by every returning query. New
-// columns read with COALESCE(..., '') so a row written before migration 005
+// columns read with COALESCE(..., ”) so a row written before migration 005
 // still decodes as "not recorded" instead of failing a scan.
 const applicationColumns = `id, company, role, status,
 	COALESCE(source, ''), COALESCE(address, ''), COALESCE(url, ''),
@@ -447,9 +622,24 @@ func (s PostgresStore) Create(ctx context.Context, userID string, in Input) (App
 	if in.Channel != "" {
 		channel = in.Channel
 	}
-	err := s.DB.QueryRowContext(ctx, `INSERT INTO applications (user_id, company, role, status, source, address, url, channel, job_id, applied_on, notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING `+applicationColumns,
+	// The row and its creation event must commit together: there is no state
+	// in which an application exists without its first history entry.
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return a, err
+	}
+	defer tx.Rollback()
+	err = tx.QueryRowContext(ctx, `INSERT INTO applications (user_id, company, role, status, source, address, url, channel, job_id, applied_on, notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING `+applicationColumns,
 		userID, in.Company, in.Role, in.Status, in.Source, in.Address, in.URL, channel, in.JobID, appliedOn, in.Notes).Scan(applicationScanDest(&a)...)
-	return a, err
+	if err != nil {
+		return a, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO application_events (user_id, application_id, event_type, to_status)
+		VALUES ($1, $2, $3, $4)`, userID, a.ID, EventCreated, in.Status)
+	if err != nil {
+		return a, err
+	}
+	return a, tx.Commit()
 }
 
 func (s PostgresStore) List(ctx context.Context, userID string, query Query) (ListResult, error) {
@@ -465,9 +655,8 @@ func (s PostgresStore) List(ctx context.Context, userID string, query Query) (Li
 	}
 	defer tx.Rollback()
 
-	// Counts ignore the status filter so the saved/applied summary describes the
-	// whole (otherwise filtered) set; the total and the page use the status
-	// filter so the total always describes the rows the page can return.
+	// Counts ignore the status filter so the stage summary describes the whole
+	// (otherwise filtered) set; the total and page honor the status filter.
 	baseWhere, baseArgs := filterClause(query, false, userID)
 	pageWhere, pageArgs := filterClause(query, true, userID)
 
@@ -478,13 +667,15 @@ func (s PostgresStore) List(ctx context.Context, userID string, query Query) (Li
 		totalExpr = fmt.Sprintf("count(*) FILTER (WHERE status = $%d)", len(countArgs))
 	}
 	countRow := tx.QueryRowContext(ctx, `SELECT `+totalExpr+
-		`, count(*) FILTER (WHERE status = 'saved'), count(*) FILTER (WHERE status = 'applied')`+
+		`, count(*) FILTER (WHERE status = 'saved'), count(*) FILTER (WHERE status = 'applied'),
+		count(*) FILTER (WHERE status = 'interviewing'), count(*) FILTER (WHERE status = 'offer'),
+		count(*) FILTER (WHERE status = 'accepted'), count(*) FILTER (WHERE status = 'rejected'),
+		count(*) FILTER (WHERE status = 'withdrawn')`+
 		` FROM applications WHERE `+baseWhere, countArgs...)
-	var saved, applied int
-	if err := countRow.Scan(&result.Total, &saved, &applied); err != nil {
+	if err := countRow.Scan(&result.Total, &result.Counts.Saved, &result.Counts.Applied, &result.Counts.Interviewing,
+		&result.Counts.Offer, &result.Counts.Accepted, &result.Counts.Rejected, &result.Counts.Withdrawn); err != nil {
 		return ListResult{}, err
 	}
-	result.Counts = Counts{Saved: saved, Applied: applied}
 
 	// No rows in this snapshot means there is no page to seek into.
 	if result.Total == 0 {
@@ -580,6 +771,24 @@ func (s PostgresStore) Get(ctx context.Context, userID, id string) (Application,
 
 func (s PostgresStore) Patch(ctx context.Context, userID, id string, input PatchInput) (Application, error) {
 	var a Application
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return a, err
+	}
+	defer tx.Rollback()
+
+	// Lock the row first. Concurrent stage updates then serialize: each one
+	// sees the status committed by the previous one, so the ledger records a
+	// real chain of changes rather than two events from the same former stage.
+	var previous string
+	err = tx.QueryRowContext(ctx, `SELECT status FROM applications WHERE user_id = $1 AND id = $2 FOR UPDATE`, userID, id).Scan(&previous)
+	if errors.Is(err, sql.ErrNoRows) {
+		return a, nil
+	}
+	if err != nil {
+		return a, err
+	}
+
 	sets := make([]string, 0, 10)
 	args := []any{userID, id}
 	set := func(column string, value any) {
@@ -628,12 +837,103 @@ func (s PostgresStore) Patch(ctx context.Context, userID, id string, input Patch
 			set("applied_on", *input.AppliedOn)
 		}
 	}
-	err := s.DB.QueryRowContext(ctx, `UPDATE applications SET `+strings.Join(sets, ", ")+
+	err = tx.QueryRowContext(ctx, `UPDATE applications SET `+strings.Join(sets, ", ")+
 		` WHERE user_id = $1 AND id = $2 RETURNING `+applicationColumns, args...).Scan(applicationScanDest(&a)...)
-	if err == sql.ErrNoRows {
-		err = nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return a, nil
 	}
-	return a, err
+	if err != nil {
+		return a, err
+	}
+
+	// A patch that leaves the stage unchanged is an ordinary edit, not a stage
+	// change: it must not create a duplicate history entry.
+	if input.Status != nil && *input.Status != previous {
+		var note any
+		if input.StageNote != nil && *input.StageNote != "" {
+			note = *input.StageNote
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO application_events
+			(user_id, application_id, event_type, from_status, to_status, note)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			userID, id, EventStageChanged, previous, *input.Status, note)
+		if err != nil {
+			return a, err
+		}
+	}
+	return a, tx.Commit()
+}
+
+// eventColumns is the read projection for history rows. Nullable columns read
+// with COALESCE so a missing value becomes "not recorded" instead of failing a
+// scan. occurred_at is appended by the page query as a real timestamp because
+// the keyset cursor needs it.
+const eventColumns = `id, application_id, event_type,
+	COALESCE(from_status, ''), COALESCE(to_status, ''), COALESCE(note, '')`
+
+type eventPageRow struct {
+	Event      Event
+	OccurredAt time.Time
+}
+
+// Events returns one owner-scoped page of an application's history, newest
+// first. The application is checked inside the same read-only snapshot as the
+// rows, so a cursor minted for another owner's application cannot leak data.
+func (s PostgresStore) Events(ctx context.Context, userID, applicationID string, query EventQuery) (EventListResult, error) {
+	query.ApplicationID = applicationID
+	result := EventListResult{PageSize: query.PageSize, Items: []Event{}}
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return EventListResult{}, err
+	}
+	defer tx.Rollback()
+
+	var owned int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM applications WHERE user_id = $1 AND id = $2`, userID, applicationID).Scan(&owned)
+	if errors.Is(err, sql.ErrNoRows) {
+		return EventListResult{}, ErrApplicationNotFound
+	}
+	if err != nil {
+		return EventListResult{}, err
+	}
+
+	pageSQL := `SELECT ` + eventColumns + `, occurred_at FROM application_events
+		WHERE user_id = $1 AND application_id = $2`
+	args := []any{userID, applicationID}
+	if query.After != nil {
+		args = append(args, query.After.OccurredAt, query.After.ID)
+		pageSQL += fmt.Sprintf(` AND (occurred_at, id) < ($%d::timestamptz, $%d::uuid)`, len(args)-1, len(args))
+	}
+	args = append(args, query.PageSize+1)
+	pageSQL += ` ORDER BY occurred_at DESC, id DESC LIMIT $` + strconv.Itoa(len(args))
+
+	rows, err := tx.QueryContext(ctx, pageSQL, args...)
+	if err != nil {
+		return EventListResult{}, err
+	}
+	defer rows.Close()
+	page := make([]eventPageRow, 0, query.PageSize+1)
+	for rows.Next() {
+		var row eventPageRow
+		if err := rows.Scan(&row.Event.ID, &row.Event.ApplicationID, &row.Event.EventType,
+			&row.Event.FromStatus, &row.Event.ToStatus, &row.Event.Note, &row.OccurredAt); err != nil {
+			return EventListResult{}, err
+		}
+		row.Event.OccurredAt = row.OccurredAt.UTC().Format(time.RFC3339Nano)
+		page = append(page, row)
+	}
+	if err := rows.Err(); err != nil {
+		return EventListResult{}, err
+	}
+	if len(page) > query.PageSize {
+		last := page[query.PageSize-1]
+		result.NextCursor = query.encodeEventCursor(last.OccurredAt, last.Event.ID)
+		page = page[:query.PageSize]
+	}
+	for _, row := range page {
+		result.Items = append(result.Items, row.Event)
+	}
+	return result, nil
 }
 
 func (s PostgresStore) Delete(ctx context.Context, userID, id string) (bool, error) {

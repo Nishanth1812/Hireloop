@@ -42,10 +42,15 @@ type applicationPage struct {
 }
 
 // applicationCounts describe the current filters except status, so the
-// saved/applied summary stays truthful while a status filter is applied.
+// per-stage summary stays truthful while a status filter is applied.
 type applicationCounts struct {
-	Saved   int `json:"saved"`
-	Applied int `json:"applied"`
+	Saved        int `json:"saved"`
+	Applied      int `json:"applied"`
+	Interviewing int `json:"interviewing"`
+	Offer        int `json:"offer"`
+	Accepted     int `json:"accepted"`
+	Rejected     int `json:"rejected"`
+	Withdrawn    int `json:"withdrawn"`
 }
 
 // NewHandler keeps the applications-only handler used by existing callers and
@@ -174,8 +179,13 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 			PageSize: result.PageSize,
 			Total:    result.Total,
 			Counts: applicationCounts{
-				Saved:   result.Counts.Saved,
-				Applied: result.Counts.Applied,
+				Saved:        result.Counts.Saved,
+				Applied:      result.Counts.Applied,
+				Interviewing: result.Counts.Interviewing,
+				Offer:        result.Counts.Offer,
+				Accepted:     result.Counts.Accepted,
+				Rejected:     result.Counts.Rejected,
+				Withdrawn:    result.Counts.Withdrawn,
 			},
 			NextCursor: nextCursor,
 		})
@@ -205,6 +215,53 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(app)
+	})
+	// Owner-scoped stage history. The application id comes from the route and
+	// is checked against the verified owner inside the store query, so a
+	// guessed id cannot disclose another account's history.
+	mux.HandleFunc("GET /api/applications/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		id := r.PathValue("id")
+		if !applications.ValidID(id) {
+			http.Error(w, "invalid application ID", http.StatusBadRequest)
+			return
+		}
+		if store == nil {
+			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		query, err := applications.ParseEventQuery(r.URL.Query(), id)
+		if err != nil {
+			http.Error(w, "invalid application event query", http.StatusBadRequest)
+			return
+		}
+		result, err := store.Events(r.Context(), u.ID, id, query)
+		if err != nil {
+			if errors.Is(err, applications.ErrApplicationNotFound) {
+				http.Error(w, "application not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "applications unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		items := result.Items
+		if items == nil {
+			items = []applications.Event{}
+		}
+		var nextCursor *string
+		if result.NextCursor != "" {
+			cursor := result.NextCursor
+			nextCursor = &cursor
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			Items      []applications.Event `json:"items"`
+			PageSize   int                  `json:"page_size"`
+			NextCursor *string              `json:"next_cursor"`
+		}{Items: items, PageSize: result.PageSize, NextCursor: nextCursor})
 	})
 	mux.HandleFunc("PATCH /api/applications/{id}", func(w http.ResponseWriter, r *http.Request) {
 		u, ok := authenticate(w, r)
@@ -274,6 +331,10 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 		}
 		if errors.Is(err, tasks.ErrNotFound) {
 			http.Error(w, "task not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, tasks.ErrApplicationNotFound) {
+			http.Error(w, "application not found", http.StatusNotFound)
 			return
 		}
 		http.Error(w, "tasks unavailable", http.StatusServiceUnavailable)

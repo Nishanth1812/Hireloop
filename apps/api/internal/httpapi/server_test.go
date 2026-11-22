@@ -22,10 +22,12 @@ import (
 // one owner for the sample application, so we can assert routes never use a
 // caller-supplied or cross-user identity.
 type isolationStore struct {
-	owner   string
-	create  string
-	getUser string
-	getID   string
+	owner      string
+	create     string
+	getUser    string
+	getID      string
+	eventsUser string
+	eventsApp  string
 }
 
 func (s *isolationStore) Create(ctx context.Context, userID string, in applications.Input) (applications.Application, error) {
@@ -45,6 +47,11 @@ func (s *isolationStore) Get(ctx context.Context, userID, id string) (applicatio
 }
 func (s *isolationStore) Patch(ctx context.Context, userID, id string, in applications.PatchInput) (applications.Application, error) {
 	return applications.Application{}, nil
+}
+func (s *isolationStore) Events(ctx context.Context, userID, applicationID string, query applications.EventQuery) (applications.EventListResult, error) {
+	s.eventsUser = userID
+	s.eventsApp = applicationID
+	return applications.EventListResult{Items: []applications.Event{}, PageSize: query.PageSize}, nil
 }
 func (s *isolationStore) Delete(ctx context.Context, userID, id string) (bool, error) {
 	return false, nil
@@ -185,6 +192,22 @@ func TestClerkGetUsesBoundOwner(t *testing.T) {
 	}
 	if store.getUser != owner || store.getID != "00000000-0000-0000-0000-000000000001" {
 		t.Fatalf("get user_id = %q id = %q, want %q / 00000000-0000-0000-0000-000000000001", store.getUser, store.getID, owner)
+	}
+}
+
+func TestClerkEventsUseBoundOwnerAndRouteApplication(t *testing.T) {
+	owner := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	handler, store, token := clerkHandler(t, "user_clerk_a", owner)
+	const id = "00000000-0000-0000-0000-000000000001"
+	res := requireAuth(t, handler, http.MethodGet, "/api/applications/"+id+"/events", token, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if store.eventsUser != owner || store.eventsApp != id {
+		t.Fatalf("events owner = %q application = %q, want %q / %s", store.eventsUser, store.eventsApp, owner, id)
+	}
+	if strings.Contains(store.eventsUser, "user_clerk") {
+		t.Fatalf("events owner must be the bound owner, not the Clerk subject: %q", store.eventsUser)
 	}
 }
 

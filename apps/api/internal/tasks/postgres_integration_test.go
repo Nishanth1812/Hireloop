@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -107,6 +108,104 @@ func jobForTask(ctx context.Context, t *testing.T, store PostgresStore, db *sql.
 		return reminders.Job{}, err
 	}
 	return store.Jobs.Get(ctx, owner, jobID)
+}
+
+// seedTaskWithDate inserts a date-only task with an explicit created_at so the
+// keyset page order is deterministic without depending on clock resolution.
+func seedTaskWithDate(ctx context.Context, t *testing.T, db *sql.DB, owner, applicationID, title, date string, createdAt time.Time) string {
+	t.Helper()
+	var id string
+	err := db.QueryRowContext(ctx,
+		`INSERT INTO tasks (user_id, application_id, title, due_precision, due_date, created_at)
+		 VALUES ($1, $2, $3, 'date', $4, $5) RETURNING id`,
+		owner, applicationID, title, date, createdAt).Scan(&id)
+	if err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	return id
+}
+
+// TestPostgresApplicationFilterIsOwnerScopedAndCursorBound pins the detail
+// surface's task query: it returns all of one application's tasks across pages,
+// and rejects an unknown or cross-owner application before reading any task.
+func TestPostgresApplicationFilterIsOwnerScopedAndCursorBound(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	otherOwner := randomOwner(t)
+	cleanupOwner(t, db, otherOwner)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	appA := seedApplication(ctx, t, db, owner)
+	var appB, foreignApp string
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO applications (user_id, company, role, status) VALUES ($1, 'Globex', 'Designer', 'saved') RETURNING id`,
+		owner).Scan(&appB); err != nil {
+		t.Fatalf("seed second application: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO applications (user_id, company, role, status) VALUES ($1, 'Initech', 'Analyst', 'saved') RETURNING id`,
+		otherOwner).Scan(&foreignApp); err != nil {
+		t.Fatalf("seed foreign application: %v", err)
+	}
+
+	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	seedTaskWithDate(ctx, t, db, owner, appA, "A one", "2026-12-01", base)
+	seedTaskWithDate(ctx, t, db, owner, appA, "A two", "2026-12-02", base.Add(time.Minute))
+	seedTaskWithDate(ctx, t, db, owner, appA, "A three", "2026-12-03", base.Add(2*time.Minute))
+	seedTaskWithDate(ctx, t, db, owner, appB, "B one", "2026-12-04", base.Add(3*time.Minute))
+	seedTaskWithDate(ctx, t, db, otherOwner, foreignApp, "Foreign", "2026-12-05", base.Add(4*time.Minute))
+
+	filter := Filter{ApplicationID: appA, PageSize: 2}
+	filter.Normalize()
+	first, err := store.List(ctx, owner, filter)
+	if err != nil || first.Total != 3 || len(first.Items) != 2 || first.NextCursor == "" {
+		t.Fatalf("first application page = %+v, err = %v", first, err)
+	}
+	for _, task := range first.Items {
+		if task.ApplicationID != appA {
+			t.Fatalf("task %q from another application leaked", task.ID)
+		}
+	}
+	next, err := ParseQuery(url.Values{
+		"application_id": {appA}, "page_size": {"2"}, "cursor": {first.NextCursor},
+	})
+	if err != nil {
+		t.Fatalf("decode next cursor: %v", err)
+	}
+	second, err := store.List(ctx, owner, next)
+	if err != nil || second.Total != 3 || len(second.Items) != 1 || second.NextCursor != "" {
+		t.Fatalf("second application page = %+v, err = %v", second, err)
+	}
+	seen := map[string]bool{}
+	for _, task := range append(append([]Task{}, first.Items...), second.Items...) {
+		if seen[task.ID] {
+			t.Fatalf("task %s repeated across pages", task.ID)
+		}
+		seen[task.ID] = true
+	}
+
+	other := Filter{ApplicationID: appB, PageSize: 25}
+	other.Normalize()
+	if got, err := store.List(ctx, owner, other); err != nil || got.Total != 1 || got.Items[0].Title != "B one" {
+		t.Fatalf("second application = %+v, err = %v", got, err)
+	}
+
+	// The cursor is bound to the application that minted it.
+	if _, err := ParseQuery(url.Values{"application_id": {appB}, "cursor": {first.NextCursor}}); err == nil {
+		t.Fatal("cursor from another application accepted")
+	}
+
+	// Unknown and cross-owner applications produce the same not-found error.
+	for name, applicationID := range map[string]string{
+		"unknown":     "55555555-5555-4555-8555-555555555555",
+		"cross owner": foreignApp,
+	} {
+		f := Filter{ApplicationID: applicationID, PageSize: 25}
+		f.Normalize()
+		if _, err := store.List(ctx, owner, f); !errors.Is(err, ErrApplicationNotFound) {
+			t.Errorf("%s application: err = %v, want ErrApplicationNotFound", name, err)
+		}
+	}
 }
 
 func TestPostgresLegacyAmbiguousInstantCanBeUpdated(t *testing.T) {

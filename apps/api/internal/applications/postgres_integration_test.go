@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -715,6 +718,290 @@ func mustCursor(t *testing.T, result ListResult) *Cursor {
 		t.Fatalf("decode next cursor: %v", err)
 	}
 	return &cursor
+}
+
+// TestPostgresCreateAndStageChangesWriteEvents proves the ledger contract: a
+// creation event at insert, one event per real stage change with its optional
+// note, and no event for an edit that leaves the stage alone.
+func TestPostgresCreateAndStageChangesWriteEvents(t *testing.T) {
+	store, _, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	created, err := store.Create(ctx, owner, Input{Company: "Acme", Role: "Engineer", Status: StatusSaved})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	events, err := store.Events(ctx, owner, created.ID, EventQuery{PageSize: 25})
+	if err != nil || len(events.Items) != 1 {
+		t.Fatalf("creation events = %+v, err = %v", events.Items, err)
+	}
+	first := events.Items[0]
+	if first.EventType != EventCreated || first.FromStatus != "" || first.ToStatus != StatusSaved || first.Note != "" || first.OccurredAt == "" {
+		t.Fatalf("creation event = %+v", first)
+	}
+
+	note := "Recruiter call scheduled"
+	interviewing, offer := StatusInterviewing, StatusOffer
+	if _, err := store.Patch(ctx, owner, created.ID, PatchInput{Status: &interviewing, StageNote: &note}); err != nil {
+		t.Fatalf("stage change: %v", err)
+	}
+	if _, err := store.Patch(ctx, owner, created.ID, PatchInput{Status: &interviewing}); err != nil {
+		t.Fatalf("unchanged stage: %v", err)
+	}
+	if _, err := store.Patch(ctx, owner, created.ID, PatchInput{Status: &offer}); err != nil {
+		t.Fatalf("second stage change: %v", err)
+	}
+	events, err = store.Events(ctx, owner, created.ID, EventQuery{PageSize: 25})
+	if err != nil || len(events.Items) != 3 {
+		t.Fatalf("events after changes = %+v, err = %v", events.Items, err)
+	}
+	// Newest first: offer, interviewing, created.
+	want := []struct {
+		eventType string
+		from      string
+		to        string
+		note      string
+	}{
+		{EventStageChanged, StatusInterviewing, StatusOffer, ""},
+		{EventStageChanged, StatusSaved, StatusInterviewing, note},
+		{EventCreated, "", StatusSaved, ""},
+	}
+	for i, expected := range want {
+		got := events.Items[i]
+		if got.EventType != expected.eventType || got.FromStatus != expected.from || got.ToStatus != expected.to || got.Note != expected.note {
+			t.Fatalf("event %d = %+v, want %+v", i, got, expected)
+		}
+	}
+}
+
+// TestPostgresStageAndEventRollBackTogether injects a failure on the event
+// insert and proves the status update is rolled back with it. A failed stage
+// change must never leave a changed stage without its history entry.
+func TestPostgresStageAndEventRollBackTogether(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	created, err := store.Create(ctx, owner, Input{Company: "Acme", Role: "Engineer", Status: StatusSaved})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	const functionName = "hireloop_test_reject_event"
+	const triggerName = "hireloop_test_reject_event"
+	if _, err := db.ExecContext(ctx, `CREATE OR REPLACE FUNCTION public.`+functionName+`()
+		RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'event write blocked'; END; $$ LANGUAGE plpgsql`); err != nil {
+		t.Fatalf("create failure function: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER `+triggerName+` BEFORE INSERT ON public.application_events
+		FOR EACH ROW EXECUTE FUNCTION public.`+functionName+`()`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = db.ExecContext(cleanupCtx, `DROP TRIGGER IF EXISTS `+triggerName+` ON public.application_events`)
+		_, _ = db.ExecContext(cleanupCtx, `DROP FUNCTION IF EXISTS public.`+functionName+`()`)
+	})
+
+	interviewing := StatusInterviewing
+	if _, err := store.Patch(ctx, owner, created.ID, PatchInput{Status: &interviewing}); err == nil {
+		t.Fatal("stage change succeeded despite a failing event insert")
+	}
+	got, err := store.Get(ctx, owner, created.ID)
+	if err != nil || got.Status != StatusSaved {
+		t.Fatalf("status after failed event insert = %q, err = %v", got.Status, err)
+	}
+	events, err := store.Events(ctx, owner, created.ID, EventQuery{PageSize: 25})
+	if err != nil || len(events.Items) != 1 {
+		t.Fatalf("events after failed insert = %+v, err = %v", events.Items, err)
+	}
+}
+
+// TestPostgresConcurrentStageUpdatesAreSerialized proves FOR UPDATE keeps the
+// row and its ledger consistent: two racing changes both commit and produce a
+// real chain of events rather than two entries from the same former stage.
+func TestPostgresConcurrentStageUpdatesAreSerialized(t *testing.T) {
+	store, _, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	created, err := store.Create(ctx, owner, Input{Company: "Acme", Role: "Engineer", Status: StatusSaved})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, target := range []string{StatusInterviewing, StatusOffer} {
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			_, err := store.Patch(ctx, owner, created.ID, PatchInput{Status: &target})
+			errs <- err
+		}(target)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent stage change: %v", err)
+		}
+	}
+	events, err := store.Events(ctx, owner, created.ID, EventQuery{PageSize: 25})
+	if err != nil || len(events.Items) != 3 {
+		t.Fatalf("events after concurrent changes = %+v, err = %v", events.Items, err)
+	}
+	latest, err := store.Get(ctx, owner, created.ID)
+	if err != nil || (latest.Status != StatusInterviewing && latest.Status != StatusOffer) {
+		t.Fatalf("final stage = %q, err = %v", latest.Status, err)
+	}
+	// The newest event must lead from the stage that was committed before it,
+	// never from the original saved stage twice.
+	if events.Items[0].FromStatus != events.Items[1].ToStatus {
+		t.Fatalf("event chain is inconsistent: %+v", events.Items)
+	}
+}
+
+// TestPostgresEventsAreOwnerScopedAndBoundToApplication pins the history read:
+// wrong owners get no data, cursors cannot cross applications, and a walk with
+// a bounded page returns every event exactly once, newest first.
+func TestPostgresEventsAreOwnerScopedAndBoundToApplication(t *testing.T) {
+	store, _, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	first, err := store.Create(ctx, owner, Input{Company: "Acme", Role: "Engineer", Status: StatusSaved})
+	if err != nil {
+		t.Fatalf("create first: %v", err)
+	}
+	second, err := store.Create(ctx, owner, Input{Company: "Globex", Role: "Designer", Status: StatusApplied})
+	if err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+	for _, status := range []string{StatusInterviewing, StatusOffer, StatusAccepted} {
+		stage := status
+		if _, err := store.Patch(ctx, owner, first.ID, PatchInput{Status: &stage}); err != nil {
+			t.Fatalf("stage change: %v", err)
+		}
+	}
+
+	otherOwner := randomOwner(t)
+	if _, err := store.Events(ctx, otherOwner, first.ID, EventQuery{PageSize: 25}); !errors.Is(err, ErrApplicationNotFound) {
+		t.Fatalf("other owner events: err = %v, want ErrApplicationNotFound", err)
+	}
+	if _, err := store.Events(ctx, owner, "00000000-0000-0000-0000-0000000000ff", EventQuery{PageSize: 25}); !errors.Is(err, ErrApplicationNotFound) {
+		t.Fatalf("unknown application events: err = %v, want ErrApplicationNotFound", err)
+	}
+
+	seen := map[string]bool{}
+	var after *EventCursor
+	for page := 1; ; page++ {
+		if page > 10 {
+			t.Fatal("history walk did not terminate")
+		}
+		result, err := store.Events(ctx, owner, first.ID, EventQuery{PageSize: 2, After: after})
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		for _, event := range result.Items {
+			if seen[event.ID] {
+				t.Fatalf("event %s repeated", event.ID)
+			}
+			seen[event.ID] = true
+		}
+		if result.NextCursor == "" {
+			break
+		}
+		parsed, err := ParseEventQuery(url.Values{"page_size": {"2"}, "cursor": {result.NextCursor}}, first.ID)
+		if err != nil {
+			t.Fatalf("decode next cursor: %v", err)
+		}
+		after = parsed.After
+	}
+	if len(seen) != 4 {
+		t.Fatalf("saw %d events, want 4", len(seen))
+	}
+
+	// A cursor minted for one application is rejected for another.
+	page, err := store.Events(ctx, owner, first.ID, EventQuery{PageSize: 1})
+	if err != nil || page.NextCursor == "" {
+		t.Fatalf("first history page = %+v, err = %v", page, err)
+	}
+	if _, err := ParseEventQuery(url.Values{"cursor": {page.NextCursor}}, second.ID); err == nil {
+		t.Fatal("cursor from another application accepted")
+	}
+}
+
+// TestPostgresLegacyRowsHaveNoInventedEvents proves migration 016 did not
+// fabricate history for applications that predate the event ledger.
+func TestPostgresLegacyRowsHaveNoInventedEvents(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	id := insertSeedRow(ctx, t, db, owner, "Acme", "Legacy", "applied", time.Now())
+	events, err := store.Events(ctx, owner, id, EventQuery{PageSize: 25})
+	if err != nil || len(events.Items) != 0 {
+		t.Fatalf("legacy events = %+v, err = %v", events.Items, err)
+	}
+}
+
+// TestPostgresPerStageCounts pins the widened stage summary: total counts every
+// row, counts ignore the status filter, and every new stage has its own member.
+func TestPostgresPerStageCounts(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	for i, status := range []string{StatusSaved, StatusApplied, StatusInterviewing, StatusOffer, StatusAccepted, StatusRejected, StatusWithdrawn} {
+		insertSeedRow(ctx, t, db, owner, "Acme", fmt.Sprintf("Role %d", i), status, base.Add(time.Duration(i)*time.Minute))
+	}
+	all, err := store.List(ctx, owner, Query{PageSize: 50})
+	if err != nil || all.Total != 7 {
+		t.Fatalf("unfiltered list = %+v, err = %v", all, err)
+	}
+	if all.Counts.Saved != 1 || all.Counts.Applied != 1 || all.Counts.Interviewing != 1 ||
+		all.Counts.Offer != 1 || all.Counts.Accepted != 1 || all.Counts.Rejected != 1 || all.Counts.Withdrawn != 1 {
+		t.Fatalf("per-stage counts = %+v", all.Counts)
+	}
+	filtered, err := store.List(ctx, owner, Query{Status: StatusInterviewing, PageSize: 50})
+	if err != nil || filtered.Total != 1 || len(filtered.Items) != 1 || filtered.Counts != all.Counts {
+		t.Fatalf("filtered list = %+v, err = %v", filtered, err)
+	}
+}
+
+// TestPostgresDeleteRemovesEventHistory proves the FK cascade removes an
+// application's ledger along with its tasks when the application is deleted.
+func TestPostgresDeleteRemovesEventHistory(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	created, err := store.Create(ctx, owner, Input{Company: "Acme", Role: "Engineer", Status: StatusSaved})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	interviewing := StatusInterviewing
+	if _, err := store.Patch(ctx, owner, created.ID, PatchInput{Status: &interviewing}); err != nil {
+		t.Fatalf("stage change: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO tasks (user_id, application_id, title, due_precision)
+		VALUES ($1, $2, 'Follow up', 'none')`, owner, created.ID); err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	deleted, err := store.Delete(ctx, owner, created.ID)
+	if err != nil || !deleted {
+		t.Fatalf("delete = %v, err = %v", deleted, err)
+	}
+	var events int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM application_events WHERE application_id = $1`, created.ID).Scan(&events); err != nil || events != 0 {
+		t.Fatalf("events after delete = %d, err = %v", events, err)
+	}
+	var tasksCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM tasks WHERE application_id = $1`, created.ID).Scan(&tasksCount); err != nil || tasksCount != 0 {
+		t.Fatalf("tasks after delete = %d, err = %v", tasksCount, err)
+	}
 }
 
 // TestPostgresDeleteSuppressesQueuedReminderJobs proves deletion suppresses

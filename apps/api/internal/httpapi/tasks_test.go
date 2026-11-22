@@ -24,6 +24,7 @@ import (
 // exercise routing, validation, status transitions and isolation.
 type fakeTaskStore struct {
 	records   map[string][]tasks.Task
+	appOwners map[string]string
 	seq       int
 	lastInput tasks.Input
 	lastPatch tasks.PatchInput
@@ -31,7 +32,18 @@ type fakeTaskStore struct {
 }
 
 func newFakeTaskStore() *fakeTaskStore {
-	return &fakeTaskStore{records: make(map[string][]tasks.Task)}
+	return &fakeTaskStore{
+		records:   make(map[string][]tasks.Task),
+		appOwners: make(map[string]string),
+	}
+}
+
+// seedApplication marks an application id as belonging to an owner, mirroring
+// the ownership check the real task store performs before a filtered list.
+func (s *fakeTaskStore) seedApplication(owner, applicationID string) {
+	if _, exists := s.appOwners[applicationID]; !exists {
+		s.appOwners[applicationID] = owner
+	}
 }
 
 func (s *fakeTaskStore) nextID() string {
@@ -44,6 +56,7 @@ func (s *fakeTaskStore) Create(_ context.Context, owner string, input tasks.Inpu
 		return tasks.Task{}, s.err
 	}
 	s.lastInput = input
+	s.seedApplication(owner, input.ApplicationID)
 	task := tasks.Task{
 		ID:            s.nextID(),
 		ApplicationID: input.ApplicationID,
@@ -81,8 +94,17 @@ func (s *fakeTaskStore) List(_ context.Context, owner string, filter tasks.Filte
 		return tasks.ListResult{}, s.err
 	}
 	filter.Normalize()
+	if filter.ApplicationID != "" {
+		taskOwner, exists := s.appOwners[filter.ApplicationID]
+		if !exists || taskOwner != owner {
+			return tasks.ListResult{}, tasks.ErrApplicationNotFound
+		}
+	}
 	matching := []tasks.Task{}
 	for _, task := range s.records[owner] {
+		if filter.ApplicationID != "" && task.ApplicationID != filter.ApplicationID {
+			continue
+		}
 		if filter.ShowAll || task.Status == tasks.StatusOpen {
 			matching = append(matching, task)
 		}
@@ -535,6 +557,85 @@ func TestTaskListIsBoundedAndContinuesWithOwnerIsolation(t *testing.T) {
 	}
 	if w := h.request(h.token, http.MethodGet, "", "/api/tasks?filter=all&cursor="+url.QueryEscape(cursor)); w.Code != http.StatusBadRequest {
 		t.Fatalf("cursor from another view: %d", w.Code)
+	}
+}
+
+func TestTaskListFiltersByApplicationWithOwnerValidation(t *testing.T) {
+	h := newTaskHarness(t)
+	const appA = "33333333-3333-4333-8333-333333333331"
+	const appB = "33333333-3333-4333-8333-333333333332"
+	const appBOwner = "33333333-3333-4333-8333-333333333333"
+	h.store.seedApplication("owner-a", appA)
+	h.store.seedApplication("owner-a", appB)
+	h.store.seedApplication("owner-b", appBOwner)
+
+	create := func(token, applicationID, title string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"application_id":%q,"title":%q,"due_precision":"date","due_date":"2026-12-01"}`, applicationID, title)
+		if w := h.request(token, http.MethodPost, body, "/api/tasks"); w.Code != http.StatusCreated {
+			t.Fatalf("create %s: %d %s", title, w.Code, w.Body.String())
+		}
+	}
+	for i := 0; i < 3; i++ {
+		create(h.token, appA, fmt.Sprintf("A task %d", i))
+	}
+	for i := 0; i < 2; i++ {
+		create(h.token, appB, fmt.Sprintf("B task %d", i))
+	}
+	create(h.tokenB, appBOwner, "Other owner task")
+
+	type envelope struct {
+		Items      []tasks.Task `json:"items"`
+		Total      int          `json:"total"`
+		NextCursor *string      `json:"next_cursor"`
+	}
+	read := func(token, path string) envelope {
+		t.Helper()
+		w := h.request(token, http.MethodGet, "", path)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: %d %s", path, w.Code, w.Body.String())
+		}
+		var result envelope
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	first := read(h.token, "/api/tasks?application_id="+appA+"&page_size=2")
+	if first.Total != 3 || len(first.Items) != 2 || first.NextCursor == nil {
+		t.Fatalf("first application page = %+v", first)
+	}
+	for _, task := range first.Items {
+		if task.ApplicationID != appA {
+			t.Fatalf("unexpected application id %q on page", task.ApplicationID)
+		}
+	}
+	second := read(h.token, "/api/tasks?application_id="+appA+"&page_size=2&cursor="+url.QueryEscape(*first.NextCursor))
+	if second.Total != 3 || len(second.Items) != 1 || second.NextCursor != nil {
+		t.Fatalf("second application page = %+v", second)
+	}
+	if second.Items[0].ID == first.Items[0].ID || second.Items[0].ID == first.Items[1].ID {
+		t.Fatal("application page repeated a row")
+	}
+	if got := read(h.token, "/api/tasks?application_id="+appB); got.Total != 2 || len(got.Items) != 2 {
+		t.Fatalf("second application = %+v", got)
+	}
+
+	// A cursor minted for one application is rejected for another.
+	if w := h.request(h.token, http.MethodGet, "", "/api/tasks?application_id="+appB+"&cursor="+url.QueryEscape(*first.NextCursor)); w.Code != http.StatusBadRequest {
+		t.Fatalf("cross-application cursor = %d, want 400", w.Code)
+	}
+	// Unknown and cross-owner application ids are indistinguishable: both 404.
+	for name, path := range map[string]string{
+		"unknown":     "/api/tasks?application_id=44444444-4444-4444-8444-444444444444",
+		"cross owner": "/api/tasks?application_id=" + appBOwner,
+	} {
+		if w := h.request(h.token, http.MethodGet, "", path); w.Code != http.StatusNotFound {
+			t.Errorf("%s application: %d %s, want 404", name, w.Code, w.Body.String())
+		}
+	}
+	if w := h.request(h.token, http.MethodGet, "", "/api/tasks?application_id=not-a-uuid"); w.Code != http.StatusBadRequest {
+		t.Fatalf("malformed application id = %d, want 400", w.Code)
 	}
 }
 

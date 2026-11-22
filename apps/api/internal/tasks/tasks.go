@@ -31,6 +31,11 @@ var ErrNotFound = errors.New("task not found")
 // ErrInvalid indicates a task whose merged fields fail validation.
 var ErrInvalid = errors.New("invalid task")
 
+// ErrApplicationNotFound means the requested application filter does not name
+// an application owned by the caller. The HTTP layer turns it into a 404
+// without revealing whether another owner holds the id.
+var ErrApplicationNotFound = errors.New("application not found")
+
 const (
 	maxTitleLength    = 200
 	maxTimeZoneLength = 64
@@ -42,10 +47,11 @@ const (
 	DefaultPageSize = 25
 	MaxPageSize     = 50
 
-	QueryFilter     = "filter"
-	QueryCursor     = "cursor"
-	QueryPageSize   = "page_size"
-	maxCursorLength = 1024
+	QueryFilter      = "filter"
+	QueryApplication = "application_id"
+	QueryCursor      = "cursor"
+	QueryPageSize    = "page_size"
+	maxCursorLength  = 1024
 
 	FilterOpen = "open"
 	FilterAll  = "all"
@@ -125,7 +131,10 @@ type Task struct {
 type Filter struct {
 	ShowAll  bool
 	PageSize int
-	After    *Cursor
+	// ApplicationID narrows the list to one application. The store verifies
+	// that the application belongs to the caller before returning any rows.
+	ApplicationID string
+	After         *Cursor
 }
 
 // Cursor is a decoded keyset position: the complete sort key of the last row
@@ -316,12 +325,19 @@ func validStatus(value string) bool {
 func ParseQuery(values url.Values) (Filter, error) {
 	for key := range values {
 		switch key {
-		case QueryFilter, QueryCursor, QueryPageSize:
+		case QueryFilter, QueryApplication, QueryCursor, QueryPageSize:
 		default:
 			return Filter{}, fmt.Errorf("unsupported task query parameter %q", key)
 		}
 	}
 	filter := Filter{}
+	if values.Has(QueryApplication) {
+		applicationID := values.Get(QueryApplication)
+		if !applications.ValidID(applicationID) {
+			return Filter{}, fmt.Errorf("invalid %s", QueryApplication)
+		}
+		filter.ApplicationID = applicationID
+	}
 	if values.Has(QueryFilter) {
 		if values.Get(QueryFilter) == "" {
 			return Filter{}, fmt.Errorf("%s must not be empty", QueryFilter)
@@ -388,7 +404,7 @@ func (f Filter) cursorFilterHash() string {
 	if f.ShowAll {
 		view = FilterAll
 	}
-	sum := sha256.Sum256([]byte("filter=" + view))
+	sum := sha256.Sum256([]byte("filter=" + view + "\x00application_id=" + f.ApplicationID))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
@@ -739,10 +755,26 @@ func (s PostgresStore) List(ctx context.Context, userID string, filter Filter) (
 	defer tx.Rollback()
 
 	where := `user_id = $1`
+	args := []any{userID}
 	if !filter.ShowAll {
 		where += ` AND status = '` + StatusOpen + `'`
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM tasks WHERE `+where, userID).Scan(&result.Total); err != nil {
+	if filter.ApplicationID != "" {
+		// The filter is an application id from the URL, not a trusted value:
+		// verify the caller owns it before returning any of its tasks. An
+		// unknown or cross-owner id is indistinguishable from a missing task.
+		var owned int
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM applications WHERE id = $1 AND user_id = $2`, filter.ApplicationID, userID).Scan(&owned)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ListResult{}, ErrApplicationNotFound
+		}
+		if err != nil {
+			return ListResult{}, err
+		}
+		args = append(args, filter.ApplicationID)
+		where += fmt.Sprintf(` AND application_id = $%d`, len(args))
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM tasks WHERE `+where, args...).Scan(&result.Total); err != nil {
 		return ListResult{}, err
 	}
 	if result.Total == 0 {
@@ -753,10 +785,10 @@ func (s PostgresStore) List(ctx context.Context, userID string, filter Filter) (
 	// day and due_at are compared ASC with their sentinels, then created_at and
 	// id DESC; one look-ahead row decides whether another page exists.
 	pageSQL := `SELECT ` + taskPageColumns + ` FROM tasks WHERE ` + where
-	args := []any{userID}
+	pageArgs := append([]any{}, args...)
 	if filter.After != nil {
-		n := len(args) + 1
-		args = append(args, filter.After.Day, filter.After.At, filter.After.CreatedAt, filter.After.ID)
+		n := len(pageArgs) + 1
+		pageArgs = append(pageArgs, filter.After.Day, filter.After.At, filter.After.CreatedAt, filter.After.ID)
 		key := `COALESCE(due_date, (due_at AT TIME ZONE 'UTC')::date, 'infinity'::date)`
 		at := `COALESCE(due_at, '-infinity'::timestamptz)`
 		pageSQL += fmt.Sprintf(` AND ((%s, %s) > ($%d::date, $%d::timestamptz)
@@ -765,11 +797,11 @@ func (s PostgresStore) List(ctx context.Context, userID string, filter Filter) (
 					OR (created_at = $%d::timestamptz AND id < $%d::uuid))))`,
 			key, at, n, n+1, key, at, n, n+1, n+2, n+2, n+3)
 	}
-	args = append(args, filter.PageSize+1)
+	pageArgs = append(pageArgs, filter.PageSize+1)
 	pageSQL += ` ORDER BY COALESCE(due_date, (due_at AT TIME ZONE 'UTC')::date) ASC NULLS LAST,
-		due_at ASC NULLS FIRST, created_at DESC, id DESC LIMIT $` + strconv.Itoa(len(args))
+		due_at ASC NULLS FIRST, created_at DESC, id DESC LIMIT $` + strconv.Itoa(len(pageArgs))
 
-	rows, err := tx.QueryContext(ctx, pageSQL, args...)
+	rows, err := tx.QueryContext(ctx, pageSQL, pageArgs...)
 	if err != nil {
 		return ListResult{}, err
 	}

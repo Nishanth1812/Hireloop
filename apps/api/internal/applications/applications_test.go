@@ -88,6 +88,93 @@ func TestManualFieldValidation(t *testing.T) {
 	}
 }
 
+func TestApplicationStagesAndStageNoteValidation(t *testing.T) {
+	for _, status := range []string{"saved", "applied", "interviewing", "offer", "accepted", "rejected", "withdrawn"} {
+		in := Input{Company: "Acme", Role: "Engineer", Status: status}
+		if !in.Valid() {
+			t.Errorf("stage %q was rejected", status)
+		}
+		stageNote := "Recruiter call scheduled"
+		patch := PatchInput{Status: &status, StageNote: &stageNote}
+		if !patch.Valid() {
+			t.Errorf("stage note rejected for %q", status)
+		}
+	}
+	invalid := Input{Company: "Acme", Role: "Engineer", Status: "in-review"}
+	if invalid.Valid() {
+		t.Fatal("unknown stage accepted")
+	}
+	note := strings.Repeat("x", 501)
+	status := "interviewing"
+	overlong := PatchInput{Status: &status, StageNote: &note}
+	if overlong.Valid() {
+		t.Fatal("overlong stage note accepted")
+	}
+	withoutStatus := PatchInput{StageNote: &note}
+	if withoutStatus.Valid() {
+		t.Fatal("stage note without status accepted")
+	}
+	blankNote := "   "
+	withBlankNote := PatchInput{Status: &status, StageNote: &blankNote}
+	if !withBlankNote.Valid() || *withBlankNote.StageNote != "" {
+		t.Fatal("blank stage note must be accepted and trimmed")
+	}
+}
+
+func TestListQueryAcceptsEveryStage(t *testing.T) {
+	for _, status := range []string{"saved", "applied", "interviewing", "offer", "accepted", "rejected", "withdrawn"} {
+		query, err := ParseQuery(url.Values{"status": {status}})
+		if err != nil || query.Status != status {
+			t.Errorf("status %q: query = %+v, err = %v", status, query, err)
+		}
+	}
+	if _, err := ParseQuery(url.Values{"status": {"in-review"}}); err == nil {
+		t.Fatal("unknown status filter accepted")
+	}
+}
+
+func TestEventQueryIsBoundedAndCursorIsApplicationBound(t *testing.T) {
+	appID := "123e4567-e89b-42d3-a456-426614174000"
+	otherID := "123e4567-e89b-42d3-a456-426614174001"
+	query, err := ParseEventQuery(url.Values{}, appID)
+	if err != nil || query.PageSize != DefaultPageSize || query.After != nil {
+		t.Fatalf("event query defaults = %+v, %v", query, err)
+	}
+	query, err = ParseEventQuery(url.Values{"page_size": {"2"}}, appID)
+	if err != nil || query.PageSize != 2 {
+		t.Fatalf("event query page = %+v, %v", query, err)
+	}
+	for name, values := range map[string]url.Values{
+		"unknown parameter": {"status": {"saved"}},
+		"empty cursor":      {"cursor": {""}},
+		"bad page size":     {"page_size": {"0"}},
+		"oversized page":    {"page_size": {strconv.Itoa(MaxPageSize + 1)}},
+		"malformed cursor":  {"cursor": {"abc"}},
+	} {
+		if _, err := ParseEventQuery(values, appID); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+	if _, err := ParseEventQuery(url.Values{}, "not-a-uuid"); err == nil {
+		t.Fatal("invalid application id accepted")
+	}
+
+	occurred := time.Date(2026, 11, 2, 10, 30, 0, 123456000, time.UTC)
+	eventID := "00000000-0000-0000-0000-000000000009"
+	token := EncodeEventCursor(EventQuery{ApplicationID: appID, PageSize: 2}, occurred, eventID)
+	parsed, err := ParseEventQuery(url.Values{"page_size": {"2"}, "cursor": {token}}, appID)
+	if err != nil {
+		t.Fatalf("matching event cursor rejected: %v", err)
+	}
+	if parsed.After == nil || !parsed.After.OccurredAt.Equal(occurred) || parsed.After.ID != eventID {
+		t.Fatalf("decoded event cursor = %+v", parsed.After)
+	}
+	// A cursor minted for one application must not be reused for another.
+	if _, err := ParseEventQuery(url.Values{"cursor": {token}}, otherID); err == nil {
+		t.Fatal("cursor from another application accepted")
+	}
+}
+
 func TestPatchTrimsManualFieldsAndClearsOptionalOnes(t *testing.T) {
 	url, channel, jobID, appliedOn, notes := "  https://example.com/42  ", " campus ", " REQ-42 ", " 2026-11-02 ", "  notice  "
 	input := PatchInput{URL: &url, Channel: &channel, JobID: &jobID, AppliedOn: &appliedOn, Notes: &notes}
