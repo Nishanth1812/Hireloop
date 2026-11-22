@@ -14,6 +14,7 @@ import (
 
 	"hireloop/api/db/migrations"
 	"hireloop/api/internal/accounts"
+	"hireloop/api/internal/reminders"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -42,13 +43,13 @@ import (
 // from the two opt-in environment variables; no .env file is read.
 
 type drillOwner struct {
-	subject   string
-	authID    string
-	appID     string
-	taskID    string
-	jobID     string
-	emailID   string
-	owners    []string
+	subject        string
+	authID         string
+	appID          string
+	taskID         string
+	jobID          string
+	emailID        string
+	owners         []string
 	syntheticEmail string
 }
 
@@ -56,7 +57,7 @@ type drillOwner struct {
 // delivery tables and the webhook event ledger that earlier drills omitted.
 type drillCounts struct {
 	applications, events, tasks, jobs, settings, identities, authUsers int
-	providerEmails, payloads, webhookEvents                           int
+	providerEmails, payloads, webhookEvents                            int
 }
 
 func drillURLs(t *testing.T) (string, string) {
@@ -203,22 +204,22 @@ func countOwner(t *testing.T, ctx context.Context, db *sql.DB, o drillOwner) dri
 	var c drillCounts
 	queries := []struct {
 		query string
-		id    any
+		args  []any
 		dest  *int
 	}{
-		{`SELECT count(*) FROM public.applications WHERE user_id = ANY($1::text[])`, o.owners, &c.applications},
-		{`SELECT count(*) FROM public.application_events WHERE user_id = ANY($1::text[])`, o.owners, &c.events},
-		{`SELECT count(*) FROM public.tasks WHERE user_id = ANY($1::text[])`, o.owners, &c.tasks},
-		{`SELECT count(*) FROM public.reminder_jobs WHERE user_id = ANY($1::text[])`, o.owners, &c.jobs},
-		{`SELECT count(*) FROM public.user_notification_settings WHERE user_id = ANY($1::text[])`, o.owners, &c.settings},
-		{`SELECT count(*) FROM public.user_identities WHERE clerk_subject = $1`, o.subject, &c.identities},
-		{`SELECT count(*) FROM auth.users WHERE id = $1`, o.authID, &c.authUsers},
-		{`SELECT count(*) FROM public.reminder_provider_emails WHERE user_id = ANY($1::text[])`, o.owners, &c.providerEmails},
-		{`SELECT count(*) FROM public.reminder_delivery_payloads WHERE job_id IN (SELECT id FROM public.reminder_jobs WHERE user_id = ANY($1::text[]))`, o.owners, &c.payloads},
-		{`SELECT count(*) FROM public.reminder_email_events WHERE job_id IN (SELECT id FROM public.reminder_jobs WHERE user_id = ANY($1::text[])) OR provider_email_id IN (SELECT provider_email_id FROM public.reminder_provider_emails WHERE user_id = ANY($1::text[]))`, o.owners, &c.webhookEvents},
+		{`SELECT count(*) FROM public.applications WHERE user_id = ANY($1::text[])`, []any{o.owners}, &c.applications},
+		{`SELECT count(*) FROM public.application_events WHERE user_id = ANY($1::text[])`, []any{o.owners}, &c.events},
+		{`SELECT count(*) FROM public.tasks WHERE user_id = ANY($1::text[])`, []any{o.owners}, &c.tasks},
+		{`SELECT count(*) FROM public.reminder_jobs WHERE user_id = ANY($1::text[])`, []any{o.owners}, &c.jobs},
+		{`SELECT count(*) FROM public.user_notification_settings WHERE user_id = ANY($1::text[])`, []any{o.owners}, &c.settings},
+		{`SELECT count(*) FROM public.user_identities WHERE clerk_subject = $1`, []any{o.subject}, &c.identities},
+		{`SELECT count(*) FROM auth.users WHERE id = $1`, []any{o.authID}, &c.authUsers},
+		{`SELECT count(*) FROM public.reminder_provider_emails WHERE user_id = ANY($1::text[])`, []any{o.owners}, &c.providerEmails},
+		{`SELECT count(*) FROM public.reminder_delivery_payloads WHERE job_id = $1`, []any{o.jobID}, &c.payloads},
+		{`SELECT count(*) FROM public.reminder_email_events WHERE job_id = $1 OR provider_email_id = $2`, []any{o.jobID, o.emailID}, &c.webhookEvents},
 	}
 	for _, q := range queries {
-		if err := db.QueryRowContext(ctx, q.query, q.id).Scan(q.dest); err != nil {
+		if err := db.QueryRowContext(ctx, q.query, q.args...).Scan(q.dest); err != nil {
 			t.Fatalf("count owner rows: %v", err)
 		}
 	}
@@ -376,9 +377,22 @@ func TestRestoreDrillDeletedAccountDoesNotReturn(t *testing.T) {
 		`SELECT count(*) FROM public.account_deletions WHERE clerk_subject = $1`, deleted.subject).Scan(&tombstones); err != nil || tombstones != 1 {
 		t.Fatalf("tombstone was not retained after reconcile: %d, %v", tombstones, err)
 	}
+	var providerFingerprints int
+	if err := target.QueryRowContext(ctx, `SELECT count(*) FROM public.account_deletion_provider_hashes WHERE clerk_subject = $1`, deleted.subject).Scan(&providerFingerprints); err != nil || providerFingerprints == 0 {
+		t.Fatalf("deleted provider-id fingerprints were not retained after restore: %d, %v", providerFingerprints, err)
+	}
+	lateEventID := "evt_post_restore_late_" + deleted.emailID
+	if applied, err := (&reminders.Store{DB: target}).RecordWebhookEvent(ctx, lateEventID, deleted.emailID, "email.delivered",
+		reminders.Transition{State: reminders.StateDelivered, Note: "delayed callback after restore"}); err != nil || applied {
+		t.Fatalf("late callback after restore = %v, %v; want discarded", applied, err)
+	}
+	var lateEvents int
+	if err := target.QueryRowContext(ctx, `SELECT count(*) FROM public.reminder_email_events WHERE provider_event_id = $1`, lateEventID).Scan(&lateEvents); err != nil || lateEvents != 0 {
+		t.Fatalf("late callback after restore created %d webhook events, err = %v", lateEvents, err)
+	}
 	if _, err := targetStore.Reconcile(ctx); err != nil {
 		t.Fatalf("second reconcile: %v", err)
 	}
 	requireZero(t, "after second reconcile", countOwner(t, ctx, target, deleted))
-	t.Log("GATE MET: live journal imported and reconciled; deleted owner absent from all ten tables, control owner intact, tombstone retained")
+	t.Log("GATE MET: live journal imported and reconciled; deleted owner absent from all ten data tables, control owner intact, deletion tombstone and provider-id fingerprints retained")
 }

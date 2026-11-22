@@ -46,12 +46,56 @@ jobs:
           cat > "$RUNNER_TEMP/pg_dump" <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
-          docker exec "$POSTGRES_CONTAINER" pg_dump "$@"
+          output=''
+          args=()
+          while (($#)); do
+            case "$1" in
+              -f|--file)
+                output=$2
+                shift 2
+                ;;
+              --file=*)
+                output=${1#*=}
+                shift
+                ;;
+              *)
+                args+=("$1")
+                shift
+                ;;
+            esac
+          done
+          if [[ -n "$output" ]]; then
+            docker exec "$POSTGRES_CONTAINER" pg_dump "${args[@]}" > "$output"
+          else
+            docker exec "$POSTGRES_CONTAINER" pg_dump "${args[@]}"
+          fi
           EOF
           cat > "$RUNNER_TEMP/pg_restore" <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
-          docker exec "$POSTGRES_CONTAINER" pg_restore "$@"
+          archive=''
+          args=()
+          while (($#)); do
+            case "$1" in
+              -d|--dbname)
+                args+=("$1" "$2")
+                shift 2
+                ;;
+              *)
+                if [[ -z "$archive" && -f "$1" ]]; then
+                  archive=$1
+                else
+                  args+=("$1")
+                fi
+                shift
+                ;;
+            esac
+          done
+          if [[ -n "$archive" ]]; then
+            docker exec -i "$POSTGRES_CONTAINER" pg_restore "${args[@]}" < "$archive"
+          else
+            docker exec -i "$POSTGRES_CONTAINER" pg_restore "${args[@]}"
+          fi
           EOF
           chmod +x "$RUNNER_TEMP/pg_dump" "$RUNNER_TEMP/pg_restore"
       - name: Test API and restore safety
