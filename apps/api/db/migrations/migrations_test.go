@@ -586,6 +586,142 @@ func TestApplicationTrackingConstraintsAgainstConfiguredDatabase(t *testing.T) {
 	}
 }
 
+// TestAccountDeletionsMigrationIsAdditive pins migration 017: the durable
+// deletion journal is service-only (RLS, no end-user policy), stores only
+// opaque owner identifiers and a pending/completed state, is unique per Clerk
+// subject with an index on the bound Supabase id, and installs a write guard
+// that serializes owner writes against a deletion. Its down migration refuses
+// to discard a non-empty history instead of silently reopening resurrection.
+func TestAccountDeletionsMigrationIsAdditive(t *testing.T) {
+	applied := migrationStatements(t, 17)
+	for _, fragment := range []string{
+		"CREATE TABLE public.account_deletions",
+		"clerk_subject text PRIMARY KEY",
+		"supabase_user_id text",
+		"state text NOT NULL DEFAULT 'pending'",
+		"CHECK (state IN ('pending', 'completed'))",
+		"created_at timestamptz NOT NULL DEFAULT now()",
+		"updated_at timestamptz NOT NULL DEFAULT now()",
+		"completed_at timestamptz",
+		"CREATE UNIQUE INDEX account_deletions_supabase_idx",
+		"ENABLE ROW LEVEL SECURITY",
+		"CREATE OR REPLACE FUNCTION public.account_deletion_guard()",
+		"pg_advisory_xact_lock",
+	} {
+		if !strings.Contains(applied, fragment) {
+			t.Errorf("migration 017 is missing %q", fragment)
+		}
+	}
+	// The journal holds opaque identifiers only: no email, no account content.
+	for _, forbidden := range []string{"email_address", "recipient", "payload", "notes"} {
+		if strings.Contains(strings.ToLower(applied), forbidden) {
+			t.Errorf("migration 017 must not store %q in the deletion journal", forbidden)
+		}
+	}
+	// The guard must cover every owner-scoped table so no write path can
+	// recreate a deleted owner's rows.
+	for _, table := range []string{
+		"applications", "application_events", "tasks", "reminder_jobs",
+		"user_notification_settings", "reminder_provider_emails",
+	} {
+		if !strings.Contains(applied, "ON public."+table) {
+			t.Errorf("migration 017 does not guard writes to %s", table)
+		}
+	}
+	raw := rawMigration(t, 17)
+	if !strings.Contains(raw, "Rollback:") {
+		t.Error("migration 017 must document how to reverse it")
+	}
+
+	source, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	reader, _, err := source.ReadDown(17)
+	if err != nil {
+		t.Fatalf("migration 017 must have a down migration: %v", err)
+	}
+	defer reader.Close()
+	down, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downBody := string(down)
+	for _, fragment := range []string{
+		"RAISE EXCEPTION",
+		"deletion history is not empty",
+		"DROP TABLE IF EXISTS public.account_deletions",
+	} {
+		if !strings.Contains(downBody, fragment) {
+			t.Errorf("migration 017 down is missing %q", fragment)
+		}
+	}
+}
+
+// TestAccountDeletionsRollbackRefusesHistoryAgainstDisposableDatabase proves
+// the real down migration aborts while any tombstone remains. Opt-in and only
+// for a freshly created disposable database.
+func TestAccountDeletionsRollbackRefusesHistoryAgainstDisposableDatabase(t *testing.T) {
+	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("set HIRELOOP_TEST_DATABASE_URL to a disposable database to exercise migration 017 rollback")
+	}
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal("open disposable test database")
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal("connect to disposable test database")
+	}
+	if err := Apply(db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	source, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	reader, _, err := source.ReadDown(17)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	downBytes, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	owner := "migration-017-rollback-" + time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO public.account_deletions (clerk_subject, state) VALUES ($1, 'pending')`, owner); err != nil {
+		t.Fatalf("seed synthetic tombstone: %v", err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, string(downBytes)); err == nil {
+		_ = tx.Rollback()
+		t.Fatal("down migration must refuse to discard a non-empty deletion history")
+	}
+	// The failed statement aborted the transaction; nothing was dropped.
+	_ = tx.Rollback()
+	var state string
+	if err := db.QueryRowContext(ctx,
+		`SELECT state FROM public.account_deletions WHERE clerk_subject = $1`, owner).Scan(&state); err != nil || state != "pending" {
+		t.Fatalf("tombstone was modified by a refused rollback: state = %q, err = %v", state, err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM public.account_deletions WHERE clerk_subject = $1`, owner); err != nil {
+		t.Fatalf("cleanup synthetic tombstone: %v", err)
+	}
+}
+
 func TestApplyIsIdempotentAgainstConfiguredDatabase(t *testing.T) {
 	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
 	if databaseURL == "" {

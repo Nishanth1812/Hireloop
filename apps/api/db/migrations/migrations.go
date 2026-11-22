@@ -13,7 +13,11 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
-//go:embed *.up.sql
+// Up migrations are applied by Apply. Down migrations are embedded so the
+// rollback can be exercised by tooling and by the opt-in migration tests; the
+// deletion journal's down migration refuses to discard non-empty history.
+//
+//go:embed *.up.sql *.down.sql
 var files embed.FS
 
 func NewSource() (source.Driver, error) { return iofs.New(files, ".") }
