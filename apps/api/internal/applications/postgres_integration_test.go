@@ -818,6 +818,43 @@ func TestPostgresStageAndEventRollBackTogether(t *testing.T) {
 	}
 }
 
+// TestPostgresApplicationCreateRollsBackWithoutCreationEvent ensures a failed
+// creation event cannot leave an application that has no initial history.
+func TestPostgresApplicationCreateRollsBackWithoutCreationEvent(t *testing.T) {
+	store, db, owner := openIntegrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const functionName = "hireloop_test_reject_create_event"
+	const triggerName = "hireloop_test_reject_create_event"
+	if _, err := db.ExecContext(ctx, "CREATE OR REPLACE FUNCTION public."+functionName+"()\n\t\tRETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'event write blocked'; END; $$ LANGUAGE plpgsql"); err != nil {
+		t.Fatalf("create failure function: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE TRIGGER "+triggerName+" BEFORE INSERT ON public.application_events\n\t\tFOR EACH ROW EXECUTE FUNCTION public."+functionName+"()"); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = db.ExecContext(cleanupCtx, "DROP TRIGGER IF EXISTS "+triggerName+" ON public.application_events")
+		_, _ = db.ExecContext(cleanupCtx, "DROP FUNCTION IF EXISTS public."+functionName+"()")
+	})
+
+	if _, err := store.Create(ctx, owner, Input{Company: "Acme", Role: "Engineer", Status: StatusSaved}); err == nil {
+		t.Fatal("create succeeded despite a failing creation-event insert")
+	}
+	var applications, events int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM applications WHERE user_id = $1`, owner).Scan(&applications); err != nil {
+		t.Fatalf("count applications after failed create: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM application_events WHERE user_id = $1`, owner).Scan(&events); err != nil {
+		t.Fatalf("count events after failed create: %v", err)
+	}
+	if applications != 0 || events != 0 {
+		t.Fatalf("after failed create: applications=%d events=%d, want both zero", applications, events)
+	}
+}
+
 // TestPostgresConcurrentStageUpdatesAreSerialized proves FOR UPDATE keeps the
 // row and its ledger consistent: two racing changes both commit and produce a
 // real chain of events rather than two entries from the same former stage.
