@@ -23,6 +23,7 @@ import (
 	"syscall"
 
 	"hireloop/api/db/migrations"
+	"hireloop/api/internal/accounts"
 	"hireloop/api/internal/clerk"
 	"hireloop/api/internal/reminders"
 	"hireloop/api/internal/resend"
@@ -46,7 +47,28 @@ func main() {
 
 	store := &reminders.Store{DB: db}
 	dispatcher := newResendDispatcher(store)
-	worker := reminders.NewWorker(store, reminders.Config{Dispatcher: dispatcher})
+
+	// Pending account deletions are retried on every poll, independently of
+	// email sending. Without CLERK_SECRET_KEY the capability is unavailable:
+	// fail closed by reporting the outage on every tick instead of silently
+	// dropping the retry. The tombstone keeps Hireloop access blocked.
+	accountStore := &accounts.Store{DB: db}
+	deletionRetry := func(context.Context) (int, error) {
+		return 0, errors.New("CLERK_SECRET_KEY is required to finish pending account deletions")
+	}
+	if clerkClient, err := clerk.NewBackendClient(os.Getenv("CLERK_SECRET_KEY")); err == nil {
+		client := clerkClient
+		deletionRetry = func(ctx context.Context) (int, error) {
+			return accounts.RetryPending(ctx, accountStore, client)
+		}
+	} else {
+		log.Printf("Clerk deletion capability unavailable: %v", err)
+	}
+
+	worker := reminders.NewWorker(store, reminders.Config{
+		Dispatcher:    dispatcher,
+		DeletionRetry: deletionRetry,
+	})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if dispatcher == nil {

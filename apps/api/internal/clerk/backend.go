@@ -140,6 +140,61 @@ func (c *BackendClient) VerifiedPrimaryEmail(ctx context.Context, subject string
 	return "", ErrNoVerifiedEmail
 }
 
+// BanUser revokes all of the subject's sessions and blocks that exact Clerk
+// identity from signing in again. A 404 means the user is already gone and is
+// treated as success, so a retry after a completed deletion is harmless.
+// No key, header or user payload is ever logged.
+func (c *BackendClient) BanUser(ctx context.Context, subject string) error {
+	return c.doUserAction(ctx, subject, http.MethodPost, "/ban")
+}
+
+// DeleteUser deletes the exact authenticated Clerk subject through the
+// Backend API. A 404 means the user was already deleted, which is idempotent.
+func (c *BackendClient) DeleteUser(ctx context.Context, subject string) error {
+	return c.doUserAction(ctx, subject, http.MethodDelete, "")
+}
+
+// BanAndDelete performs both provider steps for account deletion. The verified
+// JWT subject is the only target id; neither method accepts an email or any
+// other person-level identifier.
+func (c *BackendClient) BanAndDelete(ctx context.Context, subject string) error {
+	if err := c.BanUser(ctx, subject); err != nil {
+		return err
+	}
+	return c.DeleteUser(ctx, subject)
+}
+
+func (c *BackendClient) doUserAction(ctx context.Context, subject, method, suffix string) error {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return errors.New("clerk: subject required")
+	}
+	if len(subject) > maxBackendSubjectBytes || hasControl(subject) {
+		return errors.New("clerk: subject is invalid")
+	}
+	req, err := http.NewRequestWithContext(ctx, method,
+		c.baseURL+"/v1/users/"+url.PathEscape(subject)+suffix, nil)
+	if err != nil {
+		return fmt.Errorf("clerk: backend request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", backendUserAgent)
+
+	res, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("clerk: backend request failed: %w", err)
+	}
+	defer res.Body.Close()
+	// Drain only to allow connection reuse. The body is never parsed or logged:
+	// it can contain user data, and only the HTTP outcome matters here.
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 8<<10))
+	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusOK || res.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	return fmt.Errorf("clerk: backend request failed (HTTP %d)", res.StatusCode)
+}
+
 func hasControl(s string) bool {
 	for _, r := range s {
 		if r < 0x20 || r == 0x7f {

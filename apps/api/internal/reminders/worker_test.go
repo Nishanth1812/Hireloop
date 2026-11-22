@@ -1,6 +1,8 @@
 package reminders
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -44,6 +46,30 @@ func TestApplyOutcomeMapsDeliveryStates(t *testing.T) {
 	// Unknown outcomes behave like failures: honest, and retryable.
 	if tr := w.applyOutcome(Job{}, Outcome("mystery")); tr.State != StateFailed {
 		t.Fatalf("unknown outcome = %+v", tr)
+	}
+}
+
+func TestWorkerRetriesPendingDeletionsWithoutDispatcher(t *testing.T) {
+	// Pending account deletions must be retried by the worker even when email
+	// sending is disabled (no Dispatcher), because keeping Hireloop access
+	// blocked depends on Clerk deletion completing.
+	calls := 0
+	w := NewWorker(nil, Config{
+		DeletionRetry: func(context.Context) (int, error) {
+			calls++
+			if calls == 1 {
+				return 0, errors.New("clerk unavailable")
+			}
+			return 1, nil
+		},
+	})
+	w.RetryDeletionsOnce(context.Background())
+	if calls != 1 {
+		t.Fatalf("retry calls = %d", calls)
+	}
+	w.RetryDeletionsOnce(context.Background())
+	if calls != 2 {
+		t.Fatalf("retry calls after recovery = %d", calls)
 	}
 }
 
