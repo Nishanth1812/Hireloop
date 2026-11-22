@@ -1,5 +1,22 @@
-export type ApplicationStatus = "saved" | "applied";
+export type ApplicationStatus = "saved" | "applied" | "interviewing" | "offer" | "accepted" | "rejected" | "withdrawn";
 export type ApplicationChannel = "campus" | "off-campus";
+
+// The workflow's stage order, shared by the capture, edit and list selects.
+// rejected/withdrawn are terminal outcomes available from any stage.
+export const STAGE_CHOICES: ApplicationStatus[] = [
+  "saved", "applied", "interviewing", "offer", "accepted", "rejected", "withdrawn",
+];
+
+export function stageLabel(status: ApplicationStatus): string {
+  switch (status) {
+    case "interviewing": return "Interviewing";
+    case "offer": return "Offer";
+    case "accepted": return "Accepted";
+    case "rejected": return "Rejected";
+    case "withdrawn": return "Withdrawn";
+    default: return status.charAt(0).toUpperCase() + status.slice(1);
+  }
+}
 
 export type Application = {
   id: string;
@@ -20,13 +37,26 @@ export type Application = {
 };
 
 export type ApplicationInput = Pick<Application, "company" | "role" | "status"> &
-  Partial<Pick<Application, "source" | "address" | "url" | "channel" | "job_id" | "applied_on" | "notes">>;
+  Partial<Pick<Application, "source" | "address" | "url" | "channel" | "job_id" | "applied_on" | "notes">> &
+  // stage_note is optional and only meaningful with a status change: the API
+  // rejects a note without one.
+  { stage_note?: string };
 export type ApplicationPatch = Partial<ApplicationInput>;
 
 export type ApplicationFilters = {
   q: string;
   status: "" | ApplicationStatus;
   channel: "" | ApplicationChannel;
+};
+
+export type ApplicationCounts = {
+  saved: number;
+  applied: number;
+  interviewing: number;
+  offer: number;
+  accepted: number;
+  rejected: number;
+  withdrawn: number;
 };
 
 // ApplicationPage is the API's bounded keyset page. Field names mirror the
@@ -37,7 +67,7 @@ export type ApplicationPage = {
   items: Application[];
   page_size: number;
   total: number;
-  counts: { saved: number; applied: number };
+  counts: ApplicationCounts;
   next_cursor: string | null;
 };
 
@@ -106,6 +136,43 @@ export function deleteApplication(token: string, id: string): Promise<void> {
   return request(`/api/applications/${encodeURIComponent(id)}`, token, { method: "DELETE" });
 }
 
+// getApplication fetches one owner-scoped application by id for its detail
+// page.
+export function getApplication(token: string, id: string): Promise<Application> {
+  return request(`/api/applications/${encodeURIComponent(id)}`, token);
+}
+
+// ApplicationEvent is one row of the application's owner-scoped stage
+// history. The field names mirror the wire format; a "created" event starts
+// the record and a "stage_changed" event follows each successful stage
+// change. A stage change may carry a short note and from/to statuses; edits
+// to other fields never create events.
+export type ApplicationEvent = {
+  id: string;
+  application_id: string;
+  event_type: "created" | "stage_changed";
+  from_status: ApplicationStatus | null;
+  to_status: ApplicationStatus | null;
+  note: string;
+  occurred_at: string;
+};
+
+// ApplicationEventPage mirrors the tasks page envelope: the API returns
+// newest-first (occurred_at DESC, id DESC) with an opaque next_cursor, or
+// null on the last page.
+export type ApplicationEventPage = {
+  items: ApplicationEvent[];
+  page_size: number;
+  next_cursor: string | null;
+};
+
+export function listEvents(token: string, id: string, cursor: string | null = null): Promise<ApplicationEventPage> {
+  const params = new URLSearchParams();
+  if (cursor) params.set("cursor", cursor);
+  const query = params.toString();
+  return request(`/api/applications/${encodeURIComponent(id)}/events${query ? `?${query}` : ""}`, token);
+}
+
 export type TaskStatus = "open" | "done" | "cancelled";
 export type TaskPrecision = "none" | "date" | "instant";
 
@@ -159,6 +226,18 @@ export function listTasks(token: string, showAll = false, cursor: string | null 
   if (showAll) params.set("filter", "all");
   const query = params.toString();
   return request(`/api/tasks${query ? `?${query}` : ""}`, token);
+}
+
+// listTasksByApplication fetches every task linked to the application: the
+// API verifies the application belongs to the caller before returning rows,
+// and "all" includes done and cancelled actions, which a detail surface
+// should show.
+export function listTasksByApplication(token: string, applicationID: string, cursor: string | null = null): Promise<TaskPage> {
+  const params = new URLSearchParams();
+  params.set("application_id", applicationID);
+  params.set("filter", "all");
+  if (cursor) params.set("cursor", cursor);
+  return request(`/api/tasks?${params.toString()}`, token);
 }
 
 export function createTask(token: string, input: TaskInput): Promise<Task> {

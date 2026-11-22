@@ -1,6 +1,7 @@
 "use client";
 
-import type { Application, ApplicationFilters, ApplicationPage } from "@/lib/api";
+import Link from "next/link";
+import { STAGE_CHOICES, stageLabel, type Application, type ApplicationFilters, type ApplicationPage } from "@/lib/api";
 
 function formatDate(value: string) {
   // applied_on is date-only. Render it in UTC so no timezone can shift the day
@@ -77,7 +78,11 @@ export function ApplicationList({ result, filters, page, hasPrevious, hasNext, l
           {applications.map((application) => (
             <li className="application-row" key={application.id}>
               <div className="company-initial" aria-hidden="true">{application.company.slice(0, 1).toUpperCase()}</div>
-              <div className="application-copy">
+              <Link
+                className="application-copy"
+                href={`/applications/${application.id}`}
+                aria-label={`Open ${application.role} at ${application.company}`}
+              >
                 <strong>{application.role}</strong>
                 <span>{application.company}</span>
                 {application.channel && <span className="application-meta">{application.channel === "campus" ? "Campus drive" : "Off-campus"}</span>}
@@ -85,13 +90,13 @@ export function ApplicationList({ result, filters, page, hasPrevious, hasNext, l
                 {application.applied_on && <span className="application-meta">Applied: {formatDate(application.applied_on)}</span>}
                 {application.source && <span className="application-meta">via {application.source}</span>}
                 {application.address && <span className="application-meta">{application.address}</span>}
-                {application.url && (
-                  <span className="application-meta">
-                    <a className="application-link" href={application.url} target="_blank" rel="noreferrer noopener" aria-label={`Job posting for ${application.role} at ${application.company}`}>Job posting</a>
-                  </span>
-                )}
                 {application.notes && <span className="application-meta application-notes">{application.notes}</span>}
-              </div>
+              </Link>
+              {application.url && (
+                <span className="application-meta">
+                  <a className="application-link" href={application.url} target="_blank" rel="noreferrer noopener" aria-label={`Job posting for ${application.role} at ${application.company}`}>Job posting</a>
+                </span>
+              )}
               <label className="visually-hidden" htmlFor={`status-${application.id}`}>Status for {application.role} at {application.company}</label>
               <select
                 id={`status-${application.id}`}
@@ -100,8 +105,7 @@ export function ApplicationList({ result, filters, page, hasPrevious, hasNext, l
                 disabled={saving || busyId === application.id || editingId === application.id}
                 onChange={(event) => onStatusChange(application, event.target.value as Application["status"])}
               >
-                <option value="saved">Saved</option>
-                <option value="applied">Applied</option>
+                {STAGE_CHOICES.map((status) => <option key={status} value={status}>{stageLabel(status)}</option>)}
               </select>
               <button
                 className="button task-button"

@@ -30,7 +30,7 @@ const firstPage: ApplicationPage = {
   items: [],
   page_size: 25,
   total: 0,
-  counts: { saved: 0, applied: 0 },
+  counts: { saved: 0, applied: 0, interviewing: 0, offer: 0, accepted: 0, rejected: 0, withdrawn: 0 },
   next_cursor: null,
 };
 

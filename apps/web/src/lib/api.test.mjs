@@ -400,3 +400,105 @@ test("notification settings failures return a useful message", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("stage choices expose the seven workflow stages", () => {
+  assert.ok(api, "application API client is missing");
+  assert.deepEqual(api.STAGE_CHOICES, ["saved", "applied", "interviewing", "offer", "accepted", "rejected", "withdrawn"]);
+  assert.equal(api.stageLabel("saved"), "Saved");
+  assert.equal(api.stageLabel("interviewing"), "Interviewing");
+  assert.equal(api.stageLabel("offer"), "Offer");
+  assert.equal(api.stageLabel("accepted"), "Accepted");
+  assert.equal(api.stageLabel("rejected"), "Rejected");
+  assert.equal(api.stageLabel("withdrawn"), "Withdrawn");
+});
+
+test("getApplication fetches the owner-scoped record by encoded id", async () => {
+  assert.ok(api, "application API client is missing");
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ id: "app/1", company: "Acme", role: "Engineer", status: "interviewing" });
+  };
+  try {
+    const result = await api.getApplication("access-token", "app/1");
+    assert.equal(request.url, "/api/applications/app%2F1");
+    assert.equal(request.options.headers.Authorization, "Bearer access-token");
+    assert.equal(result.status, "interviewing");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("listEvents returns the paginated stage-history envelope", async () => {
+  assert.ok(api, "application API client is missing");
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({
+      items: [{
+        id: "ev-1", application_id: "app/1", event_type: "created", from_status: null,
+        to_status: "saved", note: "", occurred_at: "2026-11-18T09:00:00Z",
+      }],
+      page_size: 25,
+      next_cursor: "history-cursor",
+    });
+  };
+  try {
+    const result = await api.listEvents("access-token", "app/1");
+    assert.equal(request.url, "/api/applications/app%2F1/events");
+    assert.equal(request.options.headers.Authorization, "Bearer access-token");
+    assert.equal(result.items[0].event_type, "created");
+    assert.equal(result.next_cursor, "history-cursor");
+
+    await api.listEvents("access-token", "app/1", "history-cursor");
+    assert.equal(new URL(request.url, "http://localhost").searchParams.get("cursor"), "history-cursor");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("listTasksByApplication filters the task list by application_id and view", async () => {
+  assert.ok(api, "application API client is missing");
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ items: [{ id: "t1", application_id: "app/1", title: "Apply" }], page_size: 25, total: 1, next_cursor: null });
+  };
+  try {
+    await api.listTasksByApplication("access-token", "app/1");
+    const first = new URL(request.url, "http://localhost");
+    assert.equal(first.pathname, "/api/tasks");
+    assert.equal(first.searchParams.get("application_id"), "app/1");
+    assert.equal(first.searchParams.get("filter"), "all");
+    assert.equal(first.searchParams.get("cursor"), null);
+
+    await api.listTasksByApplication("access-token", "app/1", "task-cursor-1");
+    const second = new URL(request.url, "http://localhost");
+    assert.equal(second.searchParams.get("application_id"), "app/1");
+    assert.equal(second.searchParams.get("filter"), "all");
+    assert.equal(second.searchParams.get("cursor"), "task-cursor-1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("patchApplication accepts an optional stage note on a stage change", async () => {
+  assert.ok(api, "application API client is missing");
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return Response.json({ id: "app/1", company: "Acme", role: "Engineer", status: "interviewing" });
+  };
+  try {
+    const result = await api.patchApplication("access-token", "app/1", { status: "interviewing", stage_note: "Offer call scheduled" });
+    assert.equal(request.options.method, "PATCH");
+    assert.deepEqual(JSON.parse(request.options.body), { status: "interviewing", stage_note: "Offer call scheduled" });
+    assert.equal(result.status, "interviewing");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

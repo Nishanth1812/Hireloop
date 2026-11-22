@@ -1,7 +1,7 @@
 "use client";
 
 import type { FormEvent } from "react";
-import type { Application } from "@/lib/api";
+import { STAGE_CHOICES, stageLabel, type Application } from "@/lib/api";
 
 export function ApplicationEditForm({ application, saving, onSave, onCancel }: {
   application: Application;
@@ -22,10 +22,9 @@ export function ApplicationEditForm({ application, saving, onSave, onCancel }: {
         <input id="edit-company" name="company" autoComplete="organization" maxLength={200} required defaultValue={application.company} />
         <label htmlFor="edit-role">Role</label>
         <input id="edit-role" name="role" maxLength={200} required defaultValue={application.role} />
-        <label htmlFor="edit-status">Status</label>
+        <label htmlFor="edit-status">Stage</label>
         <select id="edit-status" name="status" defaultValue={application.status}>
-          <option value="saved">Saved</option>
-          <option value="applied">Applied</option>
+          {STAGE_CHOICES.map((status) => <option key={status} value={status}>{stageLabel(status)}</option>)}
         </select>
         <label htmlFor="edit-url">Job posting URL <span className="optional">optional</span></label>
         <input id="edit-url" name="url" type="url" maxLength={2048} defaultValue={application.url} placeholder="https://jobs.example.com/42" />

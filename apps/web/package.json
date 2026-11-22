@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test src/lib/api.test.mjs src/lib/tasks.test.mjs src/lib/theme.test.mjs src/lib/contrast.test.mjs && bun test src/app/ApplicationTracker.test.jsx src/app/_components/ThemeControl.test.jsx src/app/_components/accessibility.test.jsx"
+    "test": "node --experimental-strip-types --test src/lib/api.test.mjs src/lib/tasks.test.mjs src/lib/theme.test.mjs src/lib/contrast.test.mjs && bun test src/app/ApplicationTracker.test.jsx src/app/ApplicationDetail.test.jsx src/app/_components/ThemeControl.test.jsx src/app/_components/accessibility.test.jsx"
   },
   "dependencies": {
     "@clerk/nextjs": "7.10.0",

@@ -77,8 +77,13 @@ export function ApplicationDashboard({
   onPrevious, onNext, onToggleFinished, onTaskPrevious, onTaskNext, onRetryApplications, onRetryTasks, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask, onExport,
 }: Props) {
   // Counts come from the API for every matching row, never from the current
-  // page, so the summary stays honest while paging or filtering.
-  const total = result.counts.saved + result.counts.applied;
+  // page, so the summary stays honest while paging or filtering. The total
+  // counts every stage; saved and applied remain as separate summary rows.
+  const counts = result.counts;
+  const total = [
+    counts.saved, counts.applied, counts.interviewing, counts.offer,
+    counts.accepted, counts.rejected, counts.withdrawn,
+  ].reduce((sum, value) => sum + value, 0);
   const lastEditingId = useRef("");
   const editingId = editingApplication?.id ?? "";
   const captureUnavailable = saving || !!editingApplication || !!taskDraft;

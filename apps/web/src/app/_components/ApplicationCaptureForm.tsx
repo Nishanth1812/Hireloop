@@ -1,6 +1,7 @@
 "use client";
 
 import type { FormEvent } from "react";
+import { STAGE_CHOICES, stageLabel } from "@/lib/api";
 
 export function ApplicationCaptureForm({ saving, hidden, onSubmit }: {
   saving: boolean;
@@ -17,10 +18,9 @@ export function ApplicationCaptureForm({ saving, hidden, onSubmit }: {
         <input id="company" name="company" autoComplete="organization" maxLength={200} required placeholder="e.g. Acme" />
         <label htmlFor="role">Role</label>
         <input id="role" name="role" maxLength={200} required placeholder="e.g. Product designer" />
-        <label htmlFor="status">Status</label>
+        <label htmlFor="status">Stage</label>
         <select id="status" name="status" defaultValue="saved">
-          <option value="saved">Saved</option>
-          <option value="applied">Applied</option>
+          {STAGE_CHOICES.map((status) => <option key={status} value={status}>{stageLabel(status)}</option>)}
         </select>
         <label htmlFor="url">Job posting URL <span className="optional">optional</span></label>
         <input id="url" name="url" type="url" maxLength={2048} placeholder="https://jobs.example.com/42" />

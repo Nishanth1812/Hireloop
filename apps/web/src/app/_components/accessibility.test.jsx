@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import React, { act } from "react";
 import { Window } from "happy-dom";
 
@@ -13,6 +13,11 @@ globalThis.window = browser;
 globalThis.document = browser.document;
 globalThis.HTMLElement = browser.HTMLElement;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+mock.module("next/link", () => ({
+  __esModule: true,
+  default: ({ children, href }) => <a href={href}>{children}</a>,
+}));
 
 const { createRoot } = await import("react-dom/client");
 const { ApplicationList } = await import("./ApplicationList");
