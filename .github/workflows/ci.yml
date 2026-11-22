@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/api/go.mod
+          cache-dependency-path: apps/api/go.sum
+      - name: Create disposable test databases
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$POSTGRES_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE hireloop_test' \
+            -c 'CREATE DATABASE hireloop_backup_source' \
+            -c 'CREATE DATABASE hireloop_backup_restore'
+          docker exec "$POSTGRES_CONTAINER" psql -U postgres -d hireloop_test -v ON_ERROR_STOP=1 \
+            -c 'CREATE SCHEMA auth' \
+            -c "CREATE TABLE auth.users (id uuid PRIMARY KEY, email text NOT NULL DEFAULT '')"
+      - name: Make PostgreSQL 18 backup tools available to the restore drill
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          cat > "$RUNNER_TEMP/pg_dump" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          docker exec "$POSTGRES_CONTAINER" pg_dump "$@"
+          EOF
+          cat > "$RUNNER_TEMP/pg_restore" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          docker exec "$POSTGRES_CONTAINER" pg_restore "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/pg_dump" "$RUNNER_TEMP/pg_restore"
+      - name: Test API and restore safety
+        working-directory: apps/api
+        env:
+          HIRELOOP_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/hireloop_test?sslmode=disable
+          HIRELOOP_BACKUP_SOURCE_URL: postgres://postgres@127.0.0.1:5432/hireloop_backup_source?sslmode=disable
+          HIRELOOP_BACKUP_RESTORE_URL: postgres://postgres@127.0.0.1:5432/hireloop_backup_restore?sslmode=disable
+          HIRELOOP_PG_DUMP: ${{ runner.temp }}/pg_dump
+          HIRELOOP_PG_RESTORE: ${{ runner.temp }}/pg_restore
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: go test ./...
+      - name: Vet and build API
+        working-directory: apps/api
+        run: |
+          go vet ./...
+          go build ./...
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: bun install --frozen-lockfile
+      - name: Test, lint, and build web app
+        working-directory: apps/web
+        run: |
+          bun run test
+          bun run lint
+          bun run build
