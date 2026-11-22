@@ -109,6 +109,28 @@ test("token retrieval failures are visible instead of escaping the load effect",
   expect(container.textContent).toContain("Ready");
 });
 
+test("Today retry reloads its first page after a failed initial read", async () => {
+  let taskReads = 0;
+  globalThis.fetch = async (url) => {
+    if (url.startsWith("/api/tasks")) {
+      taskReads++;
+      if (taskReads === 1) return new Response("unavailable", { status: 503 });
+      return taskResponse([openTask()]);
+    }
+    if (url === "/api/notification-settings") return Response.json({ reminders_enabled: true });
+    return response("Acme");
+  };
+  session = account("a");
+  await render();
+
+  expect(dashboardProps.taskLoadError).toBe(true);
+  expect(taskReads).toBe(1);
+  await act(async () => dashboardProps.onRetryTasks());
+  expect(taskReads).toBe(2);
+  expect(dashboardProps.taskLoadError).toBe(false);
+  expect(dashboardProps.taskPage.items[0]?.title).toBe("Submit assessment");
+});
+
 test("missing session tokens show a sign-in error without issuing a request", async () => {
   session = account("a", async () => null);
   globalThis.fetch = () => { throw new Error("must not request data without a token"); };

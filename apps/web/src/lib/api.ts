@@ -151,8 +151,8 @@ export type ApplicationEvent = {
   id: string;
   application_id: string;
   event_type: "created" | "stage_changed";
-  from_status: ApplicationStatus | null;
-  to_status: ApplicationStatus | null;
+  from_status: "" | ApplicationStatus;
+  to_status: "" | ApplicationStatus;
   note: string;
   occurred_at: string;
 };

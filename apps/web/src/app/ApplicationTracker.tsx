@@ -277,6 +277,7 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
   function restartTasks() {
     setTaskHistory([null]);
     setTaskPageIndex(0);
+    setTaskReloadKey((key) => key + 1);
   }
 
   async function addApplication(event: FormEvent<HTMLFormElement>) {

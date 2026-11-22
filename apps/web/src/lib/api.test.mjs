@@ -438,7 +438,7 @@ test("listEvents returns the paginated stage-history envelope", async () => {
     request = { url, options };
     return Response.json({
       items: [{
-        id: "ev-1", application_id: "app/1", event_type: "created", from_status: null,
+        id: "ev-1", application_id: "app/1", event_type: "created", from_status: "",
         to_status: "saved", note: "", occurred_at: "2026-11-18T09:00:00Z",
       }],
       page_size: 25,

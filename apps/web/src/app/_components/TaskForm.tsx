@@ -5,13 +5,14 @@ import type { FormEvent } from "react";
 import type { Application, Task, TaskPrecision } from "@/lib/api";
 import { zoneChoices } from "@/lib/tasks";
 
-export function TaskForm({ application, task, applications, saving, onSave, onCancel }: {
+export function TaskForm({ application, task, applications, saving, onSave, onCancel, autoFocus = true }: {
   application: Application;
   task: Task | null;
   applications: Application[];
   saving: boolean;
   onSave: (event: FormEvent<HTMLFormElement>, id?: string) => void;
-  onCancel: () => void;
+  onCancel?: () => void;
+  autoFocus?: boolean;
 }) {
   const [precision, setPrecision] = useState<TaskPrecision>(task?.due_precision ?? "none");
   const zones = zoneChoices(task?.time_zone);
@@ -33,7 +34,7 @@ export function TaskForm({ application, task, applications, saving, onSave, onCa
         </select>
 
         <label htmlFor="task-title-input">What needs doing</label>
-        <input id="task-title-input" name="title" maxLength={200} required autoFocus
+        <input id="task-title-input" name="title" maxLength={200} required autoFocus={autoFocus}
           defaultValue={task?.title} placeholder="e.g. Submit the online assessment" />
 
         <label htmlFor="task-precision">Deadline</label>
@@ -69,9 +70,7 @@ export function TaskForm({ application, task, applications, saving, onSave, onCa
         <button className="button primary" type="submit" disabled={saving}>
           {saving ? "Saving…" : task ? "Save task" : "Add task"}
         </button>
-        <button className="button quiet" type="button" onClick={onCancel} disabled={saving}>
-          Cancel
-        </button>
+        {onCancel && <button className="button quiet" type="button" onClick={onCancel} disabled={saving}>Cancel</button>}
       </form>
     </aside>
   );
