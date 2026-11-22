@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
+	"hireloop/api/internal/accounts"
 	"hireloop/api/internal/applications"
 	"hireloop/api/internal/clerk"
 	"hireloop/api/internal/identities"
@@ -25,8 +27,11 @@ type notificationSettingsStore interface {
 }
 
 type user struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
+	ID string `json:"id"`
+	// Subject is the verified Clerk subject. It is the only owner id the
+	// account lifecycle may use; ID may be a bound Supabase owner instead.
+	Subject string `json:"-"`
+	Email   string `json:"email"`
 }
 
 // applicationPage is the bounded list envelope. Items is one keyset page;
@@ -60,6 +65,18 @@ func NewHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper,
 }
 
 func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store, taskStore tasks.Store, reminderStore notificationSettingsStore, webhookVerifier *resend.WebhookVerifier) http.Handler {
+	return newHandler(clerkVerifier, identityMapper, store, taskStore, reminderStore, webhookVerifier, nil, nil)
+}
+
+// NewHandlerWithAccount is the production constructor. It adds the account
+// export/deletion routes and the tombstone guard on every protected route.
+// Both dependencies are required: without a Clerk deletion capability the
+// delete endpoint fails closed rather than claiming completion.
+func NewHandlerWithAccount(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store, taskStore tasks.Store, reminderStore notificationSettingsStore, webhookVerifier *resend.WebhookVerifier, accountStore accounts.LifecycleStore, clerkDeleter accounts.ClerkDeleter) http.Handler {
+	return newHandler(clerkVerifier, identityMapper, store, taskStore, reminderStore, webhookVerifier, accountStore, clerkDeleter)
+}
+
+func newHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store, taskStore tasks.Store, reminderStore notificationSettingsStore, webhookVerifier *resend.WebhookVerifier, accountStore accounts.LifecycleStore, clerkDeleter accounts.ClerkDeleter) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -97,6 +114,20 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return user{}, false
 			}
+			// A tombstone blocks every protected route, including a JWT that
+			// was issued before deletion. If the lifecycle state cannot be
+			// checked, fail closed with 503 rather than serving deleted data.
+			if accountStore != nil {
+				state, err := accountStore.Status(r.Context(), cu.ID)
+				if err != nil {
+					http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+					return user{}, false
+				}
+				if state == accounts.StatusPending || state == accounts.StatusCompleted {
+					http.Error(w, "account is deleted", http.StatusForbidden)
+					return user{}, false
+				}
+			}
 			supabaseID, found, err := identityMapper.Resolve(r.Context(), cu.ID)
 			if err != nil {
 				http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
@@ -107,7 +138,7 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 				// Existing user: preserve the explicitly bound Supabase owner.
 				owner = supabaseID
 			}
-			return user{ID: owner, Email: cu.Email}, true
+			return user{ID: owner, Subject: cu.ID, Email: cu.Email}, true
 		}
 
 		http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
@@ -534,6 +565,58 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 			return
 		}
 		notificationSettings(w, enabled)
+	})
+
+	// Account lifecycle. Both routes derive the owner exclusively from the
+	// verified session subject; no request field can name another owner.
+	mux.HandleFunc("GET /api/account/export", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		if accountStore == nil {
+			http.Error(w, "account export unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		export, err := accountStore.Export(r.Context(), u.Subject)
+		if err != nil {
+			if errors.Is(err, accounts.ErrAccountDeleted) {
+				http.Error(w, "account is deleted", http.StatusForbidden)
+				return
+			}
+			http.Error(w, "account export unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", `attachment; filename="hireloop-account-export-`+time.Now().UTC().Format("2006-01-02")+`.json"`)
+		_ = json.NewEncoder(w).Encode(export)
+	})
+	mux.HandleFunc("DELETE /api/account", func(w http.ResponseWriter, r *http.Request) {
+		u, ok := authenticate(w, r)
+		if !ok {
+			return
+		}
+		if accountStore == nil || clerkDeleter == nil {
+			http.Error(w, "account deletion unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		state, err := accounts.AttemptDeletion(r.Context(), accountStore, clerkDeleter, u.Subject)
+		if err != nil {
+			http.Error(w, "account deletion unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if state == accounts.StatusCompleted {
+			// Local erasure and Clerk deletion are both confirmed.
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(struct {
+			State accounts.Status `json:"state"`
+		}{State: state})
 	})
 
 	// Resend webhooks. The route is not authenticated: it exists so the

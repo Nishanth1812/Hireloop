@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"hireloop/api/db/migrations"
+	"hireloop/api/internal/accounts"
 	"hireloop/api/internal/applications"
 	"hireloop/api/internal/clerk"
 	"hireloop/api/internal/httpapi"
@@ -71,6 +74,26 @@ func main() {
 		identityMapper = identities.PostgresMapper{DB: db}
 	}
 
+	// Account lifecycle. The same server-side Clerk client supplies the
+	// verified primary email at export time and performs ban/delete at
+	// deletion. Without CLERK_SECRET_KEY both capabilities fail closed:
+	// export returns 503 rather than an unverified email, and deletion stays
+	// pending rather than claiming completion.
+	var accountStore *accounts.Store
+	var accountClerk *clerk.BackendClient
+	if db != nil {
+		accountStore = &accounts.Store{DB: db}
+		if client, err := clerk.NewBackendClient(os.Getenv("CLERK_SECRET_KEY")); err == nil {
+			accountClerk = client
+			accountStore.VerifiedEmail = client.VerifiedPrimaryEmail
+		} else {
+			log.Printf("Clerk backend unavailable; account export and deletion fail closed: %v", err)
+			accountStore.VerifiedEmail = func(context.Context, string) (string, error) {
+				return "", errors.New("clerk: backend API key is not configured")
+			}
+		}
+	}
+
 	address := os.Getenv("HIRELOOP_API_ADDR")
 	if address == "" {
 		address = "127.0.0.1:8080"
@@ -90,7 +113,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              address,
-		Handler:           httpapi.NewHandlerWithTasks(clerkVerifier, identityMapper, store, taskStore, reminderStore, webhookVerifier),
+		Handler:           httpapi.NewHandlerWithAccount(clerkVerifier, identityMapper, store, taskStore, reminderStore, webhookVerifier, accountStore, accountClerk),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("Hireloop API listening on http://%s", server.Addr)
