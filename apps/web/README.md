@@ -1,6 +1,6 @@
 # Hireloop web
 
-Next.js front end for [Hireloop](../../README.md): Clerk Google sign-in, the manual application tracker (list, add, edit, search/filter, paginate and delete), and a Today panel for open tasks with explicit deadline precision.
+Next.js front end for [Hireloop](../../README.md): Clerk Google sign-in, the manual application tracker (list, add, edit, search/filter, paginate and delete), per-application stage history and linked tasks, and a Today panel for open tasks with explicit deadline precision.
 
 ## Local development
 
