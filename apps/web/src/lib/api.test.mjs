@@ -18,6 +18,46 @@ test("application client exposes the supported API operations", () => {
   assert.equal(typeof api.createApplication, "function");
   assert.equal(typeof api.patchApplication, "function");
   assert.equal(typeof api.deleteApplication, "function");
+  assert.equal(typeof api.exportAccount, "function");
+  assert.equal(typeof api.deleteAccount, "function");
+});
+
+test("account export downloads the authenticated response body", async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return new Response('{"schema_version":1}', { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const blob = await api.exportAccount("access-token");
+    assert.equal(request.url, "/api/account/export");
+    assert.equal(request.options.headers.Authorization, "Bearer access-token");
+    assert.equal(await blob.text(), '{"schema_version":1}');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("account deletion distinguishes completed and pending provider deletion", async () => {
+  const originalFetch = globalThis.fetch;
+  const responses = [new Response(null, { status: 204 }), new Response('{"status":"pending"}', { status: 202 })];
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return responses.shift();
+  };
+  try {
+    assert.equal(await api.deleteAccount("access-token"), "deleted");
+    assert.equal(await api.deleteAccount("access-token"), "pending");
+    for (const request of requests) {
+      assert.equal(request.url, "/api/account");
+      assert.equal(request.options.method, "DELETE");
+      assert.equal(request.options.headers.Authorization, "Bearer access-token");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("taskIcsUrl builds the owner-scoped export path", () => {

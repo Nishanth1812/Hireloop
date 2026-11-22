@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { useSession } from "@clerk/nextjs";
+import { useClerk, useSession } from "@clerk/nextjs";
 import {
   createApplication,
   createTask,
@@ -42,13 +42,21 @@ function messageFrom(error: unknown) {
 
 export default function ApplicationTracker() {
   const { session, isLoaded } = useSession();
+  const { signOut } = useClerk();
   if (!isLoaded) {
     return <main className="page-shell"><p className="loading" role="status">Checking your sign-in…</p></main>;
   }
-  return <SessionTracker key={session?.id ?? "signed-out"} session={session ?? null} />;
+  return <SessionTracker
+    key={session?.id ?? "signed-out"}
+    session={session ?? null}
+    onAccountDeletionAccepted={() => signOut({ redirectUrl: "/sign-in" })}
+  />;
 }
 
-function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof useSession>["session"]> | null }) {
+function SessionTracker({ session, onAccountDeletionAccepted }: {
+  session: NonNullable<ReturnType<typeof useSession>["session"]> | null;
+  onAccountDeletionAccepted: () => Promise<void>;
+}) {
   const [result, setResult] = useState<ApplicationPage>(firstPage);
   const [filters, setFilters] = useState<ApplicationFilters>(noFilters);
   // Keyset pagination: history[index] is the cursor that produced the page at
@@ -615,6 +623,8 @@ function SessionTracker({ session }: { session: NonNullable<ReturnType<typeof us
     notificationError={notificationError}
     notificationNotice={notificationNotice}
     onNotificationChange={changeNotificationSetting}
+    accountGetToken={sessionToken}
+    onAccountDeletionAccepted={onAccountDeletionAccepted}
     onCreate={addApplication}
     onStatusChange={(application, status) => void changeStatus(application, status)}
     onEdit={(application) => { setTaskDraft(null); setEditing(application); setError(""); setNotice(""); }}

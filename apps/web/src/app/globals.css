@@ -121,6 +121,8 @@ h3 { margin-bottom: 8px; font-size: 1rem; }
 .notification-state { margin: 10px 0 0; color: var(--muted); font-size: 0.82rem; }
 .notification-control .message { margin: 12px 0 0; }
 .notification-detail { margin: 12px 0 0; font-size: 0.78rem; }
+.account-data-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.account-delete-confirmation .button { margin-top: 0; }
 .summary { display: flex; align-items: center; gap: 26px; padding: 0 4px 3px; }
 .summary div { display: grid; gap: 1px; }
 .summary strong { font-size: 1.16rem; line-height: 1.2; }

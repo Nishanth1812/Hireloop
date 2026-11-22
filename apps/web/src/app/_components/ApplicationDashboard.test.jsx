@@ -53,6 +53,8 @@ function props(overrides = {}) {
     notificationError: "",
     notificationNotice: "",
     onNotificationChange: noop,
+    accountGetToken: async () => "token",
+    onAccountDeletionAccepted: async () => {},
     onCreate: noop,
     onStatusChange: noop,
     onEdit: noop,
@@ -126,4 +128,11 @@ test("the dashboard total matches the currently filtered result", async () => {
     filters: { q: "", status: "applied", channel: "" },
   });
   expect(container.querySelector(".summary div strong").textContent).toBe("1");
+});
+
+test("account export and deletion controls appear in the dashboard settings", async () => {
+  await render();
+  expect(container.textContent).toContain("Your data");
+  expect([...container.querySelectorAll("button")].some((button) => button.textContent.trim() === "Download your data")).toBe(true);
+  expect([...container.querySelectorAll("button")].some((button) => button.textContent.trim() === "Delete account")).toBe(true);
 });

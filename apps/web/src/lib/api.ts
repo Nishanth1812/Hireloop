@@ -71,10 +71,9 @@ export type ApplicationPage = {
   next_cursor: string | null;
 };
 
-async function request<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
-  let response: Response;
+async function authenticatedResponse(path: string, token: string, init: RequestInit = {}): Promise<Response> {
   try {
-    response = await fetch(path, {
+    return await fetch(path, {
       ...init,
       headers: {
         ...init.headers,
@@ -87,13 +86,37 @@ async function request<T>(path: string, token: string, init: RequestInit = {}): 
     // 503 so the UI never shows a raw "Failed to fetch".
     throw new Error("The API or database is unavailable. Check that the API is running and configured.");
   }
+}
 
+function throwRequestError(response: Response): void {
   if (response.status === 400) throw new Error("The API rejected these values. Check the highlighted fields and try again.");
   if (response.status === 401) throw new Error("Your session has expired. Sign out and sign in again.");
   if (response.status === 503) throw new Error("The API or database is unavailable. Check that the API is running and configured.");
   if (!response.ok) throw new Error(`Could not complete the request (${response.status}).`);
+}
+
+async function request<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
+  const response = await authenticatedResponse(path, token, init);
+  throwRequestError(response);
   if (response.status === 204) return undefined as T;
   return response.json();
+}
+
+export async function exportAccount(token: string): Promise<Blob> {
+  const response = await authenticatedResponse("/api/account/export", token);
+  if (response.status !== 200) {
+    throwRequestError(response);
+    throw new Error("The account export response was not recognized.");
+  }
+  return response.blob();
+}
+
+export async function deleteAccount(token: string): Promise<"deleted" | "pending"> {
+  const response = await authenticatedResponse("/api/account", token, { method: "DELETE" });
+  if (response.status === 204) return "deleted";
+  if (response.status === 202) return "pending";
+  throwRequestError(response);
+  throw new Error("The account deletion response was not recognized.");
 }
 
 // toChannel narrows a form value to the two channels the API accepts; anything

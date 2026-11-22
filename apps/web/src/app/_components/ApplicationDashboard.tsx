@@ -7,6 +7,7 @@ import { SignOutButton } from "@clerk/nextjs";
 import type { Application, ApplicationFilters, ApplicationPage, Task, TaskPage } from "@/lib/api";
 import { ApplicationCaptureForm } from "./ApplicationCaptureForm";
 import { ApplicationEditForm } from "./ApplicationEditForm";
+import { AccountDataControls } from "./AccountDataControls";
 import { ApplicationFilterBar } from "./ApplicationFilterBar";
 import { ApplicationList } from "./ApplicationList";
 import { NotificationControl } from "./NotificationControl";
@@ -45,6 +46,8 @@ type Props = {
   notificationError: string;
   notificationNotice: string;
   onNotificationChange: (enabled: boolean) => void;
+  accountGetToken: () => Promise<string>;
+  onAccountDeletionAccepted: () => Promise<void>;
   onCreate: (event: FormEvent<HTMLFormElement>) => void;
   onStatusChange: (application: Application, status: Application["status"]) => void;
   onEdit: (application: Application) => void;
@@ -73,6 +76,7 @@ export function ApplicationDashboard({
   email, result, filters, page, hasPrevious, hasNext, loading, loadError, saving, busyId, editingApplication,
   taskPage, taskPageIndex, taskHasPrevious, taskHasNext, taskLoading, taskLoadError, tasksShowAll, taskBusyId, taskDraft, error, notice,
   notificationEnabled, notificationLoading, notificationSaving, notificationError, notificationNotice, onNotificationChange,
+  accountGetToken, onAccountDeletionAccepted,
   onCreate, onStatusChange, onEdit, onCancelEdit, onSaveEdit, onRemove, onAddTask, onApplyFilters, onClearFilters,
   onPrevious, onNext, onToggleFinished, onTaskPrevious, onTaskNext, onRetryApplications, onRetryTasks, onEditTask, onSaveTask, onCancelTaskEdit, onCompleteTask, onCancelTask, onExport,
 }: Props) {
@@ -137,6 +141,8 @@ export function ApplicationDashboard({
         notice={notificationNotice}
         onChange={onNotificationChange}
       />
+
+      <AccountDataControls getToken={accountGetToken} onDeletionAccepted={onAccountDeletionAccepted} />
 
       {error && <p className="message error-message" role="alert">{error}</p>}
       {notice && <p className="message success-message" role="status">{notice}</p>}

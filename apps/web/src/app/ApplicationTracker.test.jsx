@@ -11,8 +11,10 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 let session;
 let dashboardProps;
+let signOutOptions;
 mock.module("@clerk/nextjs", () => ({
   useSession: () => ({ isLoaded: true, session }),
+  useClerk: () => ({ signOut: async (options) => { signOutOptions = options; } }),
 }));
 mock.module("./_components/ApplicationDashboard", () => ({
   ApplicationDashboard: (props) => {
@@ -91,6 +93,7 @@ function formWith(values) {
 }
 
 beforeEach(() => {
+  signOutOptions = null;
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -129,6 +132,14 @@ test("Today retry reloads its first page after a failed initial read", async () 
   expect(taskReads).toBe(2);
   expect(dashboardProps.taskLoadError).toBe(false);
   expect(dashboardProps.taskPage.items[0]?.title).toBe("Submit assessment");
+});
+
+test("accepted account deletion signs out through Clerk", async () => {
+  session = account("a");
+  globalThis.fetch = async () => response("Acme");
+  await render();
+  await act(async () => dashboardProps.onAccountDeletionAccepted());
+  expect(signOutOptions).toEqual({ redirectUrl: "/sign-in" });
 });
 
 test("missing session tokens show a sign-in error without issuing a request", async () => {
