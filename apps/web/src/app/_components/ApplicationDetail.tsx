@@ -17,16 +17,23 @@ import { TaskForm } from "./TaskForm";
 type Session = NonNullable<ReturnType<typeof useSession>["session"]>;
 
 type CursorPage<T> = { items: T[]; next_cursor: string | null };
+// shortcut: cap detail fetches at 100 pages; increase if legitimate records exceed it.
+const MAX_DETAIL_PAGES = 100;
 
 async function fetchAllPages<T>(fetchPage: (cursor: string | null) => Promise<CursorPage<T>>): Promise<T[]> {
   const collected: T[] = [];
   const seenCursors = new Set<string>();
   let cursor: string | null = null;
+  let pageCount = 0;
   while (true) {
     const result = await fetchPage(cursor);
+    pageCount += 1;
     collected.push(...result.items);
     const next = result.next_cursor;
     if (!next) return collected;
+    if (pageCount >= MAX_DETAIL_PAGES) {
+      throw new Error(`The record could not be read completely: the API exceeded the ${MAX_DETAIL_PAGES}-page limit.`);
+    }
     if (seenCursors.has(next)) {
       throw new Error("The record could not be read completely: the API returned a repeated page cursor.");
     }
@@ -151,18 +158,21 @@ function ApplicationDetailView({ id, session }: { id: string; session: Session }
     setSaving(true);
     setError("");
     setNotice("");
+    let stageWasSaved = false;
     try {
       const token = await sessionToken();
       const patch: ApplicationPatch = { status };
       if (note) patch.stage_note = note;
       const updated = await patchApplication(token, application.id, patch);
+      stageWasSaved = true;
       setApplication(updated);
       setStageDraft(updated.status);
       setStageNote("");
-      setNotice(`Stage updated to ${stageLabel(updated.status)}.`);
       setEvents(await reloadEvents());
+      setNotice(`Stage updated to ${stageLabel(updated.status)}.`);
     } catch (caught) {
-      setError(messageFrom(caught));
+      const failure = messageFrom(caught);
+      setError(stageWasSaved ? `Stage saved, but its history could not be refreshed. ${failure}` : failure);
     } finally {
       setSaving(false);
     }
@@ -356,8 +366,8 @@ function ApplicationDetailView({ id, session }: { id: string; session: Session }
                 task={null}
                 applications={[application]}
                 saving={saving}
+                autoFocus={false}
                 onSave={(event) => void addTask(event)}
-                onCancel={() => {}}
               />
             </section>
           </div>

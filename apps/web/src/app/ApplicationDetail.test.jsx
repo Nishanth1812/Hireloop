@@ -38,8 +38,8 @@ function application(overrides = {}) {
 }
 function event(overrides = {}) {
   return {
-    id: "ev-1", application_id: "app-1", event_type: "created", from_status: null,
-    to_status: null, note: "", occurred_at: "2026-11-18T09:00:00Z", ...overrides,
+    id: "ev-1", application_id: "app-1", event_type: "created", from_status: "",
+    to_status: "", note: "", occurred_at: "2026-11-18T09:00:00Z", ...overrides,
   };
 }
 function task(overrides = {}) {
@@ -205,10 +205,33 @@ test("history loads every page beyond the former page cap", async () => {
   expect(container.textContent).not.toMatch(/newest pages of the stage history are shown/i);
 });
 
+test("a page walk over the safety limit fails without showing partial details", async () => {
+  let eventRequests = 0;
+  responder = (url) => {
+    if (url === "/api/applications/app-1") return Response.json(application());
+    if (url.startsWith("/api/applications/app-1/events")) {
+      const index = eventRequests++;
+      return Response.json({ items: [event({ id: `ev-${index}` })], page_size: 25, next_cursor: `cursor-${index}` });
+    }
+    if (url.startsWith("/api/tasks")) return Response.json(emptyPage());
+    return Response.json({});
+  };
+  await render();
+  expect(eventRequests).toBe(100);
+  expect(container.querySelector("#detail-status")).toBeNull();
+  expect(container.querySelector('[role="alert"]').textContent).toMatch(/100-page limit/i);
+});
+
 test("empty history and task lists announce their empty states", async () => {
   await render();
   expect(container.textContent).toContain("No recorded stage history yet.");
   expect(container.textContent).toContain("No tasks are linked to this application yet.");
+});
+
+test("the inline task form does not steal focus or show an inert cancel action", async () => {
+  await render();
+  expect(document.activeElement?.id).not.toBe("task-title-input");
+  expect([...container.querySelectorAll("button")].some((button) => button.textContent.trim() === "Cancel")).toBe(false);
 });
 
 test("the stage control exposes all seven workflow stages", async () => {
@@ -327,6 +350,36 @@ test("stage-change failures are announced in place", async () => {
   await act(async () => { form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
   const alerts = [...container.querySelectorAll('[role="alert"]')].map((element) => element.textContent);
   expect(alerts.some((text) => text.includes("Could not complete the request (500)"))).toBe(true);
+});
+
+test("does not announce a stage update as complete when history refresh fails", async () => {
+  let eventRequests = 0;
+  responder = (url, options) => {
+    if (url === "/api/applications/app-1") {
+      if (options.method === "PATCH") return Response.json(application({ status: "interviewing" }));
+      return Response.json(application());
+    }
+    if (url.startsWith("/api/applications/app-1/events")) {
+      if (eventRequests++ === 0) return Response.json({ items: [event({ id: "ev-1", event_type: "created", to_status: "saved" })], page_size: 25, next_cursor: null });
+      return new Response("offline", { status: 503 });
+    }
+    if (url.startsWith("/api/tasks")) return Response.json(emptyPage());
+    return Response.json({});
+  };
+  await render();
+
+  const select = container.querySelector("#detail-status");
+  await act(async () => {
+    select.value = "interviewing";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  const form = select.closest("form");
+  await act(async () => { form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+
+  expect(noticeText()).not.toContain("Stage updated to Interviewing.");
+  const alert = container.querySelector('[role="alert"]');
+  expect(alert.textContent).toContain("Stage saved, but its history could not be refreshed.");
+  expect(alert.textContent).toContain("API or database is unavailable");
 });
 
 test("a missing application is announced with a retry action", async () => {
