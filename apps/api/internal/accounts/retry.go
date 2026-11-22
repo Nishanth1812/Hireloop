@@ -1,6 +1,9 @@
 package accounts
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // ClerkDeleter is the provider capability the lifecycle needs: ban the exact
 // authenticated subject (revoking its sessions and blocking sign-in) and then
@@ -9,11 +12,18 @@ type ClerkDeleter interface {
 	BanAndDelete(ctx context.Context, subject string) error
 }
 
-// PendingStore is the durable slice used by the retry loop.
+// PendingStore is the durable slice used by the retry loop. MarkAttempt is an
+// atomic one-minute claim so multiple worker replicas cannot retry one subject
+// at the same time.
 type PendingStore interface {
-	Pending(context.Context) ([]PendingDeletion, error)
+	Pending(context.Context, int) ([]PendingDeletion, error)
+	MarkAttempt(context.Context, string) (bool, error)
 	Complete(context.Context, string) error
 }
+
+// PendingRetryBatchSize bounds time spent on Clerk requests in each worker
+// cycle; failed subjects move behind untouched ones by updated_at.
+const PendingRetryBatchSize = 2
 
 // LifecycleStore is the full surface used by the HTTP API.
 type LifecycleStore interface {
@@ -31,8 +41,7 @@ func AttemptDeletion(ctx context.Context, store LifecycleStore, clerk ClerkDelet
 		return StatusPending, err
 	}
 	if clerk == nil {
-		// Fail closed: without the provider capability we must never report
-		// completion, even though local erasure succeeded.
+		// Keep the tombstone pending even though local erasure succeeded.
 		return StatusPending, nil
 	}
 	if err := clerk.BanAndDelete(ctx, subject); err != nil {
@@ -44,26 +53,42 @@ func AttemptDeletion(ctx context.Context, store LifecycleStore, clerk ClerkDelet
 	return StatusCompleted, nil
 }
 
-// RetryPending is called by the worker on every tick, independently of email
-// dispatch. A 404 at Clerk is treated by the client as already deleted; a
-// transient failure simply leaves the record pending for the next tick.
+// RetryPending handles a bounded batch independently of email dispatch. A 404
+// at Clerk is treated by the client as already deleted; transient failures
+// remain pending and become eligible after the one-minute claim interval.
 func RetryPending(ctx context.Context, store PendingStore, clerk ClerkDeleter) (int, error) {
 	if clerk == nil {
 		return 0, nil
 	}
-	pending, err := store.Pending(ctx)
+	pending, err := store.Pending(ctx, PendingRetryBatchSize)
 	if err != nil {
 		return 0, err
 	}
 	done := 0
+	failed := 0
 	for _, item := range pending {
+		claimed, err := store.MarkAttempt(ctx, item.ClerkSubject)
+		if err != nil {
+			failed++
+			continue
+		}
+		if !claimed {
+			continue
+		}
 		if err := clerk.BanAndDelete(ctx, item.ClerkSubject); err != nil {
+			failed++
 			continue
 		}
 		if err := store.Complete(ctx, item.ClerkSubject); err != nil {
+			failed++
 			continue
 		}
 		done++
+	}
+	if failed > 0 {
+		// The count lets the worker report outstanding work without leaking
+		// subjects or provider response details into logs.
+		return done, fmt.Errorf("%d pending account deletion(s) failed", failed)
 	}
 	return done, nil
 }

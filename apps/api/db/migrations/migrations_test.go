@@ -745,3 +745,94 @@ func TestApplyIsIdempotentAgainstConfiguredDatabase(t *testing.T) {
 		t.Fatalf("repeat migration application: %v", err)
 	}
 }
+
+func TestDeletedProviderEmailHashesMigrationStoresOnlyFingerprints(t *testing.T) {
+	source, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	reader, _, err := source.ReadUp(18)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := strings.ToLower(string(body))
+	for _, required := range []string{
+		"create table public.account_deletion_provider_hashes",
+		"provider_email_hash text primary key",
+		"references public.account_deletions",
+		"enable row level security",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Errorf("migration 018 is missing %q", required)
+		}
+	}
+	if strings.Contains(sql, "provider_email_id text") {
+		t.Error("migration 018 must not retain raw provider email ids")
+	}
+}
+
+func TestProviderEmailFingerprintRollbackRefusesHistoryAgainstDisposableDatabase(t *testing.T) {
+	databaseURL := os.Getenv("HIRELOOP_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("set HIRELOOP_TEST_DATABASE_URL to a disposable database to exercise migration 018 rollback")
+	}
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal("open disposable test database")
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal("connect to disposable test database")
+	}
+	if err := Apply(db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	source, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	reader, _, err := source.ReadDown(18)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	downSQL, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := "migration-018-rollback-" + time.Now().UTC().Format("20060102150405.000000000")
+	hash := strings.Repeat("b", 64)
+	if _, err := db.ExecContext(ctx, `INSERT INTO account_deletions (clerk_subject, state) VALUES ($1, 'pending')`, owner); err != nil {
+		t.Fatal("seed tombstone")
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO account_deletion_provider_hashes (provider_email_hash, clerk_subject) VALUES ($1, $2)`, hash, owner); err != nil {
+		t.Fatal("seed provider fingerprint")
+	}
+	defer func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM account_deletions WHERE clerk_subject = $1`, owner)
+	}()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, string(downSQL)); err == nil {
+		_ = tx.Rollback()
+		t.Fatal("down migration must refuse to discard provider suppression history")
+	}
+	_ = tx.Rollback()
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM account_deletion_provider_hashes WHERE clerk_subject = $1 AND provider_email_hash = $2`, owner, hash).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("fingerprint after refused rollback = %d, %v; want 1", count, err)
+	}
+}

@@ -58,7 +58,9 @@ package reminders
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -797,6 +799,7 @@ type eventContext struct {
 	jobID   string
 	version int
 	live    bool
+	ownerID string
 	state   callbackState
 }
 
@@ -808,9 +811,9 @@ func resolveEvent(ctx context.Context, q Executor, emailID string) (eventContext
 	var ec eventContext
 	var version sql.NullInt64
 	err := q.QueryRowContext(ctx,
-		`SELECT id, COALESCE(provider_version, delivery_version), delivery_state, retry_count, provider_email_id
+		`SELECT id, COALESCE(provider_version, delivery_version), delivery_state, retry_count, provider_email_id, user_id
 		 FROM reminder_jobs WHERE provider_email_id = $1`, emailID).
-		Scan(&ec.jobID, &version, &ec.state.state, &ec.state.retryCount, &ec.state.providerEmailID)
+		Scan(&ec.jobID, &version, &ec.state.state, &ec.state.retryCount, &ec.state.providerEmailID, &ec.ownerID)
 	if err == nil {
 		ec.version = int(version.Int64)
 		ec.live = true
@@ -822,10 +825,12 @@ func resolveEvent(ctx context.Context, q Executor, emailID string) (eventContext
 	var historyJobID string
 	var historyVersion int
 	err = q.QueryRowContext(ctx,
-		`SELECT job_id, delivery_version FROM reminder_provider_emails WHERE provider_email_id = $1`, emailID).
-		Scan(&historyJobID, &historyVersion)
+		`SELECT h.job_id, h.delivery_version, j.user_id
+		 FROM reminder_provider_emails h JOIN reminder_jobs j ON j.id = h.job_id
+		 WHERE h.provider_email_id = $1`, emailID).
+		Scan(&historyJobID, &historyVersion, &ec.ownerID)
 	if err == nil {
-		return eventContext{jobID: historyJobID, version: historyVersion}, nil
+		return eventContext{jobID: historyJobID, version: historyVersion, ownerID: ec.ownerID}, nil
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return eventContext{}, nil
@@ -841,6 +846,34 @@ func processWebhookEvent(ctx context.Context, tx *sql.Tx, eventID, emailID, even
 	ec, err := resolveEvent(ctx, tx, emailID)
 	if err != nil {
 		return false, err
+	}
+	if ec.ownerID != "" {
+		if err := lockReminderOwner(ctx, tx, ec.ownerID); err != nil {
+			return false, err
+		}
+	}
+	if err := lockProviderEmail(ctx, tx, emailID); err != nil {
+		return false, err
+	}
+	// Re-read after acquiring the same owner/provider locks as deletion. If
+	// deletion won the race, its fingerprint is visible and no event is added.
+	lockedEC, err := resolveEvent(ctx, tx, emailID)
+	if err != nil {
+		return false, err
+	}
+	if ec.ownerID != lockedEC.ownerID && lockedEC.ownerID != "" {
+		return false, errors.New("webhook provider mapping changed while locking")
+	}
+	ec = lockedEC
+	digest := sha256.Sum256([]byte(emailID))
+	var deleted bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM account_deletion_provider_hashes WHERE provider_email_hash = $1
+	)`, hex.EncodeToString(digest[:])).Scan(&deleted); err != nil {
+		return false, err
+	}
+	if deleted {
+		return false, nil
 	}
 	var jobValue, versionValue any
 	if ec.jobID != "" {
@@ -872,6 +905,18 @@ func processWebhookEvent(ctx context.Context, tx *sql.Tx, eventID, emailID, even
 		}
 	}
 	return resolveWebhookEvent(ctx, tx, eventID, emailID, tr, ec)
+}
+
+func lockReminderOwner(ctx context.Context, tx *sql.Tx, owner string) error {
+	var one int
+	return tx.QueryRowContext(ctx,
+		`SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtext($1)::bigint)) AS l`, owner).Scan(&one)
+}
+
+func lockProviderEmail(ctx context.Context, tx *sql.Tx, emailID string) error {
+	var one int
+	return tx.QueryRowContext(ctx,
+		`SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtext('provider:' || $1)::bigint)) AS l`, emailID).Scan(&one)
 }
 
 // resolveWebhookEvent applies an event when the live mapping still points at
@@ -909,6 +954,9 @@ func resolveWebhookEvent(ctx context.Context, q Executor, eventID, emailID strin
 // persisted the mapping. It runs inside the mapping transaction, so a failure
 // rolls back both writes and the next send attempt retries the whole batch.
 func reconcilePendingEvents(ctx context.Context, tx *sql.Tx, emailID string) error {
+	if err := lockProviderEmail(ctx, tx, emailID); err != nil {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT provider_event_id, target_state
 		FROM reminder_email_events
 		WHERE provider_email_id = $1 AND resolution = 'pending'`, emailID)

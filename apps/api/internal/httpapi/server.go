@@ -70,8 +70,8 @@ func NewHandlerWithTasks(clerkVerifier *clerk.Verifier, identityMapper identitie
 
 // NewHandlerWithAccount is the production constructor. It adds the account
 // export/deletion routes and the tombstone guard on every protected route.
-// Both dependencies are required: without a Clerk deletion capability the
-// delete endpoint fails closed rather than claiming completion.
+// The lifecycle store is required. Without a Clerk deletion capability the
+// local erasure still runs and stays pending rather than claiming completion.
 func NewHandlerWithAccount(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper, store applications.Store, taskStore tasks.Store, reminderStore notificationSettingsStore, webhookVerifier *resend.WebhookVerifier, accountStore accounts.LifecycleStore, clerkDeleter accounts.ClerkDeleter) http.Handler {
 	return newHandler(clerkVerifier, identityMapper, store, taskStore, reminderStore, webhookVerifier, accountStore, clerkDeleter)
 }
@@ -597,7 +597,7 @@ func newHandler(clerkVerifier *clerk.Verifier, identityMapper identities.Mapper,
 		if !ok {
 			return
 		}
-		if accountStore == nil || clerkDeleter == nil {
+		if accountStore == nil {
 			http.Error(w, "account deletion unavailable", http.StatusServiceUnavailable)
 			return
 		}

@@ -36,29 +36,27 @@ const (
 	StatusCompleted Status = "completed"
 )
 
-// ExportIdentity carries only the verified identifiers, never session tokens
-// or provider internals.
+// ExportIdentity carries the account identifiers promised by the export
+// contract, never session tokens or internal database owner keys.
 type ExportIdentity struct {
-	ClerkSubject   string `json:"clerk_subject"`
-	PrimaryEmail   string `json:"primary_email"`
-	SupabaseUserID string `json:"supabase_user_id,omitempty"`
+	ClerkSubject string `json:"clerk_subject"`
+	PrimaryEmail string `json:"primary_email"`
 }
 
 // NotificationSetting is one owner's reminder preference.
 type NotificationSetting struct {
-	UserID           string `json:"user_id"`
-	RemindersEnabled bool   `json:"reminders_enabled"`
+	RemindersEnabled bool `json:"reminders_enabled"`
 }
 
 // Export is the complete account archive. Slices are always present, even for
 // an empty account, and each array holds every row (never a page).
 type Export struct {
-	SchemaVersion       int                          `json:"schema_version"`
-	ExportedAt          string                       `json:"exported_at"`
-	Identity            ExportIdentity               `json:"identity"`
-	Applications        []ExportApplication          `json:"applications"`
-	Tasks               []tasks.Task                 `json:"tasks"`
-	NotificationSettings []NotificationSetting       `json:"notification_settings"`
+	SchemaVersion        int                   `json:"schema_version"`
+	ExportedAt           string                `json:"exported_at"`
+	Identity             ExportIdentity        `json:"identity"`
+	Applications         []ExportApplication   `json:"applications"`
+	Tasks                []tasks.Task          `json:"tasks"`
+	NotificationSettings []NotificationSetting `json:"notification_settings"`
 }
 
 // ExportApplication embeds the application's fields and adds its full stage
@@ -157,7 +155,7 @@ func (s *Store) Export(ctx context.Context, subject string) (Export, error) {
 	export := Export{
 		SchemaVersion:        ExportSchemaVersion,
 		ExportedAt:           exportedAt.UTC().Format(time.RFC3339),
-		Identity:             ExportIdentity{ClerkSubject: subject, PrimaryEmail: email, SupabaseUserID: supabaseID},
+		Identity:             ExportIdentity{ClerkSubject: subject, PrimaryEmail: email},
 		Applications:         []ExportApplication{},
 		Tasks:                []tasks.Task{},
 		NotificationSettings: []NotificationSetting{},
@@ -328,7 +326,7 @@ func renderLocal(instant time.Time, zone string) string {
 
 func exportSettings(ctx context.Context, tx *sql.Tx, owners []string) ([]NotificationSetting, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT user_id, reminders_enabled FROM user_notification_settings WHERE user_id = ANY($1::text[]) ORDER BY user_id`, owners)
+		`SELECT reminders_enabled FROM user_notification_settings WHERE user_id = ANY($1::text[]) ORDER BY user_id`, owners)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +334,7 @@ func exportSettings(ctx context.Context, tx *sql.Tx, owners []string) ([]Notific
 	result := []NotificationSetting{}
 	for rows.Next() {
 		var s NotificationSetting
-		if err := rows.Scan(&s.UserID, &s.RemindersEnabled); err != nil {
+		if err := rows.Scan(&s.RemindersEnabled); err != nil {
 			return nil, err
 		}
 		result = append(result, s)

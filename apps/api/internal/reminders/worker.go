@@ -53,9 +53,12 @@ type Config struct {
 	// Set to 0 to disable. Runs even when Dispatcher is nil so PII retention
 	// bounds are enforced in no-send deployments.
 	CleanupInterval time.Duration
-	// DeletionRetry retries pending Clerk deletions on every poll tick. It is
-	// independent of Dispatcher: a no-send deployment must still finish
-	// deletion so the tombstone's access block can eventually be confirmed.
+	// DeletionRetryInterval retries pending Clerk deletions (default 1m). It is
+	// independent of reminder polling and sending, so a provider outage does
+	// not turn into a request every second for every pending account.
+	DeletionRetryInterval time.Duration
+	// DeletionRetry is independent of Dispatcher: a no-send deployment must
+	// still finish deletion so tombstones remain safe and can be confirmed.
 	DeletionRetry func(context.Context) (int, error)
 }
 
@@ -101,6 +104,9 @@ func (c *Config) normalize() {
 	if c.CleanupInterval <= 0 {
 		c.CleanupInterval = time.Hour
 	}
+	if c.DeletionRetryInterval <= 0 {
+		c.DeletionRetryInterval = time.Minute
+	}
 }
 
 // Run polls until ctx is canceled; it returns nil on cancellation.
@@ -110,6 +116,8 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	cleanupTicker := time.NewTicker(w.cfg.CleanupInterval)
 	defer cleanupTicker.Stop()
+	deletionTicker := time.NewTicker(w.cfg.DeletionRetryInterval)
+	defer deletionTicker.Stop()
 
 	// Run cleanup and pending-deletion retry once at startup (errors logged,
 	// not fatal).
@@ -121,7 +129,6 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-pollTicker.C:
-			w.RetryDeletionsOnce(ctx)
 			if _, err := w.poll(ctx, w.cfg.BatchSize); err != nil {
 				if ctx.Err() != nil {
 					return nil
@@ -130,6 +137,8 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 		case <-cleanupTicker.C:
 			w.runCleanup(ctx)
+		case <-deletionTicker.C:
+			w.RetryDeletionsOnce(ctx)
 		}
 	}
 }
@@ -140,6 +149,9 @@ func (w *Worker) Run(ctx context.Context) error {
 // transient cleanup failures (e.g., deadlock, lock timeout) are retried on the
 // next interval.
 func (w *Worker) runCleanup(ctx context.Context) {
+	if w.store == nil || w.store.DB == nil {
+		return
+	}
 	var deletedPayloads, deletedEvents int
 	err := w.store.DB.QueryRowContext(ctx, `SELECT * FROM cleanup_reminder_retention()`).Scan(&deletedPayloads, &deletedEvents)
 	if err != nil {
@@ -152,9 +164,9 @@ func (w *Worker) runCleanup(ctx context.Context) {
 	}
 }
 
-// RetryDeletionsOnce attempts every pending account deletion once. Errors are
-// logged and swallowed: a provider outage must not stop the reminder worker,
-// and the next tick retries. It runs even with no dispatcher configured.
+// RetryDeletionsOnce attempts one bounded batch of eligible account deletions.
+// Errors are logged and swallowed: a provider outage must not stop reminder
+// work, and later ticks retry. It runs even with no dispatcher configured.
 func (w *Worker) RetryDeletionsOnce(ctx context.Context) {
 	if w.cfg.DeletionRetry == nil {
 		return

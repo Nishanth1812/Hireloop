@@ -76,9 +76,8 @@ func main() {
 
 	// Account lifecycle. The same server-side Clerk client supplies the
 	// verified primary email at export time and performs ban/delete at
-	// deletion. Without CLERK_SECRET_KEY both capabilities fail closed:
-	// export returns 503 rather than an unverified email, and deletion stays
-	// pending rather than claiming completion.
+	// deletion. Without CLERK_SECRET_KEY, export returns 503 rather than using
+	// an unverified email; deletion still erases locally and stays pending.
 	var accountStore *accounts.Store
 	var accountClerk *clerk.BackendClient
 	if db != nil {
@@ -87,7 +86,7 @@ func main() {
 			accountClerk = client
 			accountStore.VerifiedEmail = client.VerifiedPrimaryEmail
 		} else {
-			log.Printf("Clerk backend unavailable; account export and deletion fail closed: %v", err)
+			log.Printf("Clerk backend unavailable; export is disabled and account deletions stay pending: %v", err)
 			accountStore.VerifiedEmail = func(context.Context, string) (string, error) {
 				return "", errors.New("clerk: backend API key is not configured")
 			}

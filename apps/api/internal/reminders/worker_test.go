@@ -73,6 +73,26 @@ func TestWorkerRetriesPendingDeletionsWithoutDispatcher(t *testing.T) {
 	}
 }
 
+func TestWorkerDoesNotRetryPendingDeletionsOnEveryPollTick(t *testing.T) {
+	calls := 0
+	w := NewWorker(nil, Config{
+		PollInterval:          time.Millisecond,
+		DeletionRetryInterval: time.Second,
+		DeletionRetry: func(context.Context) (int, error) {
+			calls++
+			return 0, errors.New("clerk unavailable")
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("deletion retries = %d, want only the startup attempt during rapid polling", calls)
+	}
+}
+
 func TestWorkerWithoutDispatcherIsNotReady(t *testing.T) {
 	// A missing provider: the worker idles instead of leasing or
 	// exhausting jobs.

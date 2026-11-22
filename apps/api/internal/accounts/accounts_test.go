@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"hireloop/api/db/migrations"
+	"hireloop/api/internal/reminders"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -191,7 +192,7 @@ func seedOwner(t *testing.T, ctx context.Context, db *sql.DB, label string, many
 
 type rowCounts struct {
 	applications, events, tasks, jobs, settings, identities, authUsers int
-	providerEmails, payloads, webhookEvents                           int
+	providerEmails, payloads, webhookEvents                            int
 }
 
 func countRows(t *testing.T, ctx context.Context, db *sql.DB, f fixture) rowCounts {
@@ -199,22 +200,22 @@ func countRows(t *testing.T, ctx context.Context, db *sql.DB, f fixture) rowCoun
 	var c rowCounts
 	queries := []struct {
 		query string
-		arg   any
+		args  []any
 		dest  *int
 	}{
-		{`SELECT count(*) FROM applications WHERE user_id = ANY($1::text[])`, f.owners, &c.applications},
-		{`SELECT count(*) FROM application_events WHERE user_id = ANY($1::text[])`, f.owners, &c.events},
-		{`SELECT count(*) FROM tasks WHERE user_id = ANY($1::text[])`, f.owners, &c.tasks},
-		{`SELECT count(*) FROM reminder_jobs WHERE user_id = ANY($1::text[])`, f.owners, &c.jobs},
-		{`SELECT count(*) FROM user_notification_settings WHERE user_id = ANY($1::text[])`, f.owners, &c.settings},
-		{`SELECT count(*) FROM user_identities WHERE clerk_subject = $1`, f.subject, &c.identities},
-		{`SELECT count(*) FROM auth.users WHERE id = $1`, f.supabaseID, &c.authUsers},
-		{`SELECT count(*) FROM reminder_provider_emails WHERE user_id = ANY($1::text[])`, f.owners, &c.providerEmails},
-		{`SELECT count(*) FROM reminder_delivery_payloads WHERE job_id IN (SELECT id FROM reminder_jobs WHERE user_id = ANY($1::text[]))`, f.owners, &c.payloads},
-		{`SELECT count(*) FROM reminder_email_events WHERE job_id IN (SELECT id FROM reminder_jobs WHERE user_id = ANY($1::text[])) OR provider_email_id IN (SELECT provider_email_id FROM reminder_provider_emails WHERE user_id = ANY($1::text[]))`, f.owners, &c.webhookEvents},
+		{`SELECT count(*) FROM applications WHERE user_id = ANY($1::text[])`, []any{f.owners}, &c.applications},
+		{`SELECT count(*) FROM application_events WHERE user_id = ANY($1::text[])`, []any{f.owners}, &c.events},
+		{`SELECT count(*) FROM tasks WHERE user_id = ANY($1::text[])`, []any{f.owners}, &c.tasks},
+		{`SELECT count(*) FROM reminder_jobs WHERE user_id = ANY($1::text[])`, []any{f.owners}, &c.jobs},
+		{`SELECT count(*) FROM user_notification_settings WHERE user_id = ANY($1::text[])`, []any{f.owners}, &c.settings},
+		{`SELECT count(*) FROM user_identities WHERE clerk_subject = $1`, []any{f.subject}, &c.identities},
+		{`SELECT count(*) FROM auth.users WHERE id = $1`, []any{f.supabaseID}, &c.authUsers},
+		{`SELECT count(*) FROM reminder_provider_emails WHERE user_id = ANY($1::text[])`, []any{f.owners}, &c.providerEmails},
+		{`SELECT count(*) FROM reminder_delivery_payloads WHERE job_id = $1`, []any{f.jobID}, &c.payloads},
+		{`SELECT count(*) FROM reminder_email_events WHERE job_id = $1 OR provider_email_id = $2`, []any{f.jobID, f.emailID}, &c.webhookEvents},
 	}
 	for _, q := range queries {
-		if err := db.QueryRowContext(ctx, q.query, q.arg).Scan(q.dest); err != nil {
+		if err := db.QueryRowContext(ctx, q.query, q.args...).Scan(q.dest); err != nil {
 			t.Fatalf("count rows: %v", err)
 		}
 	}
@@ -302,6 +303,10 @@ func TestExportSnapshotIncludesAllOwnerRows(t *testing.T) {
 	if strings.Contains(body, control.subject) || strings.Contains(body, control.supabaseID) {
 		t.Error("export contains another owner's identifiers")
 	}
+	if strings.Contains(body, `"supabase_user_id"`) || strings.Contains(body, `"user_id"`) ||
+		strings.Contains(body, target.supabaseID) {
+		t.Error("export contains internal owner identifiers")
+	}
 	if _, err := time.Parse(time.RFC3339, export.ExportedAt); err != nil {
 		t.Errorf("exported_at is not an instant: %q", export.ExportedAt)
 	}
@@ -330,8 +335,7 @@ func TestDeleteAccountIsAtomicAndIdempotent(t *testing.T) {
 	// Inject a failure into the middle of the erasure: no data may be lost and
 	// no tombstone may remain when the transaction rolls back.
 	if _, err := db.ExecContext(ctx, `CREATE OR REPLACE FUNCTION pg_temp.fail_settings_delete() RETURNS trigger AS $$
-		BEGIN RAISE EXCEPTION 'injected failure'; END $$ LANGUAGE plpgsql`);
-		err != nil {
+		BEGIN RAISE EXCEPTION 'injected failure'; END $$ LANGUAGE plpgsql`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `CREATE CONSTRAINT TRIGGER fail_settings_delete
@@ -366,6 +370,183 @@ func TestDeleteAccountIsAtomicAndIdempotent(t *testing.T) {
 		t.Fatalf("states = %q, %q", first.State, second.State)
 	}
 	requireZero(t, "after idempotent delete", countRows(t, ctx, db, f))
+}
+
+func TestLateProviderWebhookIsDiscardedAfterDeletion(t *testing.T) {
+	db := testDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	f := seedOwner(t, ctx, db, "late_webhook", false)
+	if _, err := (&Store{DB: db}).Delete(ctx, f.subject); err != nil {
+		t.Fatalf("delete owner: %v", err)
+	}
+
+	applied, err := (&reminders.Store{DB: db}).RecordWebhookEvent(ctx,
+		"evt_late_after_"+f.emailID, f.emailID, "email.delivered",
+		reminders.Transition{State: reminders.StateDelivered, Note: "late callback"})
+	if err != nil || applied {
+		t.Fatalf("late webhook = %v, %v; want discarded", applied, err)
+	}
+	var events, hashes int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM reminder_email_events WHERE provider_event_id = $1`, "evt_late_after_"+f.emailID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM account_deletion_provider_hashes WHERE clerk_subject = $1`, f.subject).Scan(&hashes); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 || hashes != 1 {
+		t.Fatalf("late events = %d, provider-id fingerprints = %d; want 0, 1", events, hashes)
+	}
+}
+
+func TestWebhookResolvedBeforeDeletionWaitsAndIsDiscarded(t *testing.T) {
+	db := testDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	f := seedOwner(t, ctx, db, "webhook_delete_race", false)
+	name := fmt.Sprintf("phase5_race_%d", time.Now().UTC().UnixNano())
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE FUNCTION public.%s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN IF OLD.user_id = '%s' THEN PERFORM pg_sleep(2); END IF; RETURN OLD; END $$`, name, f.subject)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE TRIGGER %s BEFORE DELETE ON reminder_jobs
+		FOR EACH ROW EXECUTE FUNCTION public.%s()`, name, name)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON reminder_jobs`, name))
+		_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP FUNCTION IF EXISTS public.%s()`, name))
+	})
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		_, err := (&Store{DB: db}).Delete(ctx, f.subject)
+		deleteDone <- err
+	}()
+	waitForPGWaitEvent(t, ctx, db, "PgSleep")
+	webhookDone := make(chan error, 1)
+	go func() {
+		applied, err := (&reminders.Store{DB: db}).RecordWebhookEvent(ctx,
+			"evt_race_after_"+f.emailID, f.emailID, "email.delivered",
+			reminders.Transition{State: reminders.StateDelivered, Note: "callback raced with deletion"})
+		if err == nil && applied {
+			err = errors.New("webhook unexpectedly applied")
+		}
+		webhookDone <- err
+	}()
+	waitForPGWaitEvent(t, ctx, db, "advisory")
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("delete account: %v", err)
+	}
+	if err := <-webhookDone; err != nil {
+		t.Fatalf("webhook after deletion won the owner lock: %v", err)
+	}
+	if n := rowCount(t, ctx, db, `SELECT count(*) FROM reminder_email_events WHERE provider_event_id = $1`, "evt_race_after_"+f.emailID); n != 0 {
+		t.Fatalf("racing callback ledger rows = %d, want 0", n)
+	}
+}
+
+func waitForPGWaitEvent(t *testing.T, ctx context.Context, db *sql.DB, waitEvent string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		if err := db.QueryRowContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event = $1 AND pid <> pg_backend_pid()
+		)`, waitEvent).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for PostgreSQL wait event %q", waitEvent)
+}
+
+func rowCount(t *testing.T, ctx context.Context, db *sql.DB, query string, args ...any) int {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func TestPendingDeletionRetryMovesAttemptedSubjectsBehindUntouchedOnes(t *testing.T) {
+	db := testDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store := &Store{DB: db}
+	suffix := fmt.Sprintf("%d", time.Now().UTC().UnixNano())
+	subjects := []string{"clerk_retry_a_" + suffix, "clerk_retry_b_" + suffix, "clerk_retry_c_" + suffix}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM account_deletions WHERE clerk_subject = ANY($1::text[])`, subjects)
+	})
+	base := time.Now().UTC().Add(-time.Hour)
+	for i, subject := range subjects {
+		at := base.Add(time.Duration(i) * time.Minute)
+		if _, err := db.ExecContext(ctx, `INSERT INTO account_deletions (clerk_subject, state, created_at, updated_at)
+			VALUES ($1, 'pending', $2, $2)`, subject, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := store.Pending(ctx, 2)
+	if err != nil || len(first) != 2 || first[0].ClerkSubject != subjects[0] || first[1].ClerkSubject != subjects[1] {
+		t.Fatalf("first pending batch = %+v, %v", first, err)
+	}
+	claimed, err := store.MarkAttempt(ctx, first[0].ClerkSubject)
+	if err != nil || !claimed {
+		t.Fatalf("claim first pending subject = %v, %v", claimed, err)
+	}
+	next, err := store.Pending(ctx, 2)
+	if err != nil || len(next) != 2 || next[0].ClerkSubject != subjects[1] || next[1].ClerkSubject != subjects[2] {
+		t.Fatalf("next pending batch after a failed attempt = %+v, %v", next, err)
+	}
+}
+
+func TestConcurrentPendingDeletionAttemptClaimIsExclusive(t *testing.T) {
+	db := testDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store := &Store{DB: db}
+	subject := fmt.Sprintf("clerk_retry_claim_%d", time.Now().UTC().UnixNano())
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM account_deletions WHERE clerk_subject = $1`, subject)
+	})
+	if _, err := db.ExecContext(ctx, `INSERT INTO account_deletions (clerk_subject, state, created_at, updated_at)
+		VALUES ($1, 'pending', now() - interval '2 minutes', now() - interval '2 minutes')`, subject); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan bool, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			claimed, err := store.MarkAttempt(ctx, subject)
+			if err != nil {
+				t.Errorf("claim pending deletion: %v", err)
+				return
+			}
+			results <- claimed
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	claims := 0
+	for claimed := range results {
+		if claimed {
+			claims++
+		}
+	}
+	if claims != 1 {
+		t.Fatalf("simultaneous pending retry claims = %d, want exactly one", claims)
+	}
 }
 
 func TestDeleteAccountRemovesAllOwnerDataAndPreservesControlOwner(t *testing.T) {
@@ -483,7 +664,7 @@ func TestReconcileDeletionIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.ImportJournal(ctx, imported); err != nil {
-		t.Fatalf("importing the journal twice must be idempotent: %v", err)
+		t.Fatalf("importing the journal twice must be idempotent: %v; entry = %+v", err, imported)
 	}
 	var tombstones int
 	if err := db.QueryRowContext(ctx,
@@ -529,6 +710,94 @@ func TestReconcileDeletionIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestImportJournalPreservesTimestampsAndRejectsInvalidSupabaseIDs(t *testing.T) {
+	db := testDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store := &Store{DB: db}
+
+	invalid := JournalEntry{
+		ClerkSubject:   "clerk_bad_journal_" + time.Now().UTC().Format("20060102150405.000000000"),
+		SupabaseUserID: "00000000-0000-0000-0000-000000000000'); DELETE FROM auth.users; --",
+		State:          StatusPending,
+		CreatedAt:      "2026-01-01T00:00:00Z",
+		UpdatedAt:      "2026-01-01T00:00:00Z",
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(),
+			`DELETE FROM account_deletions WHERE clerk_subject = $1`, invalid.ClerkSubject)
+	})
+	if _, err := store.ImportJournal(ctx, []JournalEntry{invalid}); err == nil {
+		t.Fatal("journal with a non-UUID Supabase owner was accepted")
+	}
+	var rows int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM account_deletions WHERE clerk_subject = $1`, invalid.ClerkSubject).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("invalid journal created %d tombstones, err = %v", rows, err)
+	}
+
+	created := time.Date(2026, 2, 3, 4, 5, 6, 123456000, time.UTC)
+	updated := created.Add(5 * time.Minute)
+	completed := updated.Add(time.Minute)
+	sourceSubject := "clerk_journal_source_" + time.Now().UTC().Format("20060102150405.000000000")
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO account_deletions (clerk_subject, state, created_at, updated_at, completed_at)
+		VALUES ($1, 'completed', $2, $3, $4)`, sourceSubject, created, updated, completed); err != nil {
+		t.Fatalf("seed source tombstone: %v", err)
+	}
+	providerHash := strings.Repeat("a", 64)
+	if _, err := db.ExecContext(ctx, `INSERT INTO account_deletion_provider_hashes (provider_email_hash, clerk_subject) VALUES ($1, $2)`, providerHash, sourceSubject); err != nil {
+		t.Fatalf("seed provider fingerprint: %v", err)
+	}
+	targetSubject := sourceSubject + "_restored"
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM account_deletions WHERE clerk_subject = ANY($1::text[])`, []string{sourceSubject, targetSubject})
+	})
+
+	entries, err := store.Journal(ctx)
+	if err != nil {
+		t.Fatalf("export source journal: %v", err)
+	}
+	var entry JournalEntry
+	for _, candidate := range entries {
+		if candidate.ClerkSubject == sourceSubject {
+			entry = candidate
+			break
+		}
+	}
+	if entry.ClerkSubject == "" {
+		t.Fatal("source tombstone is missing from journal")
+	}
+	if len(entry.ProviderEmailHashes) != 1 || entry.ProviderEmailHashes[0] != providerHash {
+		t.Fatalf("journal provider fingerprints = %v, want %q", entry.ProviderEmailHashes, providerHash)
+	}
+	for value, want := range map[string]time.Time{entry.CreatedAt: created, entry.UpdatedAt: updated, entry.CompletedAt: completed} {
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil || !parsed.Equal(want) {
+			t.Fatalf("journal timestamp %q parsed as %v, %v; want %v", value, parsed, err, want)
+		}
+	}
+	entry.ClerkSubject = targetSubject
+	if _, err := db.ExecContext(ctx, `DELETE FROM account_deletion_provider_hashes WHERE clerk_subject = $1`, sourceSubject); err != nil {
+		t.Fatalf("prepare independent restore target: %v", err)
+	}
+	if _, err := store.ImportJournal(ctx, []JournalEntry{entry}); err != nil {
+		t.Fatalf("import source timestamps: %v", err)
+	}
+	var gotCreated, gotUpdated, gotCompleted time.Time
+	if err := db.QueryRowContext(ctx, `
+		SELECT created_at, updated_at, completed_at FROM account_deletions WHERE clerk_subject = $1`, targetSubject).
+		Scan(&gotCreated, &gotUpdated, &gotCompleted); err != nil {
+		t.Fatalf("read imported timestamps: %v", err)
+	}
+	if !gotCreated.Equal(created) || !gotUpdated.Equal(updated) || !gotCompleted.Equal(completed) {
+		t.Fatalf("imported timestamps = %v, %v, %v; want %v, %v, %v", gotCreated, gotUpdated, gotCompleted, created, updated, completed)
+	}
+	var importedHashes int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM account_deletion_provider_hashes WHERE clerk_subject = $1 AND provider_email_hash = $2`, targetSubject, providerHash).Scan(&importedHashes); err != nil || importedHashes != 1 {
+		t.Fatalf("imported provider fingerprints = %d, %v; want 1", importedHashes, err)
+	}
+}
+
 // Offline proof of durable retry: a failed Clerk deletion keeps the record
 // pending and a later success completes it, regardless of email dispatch.
 func TestPendingDeletionRetriesAfterClerkRecovery(t *testing.T) {
@@ -537,8 +806,8 @@ func TestPendingDeletionRetriesAfterClerkRecovery(t *testing.T) {
 		items: []PendingDeletion{{ClerkSubject: "user_retry"}},
 	}
 	clerk := &fakeClerk{err: errors.New("clerk unavailable")}
-	if n, err := RetryPending(ctx, store, clerk); err != nil || n != 0 {
-		t.Fatalf("first retry = %d, %v", n, err)
+	if n, err := RetryPending(ctx, store, clerk); err == nil || n != 0 {
+		t.Fatalf("failed first retry must report outstanding work: %d, %v", n, err)
 	}
 	if store.completed != 0 {
 		t.Fatal("failed Clerk deletion was marked complete")
@@ -558,16 +827,42 @@ func TestPendingDeletionRetriesAfterClerkRecovery(t *testing.T) {
 	}
 }
 
+func TestPendingDeletionRetryIsBounded(t *testing.T) {
+	items := make([]PendingDeletion, PendingRetryBatchSize+3)
+	for i := range items {
+		items[i].ClerkSubject = fmt.Sprintf("user_retry_%d", i)
+	}
+	store := &fakePendingStore{items: items}
+	clerk := &fakeClerk{err: errors.New("clerk unavailable")}
+	if _, err := RetryPending(context.Background(), store, clerk); err == nil {
+		t.Fatal("failed batch should report outstanding work")
+	}
+	if clerk.calls != PendingRetryBatchSize || store.attempted != PendingRetryBatchSize {
+		t.Fatalf("retry calls = %d, recorded attempts = %d, want %d", clerk.calls, store.attempted, PendingRetryBatchSize)
+	}
+}
+
 type fakePendingStore struct {
 	mu        sync.Mutex
 	items     []PendingDeletion
 	completed int
+	attempted int
 }
 
-func (f *fakePendingStore) Pending(context.Context) ([]PendingDeletion, error) {
+func (f *fakePendingStore) Pending(_ context.Context, limit int) ([]PendingDeletion, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if limit < len(f.items) {
+		return append([]PendingDeletion(nil), f.items[:limit]...), nil
+	}
 	return append([]PendingDeletion(nil), f.items...), nil
+}
+
+func (f *fakePendingStore) MarkAttempt(context.Context, string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attempted++
+	return true, nil
 }
 
 func (f *fakePendingStore) Complete(context.Context, string) error {

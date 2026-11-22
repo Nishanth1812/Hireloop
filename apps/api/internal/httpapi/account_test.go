@@ -63,9 +63,11 @@ func (f *fakeLifecycle) Complete(_ context.Context, subject string) error {
 	return nil
 }
 
-func (f *fakeLifecycle) Pending(context.Context) ([]accounts.PendingDeletion, error) {
+func (f *fakeLifecycle) Pending(context.Context, int) ([]accounts.PendingDeletion, error) {
 	return nil, nil
 }
+
+func (f *fakeLifecycle) MarkAttempt(context.Context, string) (bool, error) { return true, nil }
 
 type fakeDeleter struct {
 	err      error
@@ -211,13 +213,16 @@ func TestAccountDeletionResponses(t *testing.T) {
 			t.Fatalf("status = %d, want 503", response.Code)
 		}
 	})
-	t.Run("missing Clerk capability fails closed", func(t *testing.T) {
+	t.Run("missing Clerk capability erases locally and stays pending", func(t *testing.T) {
 		life := &fakeLifecycle{result: accounts.DeleteResult{State: accounts.StatusPending}}
 		handler, token := accountHandler(t, "user_a", "owner-a", life, nil)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, authenticatedRequest(http.MethodDelete, "/api/account", token, ""))
-		if response.Code != http.StatusServiceUnavailable {
-			t.Fatalf("status = %d, want 503", response.Code)
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202", response.Code)
+		}
+		if life.deletedSubject != "user_a" {
+			t.Fatalf("local deletion was not attempted for authenticated subject: %q", life.deletedSubject)
 		}
 	})
 }

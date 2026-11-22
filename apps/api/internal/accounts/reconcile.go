@@ -2,12 +2,15 @@ package accounts
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Delete writes a pending tombstone and erases every Hireloop-owned row in one
@@ -92,11 +95,18 @@ func (s *Store) Complete(ctx context.Context, subject string) error {
 	return nil
 }
 
-// Pending lists tombstoned subjects whose Clerk deletion is still outstanding.
-func (s *Store) Pending(ctx context.Context) ([]PendingDeletion, error) {
+// Pending lists an eligible bounded batch of tombstones whose Clerk deletion
+// is still outstanding. Recently attempted rows remain cooling down for one
+// minute and are skipped across worker replicas.
+func (s *Store) Pending(ctx context.Context, limit int) ([]PendingDeletion, error) {
+	if limit <= 0 || limit > PendingRetryBatchSize {
+		limit = PendingRetryBatchSize
+	}
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT clerk_subject, COALESCE(supabase_user_id, ''), created_at
-		FROM account_deletions WHERE state = 'pending' ORDER BY created_at, clerk_subject`)
+		FROM account_deletions WHERE state = 'pending'
+		  AND updated_at <= now() - interval '1 minute'
+		ORDER BY updated_at, created_at, clerk_subject LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -112,13 +122,32 @@ func (s *Store) Pending(ctx context.Context) ([]PendingDeletion, error) {
 	return result, rows.Err()
 }
 
+// MarkAttempt atomically claims a pending deletion for one minute, moving it
+// behind untouched entries and preventing duplicate requests across replicas.
+func (s *Store) MarkAttempt(ctx context.Context, subject string) (bool, error) {
+	result, err := s.DB.ExecContext(ctx, `UPDATE account_deletions
+		SET updated_at = now() WHERE clerk_subject = $1 AND state = 'pending'
+		  AND updated_at <= now() - interval '1 minute'`, subject)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 // Journal exports the durable deletion journal as opaque JSON. It contains no
 // email or account content and is intended to be copied outside the backup.
 func (s *Store) Journal(ctx context.Context) ([]JournalEntry, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT clerk_subject, COALESCE(supabase_user_id, ''), state, created_at, updated_at,
-		       COALESCE(completed_at::text, '')
-		FROM account_deletions ORDER BY created_at, clerk_subject`)
+		       completed_at,
+	       COALESCE((SELECT json_agg(provider_email_hash ORDER BY provider_email_hash)
+	                 FROM account_deletion_provider_hashes h
+	                 WHERE h.clerk_subject = d.clerk_subject), '[]'::json)
+		FROM account_deletions d ORDER BY created_at, clerk_subject`)
 	if err != nil {
 		return nil, err
 	}
@@ -126,8 +155,20 @@ func (s *Store) Journal(ctx context.Context) ([]JournalEntry, error) {
 	result := []JournalEntry{}
 	for rows.Next() {
 		var e JournalEntry
-		if err := rows.Scan(&e.ClerkSubject, &e.SupabaseUserID, &e.State, &e.CreatedAt, &e.UpdatedAt, &e.CompletedAt); err != nil {
+		var createdAt, updatedAt time.Time
+		var completedAt sql.NullTime
+		var providerHashes string
+		if err := rows.Scan(&e.ClerkSubject, &e.SupabaseUserID, &e.State, &createdAt, &updatedAt, &completedAt,
+			&providerHashes); err != nil {
 			return nil, err
+		}
+		if err := json.Unmarshal([]byte(providerHashes), &e.ProviderEmailHashes); err != nil {
+			return nil, err
+		}
+		e.CreatedAt = createdAt.UTC().Format(time.RFC3339Nano)
+		e.UpdatedAt = updatedAt.UTC().Format(time.RFC3339Nano)
+		if completedAt.Valid {
+			e.CompletedAt = completedAt.Time.UTC().Format(time.RFC3339Nano)
 		}
 		result = append(result, e)
 	}
@@ -137,12 +178,13 @@ func (s *Store) Journal(ctx context.Context) ([]JournalEntry, error) {
 // JournalEntry is one opaque tombstone record. Times are RFC3339 strings so a
 // journal survives a text export/import without losing precision.
 type JournalEntry struct {
-	ClerkSubject   string `json:"clerk_subject"`
-	SupabaseUserID string `json:"supabase_user_id,omitempty"`
-	State          Status `json:"state"`
-	CreatedAt      string `json:"created_at"`
-	UpdatedAt      string `json:"updated_at"`
-	CompletedAt    string `json:"completed_at,omitempty"`
+	ClerkSubject        string   `json:"clerk_subject"`
+	SupabaseUserID      string   `json:"supabase_user_id,omitempty"`
+	ProviderEmailHashes []string `json:"provider_email_hashes,omitempty"`
+	State               Status   `json:"state"`
+	CreatedAt           string   `json:"created_at"`
+	UpdatedAt           string   `json:"updated_at"`
+	CompletedAt         string   `json:"completed_at,omitempty"`
 }
 
 // MarshalJournal is the file format used by the restore runbook.
@@ -168,30 +210,74 @@ func (s *Store) ImportJournal(ctx context.Context, entries []JournalEntry) (int,
 	imported := 0
 	for _, entry := range entries {
 		subject := strings.TrimSpace(entry.ClerkSubject)
-		if subject == "" || strings.ContainsAny(subject, "\r\n") {
+		if subject == "" || len(subject) > 256 || strings.IndexFunc(subject, unicode.IsControl) >= 0 {
 			return 0, errors.New("accounts: invalid journal subject")
+		}
+		supabaseID := strings.TrimSpace(entry.SupabaseUserID)
+		if supabaseID != "" && !validUUID(supabaseID) {
+			return 0, errors.New("accounts: invalid journal Supabase owner")
 		}
 		state := entry.State
 		if state != StatusPending && state != StatusCompleted {
 			return 0, fmt.Errorf("accounts: invalid journal state %q", state)
 		}
+		createdAt, err := time.Parse(time.RFC3339Nano, entry.CreatedAt)
+		if err != nil {
+			return 0, errors.New("accounts: invalid journal creation time")
+		}
+		updatedAt, err := time.Parse(time.RFC3339Nano, entry.UpdatedAt)
+		if err != nil {
+			return 0, errors.New("accounts: invalid journal update time")
+		}
 		completedAt := any(nil)
 		if state == StatusCompleted {
-			if parsed, err := time.Parse(time.RFC3339, entry.CompletedAt); err == nil {
-				completedAt = parsed
+			parsed, err := time.Parse(time.RFC3339Nano, entry.CompletedAt)
+			if err != nil {
+				return 0, errors.New("accounts: completed journal entry has invalid completion time")
 			}
+			completedAt = parsed
+		} else if entry.CompletedAt != "" {
+			return 0, errors.New("accounts: pending journal entry has a completion time")
 		}
-		_, err := tx.ExecContext(ctx, `
-			INSERT INTO account_deletions (clerk_subject, supabase_user_id, state, completed_at)
-			VALUES ($1, NULLIF($2, ''), $3, $4)
+		result, err := tx.ExecContext(ctx, `
+			INSERT INTO account_deletions (clerk_subject, supabase_user_id, state, created_at, updated_at, completed_at)
+			VALUES ($1, NULLIF($2, ''), $3, $4, $5, $6)
 			ON CONFLICT (clerk_subject) DO UPDATE SET
 			    state = CASE WHEN account_deletions.state = 'completed'
 			                 THEN 'completed' ELSE EXCLUDED.state END,
 			    supabase_user_id = COALESCE(account_deletions.supabase_user_id, EXCLUDED.supabase_user_id),
-			    completed_at = COALESCE(account_deletions.completed_at, EXCLUDED.completed_at)`,
-			subject, entry.SupabaseUserID, state, completedAt)
+			    created_at = LEAST(account_deletions.created_at, EXCLUDED.created_at),
+			    updated_at = GREATEST(account_deletions.updated_at, EXCLUDED.updated_at),
+			    completed_at = COALESCE(account_deletions.completed_at, EXCLUDED.completed_at)
+			WHERE account_deletions.supabase_user_id IS NULL
+			   OR EXCLUDED.supabase_user_id IS NULL
+			   OR account_deletions.supabase_user_id = EXCLUDED.supabase_user_id`,
+			subject, supabaseID, state, createdAt, updatedAt, completedAt)
 		if err != nil {
 			return 0, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if affected != 1 {
+			return 0, errors.New("accounts: journal conflicts with an existing Supabase binding")
+		}
+		for _, hash := range entry.ProviderEmailHashes {
+			if !validProviderEmailHash(hash) {
+				return 0, errors.New("accounts: invalid journal provider email hash")
+			}
+			result, err := tx.ExecContext(ctx, `
+				INSERT INTO account_deletion_provider_hashes (provider_email_hash, clerk_subject)
+				VALUES ($1, $2) ON CONFLICT (provider_email_hash) DO UPDATE
+				SET clerk_subject = account_deletion_provider_hashes.clerk_subject
+				WHERE account_deletion_provider_hashes.clerk_subject = EXCLUDED.clerk_subject`, hash, subject)
+			if err != nil {
+				return 0, err
+			}
+			if n, err := result.RowsAffected(); err != nil || n != 1 {
+				return 0, errors.New("accounts: provider email hash belongs to another deletion")
+			}
 		}
 		imported++
 	}
@@ -199,6 +285,23 @@ func (s *Store) ImportJournal(ctx context.Context, entries []JournalEntry) (int,
 		return 0, err
 	}
 	return imported, nil
+}
+
+func validUUID(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	compact := strings.ReplaceAll(value, "-", "")
+	decoded, err := hex.DecodeString(compact)
+	return err == nil && len(decoded) == 16
+}
+
+func validProviderEmailHash(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 }
 
 // Reconcile erases every tombstoned owner from the database. After a restore,
@@ -255,6 +358,9 @@ func (s *Store) Reconcile(ctx context.Context) (int, error) {
 // and are also removed explicitly so a missing cascade cannot retain PII.
 func eraseOwner(ctx context.Context, tx *sql.Tx, subject, supabaseID string) error {
 	owners := ownersFor(subject, supabaseID)
+	if err := preserveDeletedProviderEmails(ctx, tx, subject, owners); err != nil {
+		return err
+	}
 	statements := []struct {
 		query string
 		args  []any
@@ -289,6 +395,54 @@ func eraseOwner(ctx context.Context, tx *sql.Tx, subject, supabaseID string) err
 		}
 	}
 	return nil
+}
+
+// preserveDeletedProviderEmails keeps only a SHA-256 fingerprint of each
+// known provider id. The advisory lock serializes callback insertion with
+// deletion; both paths take the owner lock before this provider-id lock.
+func preserveDeletedProviderEmails(ctx context.Context, tx *sql.Tx, subject string, owners []string) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT provider_email_id FROM reminder_provider_emails WHERE user_id = ANY($1::text[])
+		UNION
+		SELECT provider_email_id FROM reminder_jobs WHERE user_id = ANY($1::text[]) AND provider_email_id IS NOT NULL
+		ORDER BY provider_email_id`, owners)
+	if err != nil {
+		return err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := lockProviderEmail(ctx, tx, id); err != nil {
+			return err
+		}
+		hash := sha256.Sum256([]byte(id))
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO account_deletion_provider_hashes (provider_email_hash, clerk_subject)
+			VALUES ($1, $2) ON CONFLICT (provider_email_hash) DO NOTHING`, hex.EncodeToString(hash[:]), subject); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func lockProviderEmail(ctx context.Context, tx *sql.Tx, id string) error {
+	var one int
+	return tx.QueryRowContext(ctx,
+		`SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtext('provider:' || $1)::bigint)) AS l`, id).Scan(&one)
 }
 
 func lockOwner(ctx context.Context, tx *sql.Tx, id string) error {
