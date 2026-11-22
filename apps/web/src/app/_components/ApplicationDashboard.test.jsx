@@ -113,3 +113,17 @@ test("the dashboard Add action is disabled while another form hides capture", as
   expect(add.disabled).toBe(true);
   expect(document.getElementById(add.getAttribute("aria-describedby")).textContent).toMatch(/close the current form/i);
 });
+
+test("the dashboard total matches the currently filtered result", async () => {
+  await render({
+    result: {
+      items: [],
+      total: 1,
+      counts: { saved: 3, applied: 1, interviewing: 2, offer: 1, accepted: 1, rejected: 2, withdrawn: 1 },
+      next_cursor: null,
+      page_size: 25,
+    },
+    filters: { q: "", status: "applied", channel: "" },
+  });
+  expect(container.querySelector(".summary div strong").textContent).toBe("1");
+});
