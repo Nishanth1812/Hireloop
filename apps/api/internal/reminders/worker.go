@@ -173,11 +173,13 @@ func (w *Worker) RetryDeletionsOnce(ctx context.Context) {
 	}
 	completed, err := w.cfg.DeletionRetry(ctx)
 	if err != nil {
-		log.Printf("pending deletion retry failed (will retry next interval): %v", err)
+		// Use a stable, redacted event for log-based alerting; the underlying
+		// error may contain provider or database details.
+		log.Printf("event=account_deletion_retry_failed retry=next_interval")
 		return
 	}
 	if completed > 0 {
-		log.Printf("pending deletion retry completed %d deletion(s)", completed)
+		log.Printf("event=account_deletion_retry_completed count=%d", completed)
 	}
 }
 

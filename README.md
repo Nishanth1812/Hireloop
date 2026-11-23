@@ -50,7 +50,7 @@ go test ./...
 go vet ./...
 ```
 
-The reminder worker runs from `apps/api/cmd/worker` against the same `DATABASE_URL`; until a mail provider is integrated it uses the null dispatcher, so no delivery is implied.
+The reminder worker runs from `apps/api/cmd/worker` against the same `DATABASE_URL`. Email sending is opt-in and requires `RESEND_ENABLED=true`, `RESEND_API_KEY` and `RESEND_FROM`; Clerk deletion retries run independently and require `CLERK_SECRET_KEY`. Each failed deletion retry emits the redacted `event=account_deletion_retry_failed` log event. Before inviting users, configure an alert for that event and a separate worker liveness monitor in the deployment; see the local backup and deletion runbook for the response procedure.
 
 `bun run start` is the API's only script. If `DATABASE_URL` is set, startup applies only pending embedded migrations before opening the listener; a migration failure stops startup. Use the Supabase **session pooler, not transaction pooling**. Migrations are ordered SQL files guarded by an advisory lock and a history table: an up-to-date database is a no-op. Review pending migrations before starting against an existing database. If a migration fails, inspect the history and database state and take a backup before any repair; do not blindly reset the history or drop data. An existing hand-created `applications` table is not adopted automatically.
 

@@ -1,8 +1,11 @@
 package reminders
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,6 +73,26 @@ func TestWorkerRetriesPendingDeletionsWithoutDispatcher(t *testing.T) {
 	w.RetryDeletionsOnce(context.Background())
 	if calls != 2 {
 		t.Fatalf("retry calls after recovery = %d", calls)
+	}
+}
+
+func TestWorkerEmitsRedactedAccountDeletionAlertEvent(t *testing.T) {
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	w := NewWorker(nil, Config{
+		DeletionRetry: func(context.Context) (int, error) {
+			return 0, errors.New("provider response contains sensitive details")
+		},
+	})
+	w.RetryDeletionsOnce(context.Background())
+
+	if got := output.String(); !strings.Contains(got, "event=account_deletion_retry_failed") {
+		t.Fatalf("retry log %q does not contain the stable alert event", got)
+	} else if strings.Contains(got, "sensitive details") {
+		t.Fatalf("retry log leaked provider error details: %q", got)
 	}
 }
 
